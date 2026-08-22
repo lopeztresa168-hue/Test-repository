@@ -1,0 +1,1847 @@
+name: Loop Analysis Workflow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: loop-analysis-runner
+  cancel-in-progress: false
+
+jobs:
+
+  # ============================================================
+  # Job 1: بررسی پرچم وقفه
+  # ============================================================
+  check-interrupt:
+    runs-on: ubuntu-latest
+    outputs:
+      force_fixed: ${{ steps.check.outputs.force_fixed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+
+      - name: بررسی پرچم وقفه
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          {
+            echo "🔍 بررسی پرچم‌های وقفه..."
+            HTTP_CODE=$(gh api "repos/$THIRD_REPO/contents/interrupt.flag" -i 2>/dev/null | head -n 1 | cut -d' ' -f2)
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "⚠️ پرچم وقفه یافت شد! حذف می‌شود..."
+              SHA=$(gh api "repos/$THIRD_REPO/contents/interrupt.flag" -q '.sha')
+              gh api "repos/$THIRD_REPO/contents/interrupt.flag" -X DELETE -F message="clear interrupt" -F sha="$SHA" -F branch="main"
+              echo "force_fixed=true" >> $GITHUB_OUTPUT
+            else
+              echo "force_fixed=false" >> $GITHUB_OUTPUT
+            fi
+          }
+
+  # ============================================================
+  # Job 2: یکپارچه‌سازی نتایج بک‌تست (نسخه موازی/ماتریکسی)
+  # این جاب به سه بخش تقسیم شده تا سرعت بالا برود:
+  #   2a) aggregate-prepare : بررسی نوبت + ساخت لیست حداکثر ۴۰ استراتژی و تقسیم به حداکثر ۲۰ چانک ۲تایی
+  #   2b) aggregate-results : ماتریکس (حداکثر ۲۰ اجرای موازی)، هر چانک ۲ استراتژی را یکپارچه می‌کند.
+  #       هر چانک فقط روی clone محلی خودش کار می‌کند و در پایان تغییراتش را به‌صورت
+  #       artifact آپلود می‌کند — هیچ چانکی مستقیماً به مخزن سوم push نمی‌کند
+  #       (برای جلوگیری از تداخل push همزمان ۲۰ نویسنده روی یک مخزن).
+  #   2c) aggregate-collect : این جاب به aggregate-results وابسته است، پس تا وقتی
+  #       هر ۲۰ چانک تمام نشوند شروع نمی‌شود. تمام artifact های چانک‌ها را دانلود و
+  #       روی یک clone تازه اعمال می‌کند و فقط یک‌بار commit/push انجام می‌دهد.
+  #       اگر حتی یکی از چانک‌ها fail شود، هیچ push ای انجام نمی‌شود (all-or-nothing).
+  # ============================================================
+
+  aggregate-prepare:
+    needs: check-interrupt
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.turn_check.outputs.proceed }}
+      has_more: ${{ steps.build_chunks.outputs.has_more }}
+      chunk_count: ${{ steps.build_chunks.outputs.chunk_count }}
+      chunk_indices: ${{ steps.build_chunks.outputs.chunk_indices }}
+      chunks: ${{ steps.build_chunks.outputs.chunks }}
+      required_file_count: ${{ steps.file_count.outputs.required_file_count }}
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: 0. نصب jq
+        run: |
+          if ! command -v jq &> /dev/null; then
+            echo "📦 jq یافت نشد. در حال نصب..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
+            if ! command -v jq &> /dev/null; then
+              echo "❌ خطای بحرانی: نصب jq ناموفق بود."
+              exit 1
+            fi
+          fi
+          echo "✅ jq آماده است."
+
+      - name: 0.5. پاکسازی فضای موقت
+        run: |
+          rm -rf /tmp/third_repo /tmp/ohlc_repo 2>/dev/null || true
+          echo "✅ پاکسازی فضای موقت انجام شد."
+
+      - name: 0.6. بررسی نوبت منصفانه با loop.yml (فقط خواندن، بدون نوشتن)
+        id: turn_check
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          {
+            # این Job فقط می‌خواند؛ نوشتن turn.flag/no_work.flag منحصراً در
+            # Job upload-other-outputs انجام می‌شود.
+            MY_ID="analysis"
+            OTHER_ID="loop"
+            TURN_FILE="turn.flag"
+            OTHER_NOWORK_FILE="${OTHER_ID}_no_work.flag"
+            PROCEED=false
+
+            OTHER_RESP=$(gh api "repos/$THIRD_REPO/contents/$OTHER_NOWORK_FILE" 2>/dev/null || true)
+            if [ -n "$OTHER_RESP" ] && [ "$OTHER_RESP" != "null" ] && echo "$OTHER_RESP" | jq -e '.sha' >/dev/null 2>&1; then
+              echo "ℹ️ طرف مقابل ($OTHER_ID) فعلاً کاری ندارد؛ بدون رعایت نوبت ادامه می‌دهیم."
+              PROCEED=true
+            else
+              TURN_RESP=$(gh api "repos/$THIRD_REPO/contents/$TURN_FILE" 2>/dev/null || true)
+              if [ -z "$TURN_RESP" ] || [ "$TURN_RESP" = "null" ] || ! echo "$TURN_RESP" | jq -e '.sha' >/dev/null 2>&1; then
+                echo "ℹ️ فایل نوبت وجود ندارد؛ این اجرا ($MY_ID) اولین نوبت را برمی‌دارد."
+                PROCEED=true
+              else
+                CUR_TURN=$(echo "$TURN_RESP" | jq -r '.content' | base64 -d 2>/dev/null | tr -d '[:space:]')
+                if [ "$CUR_TURN" = "$MY_ID" ]; then
+                  echo "✅ نوبت $MY_ID بود. ادامه می‌دهیم (ثبت نوبت بعدی توسط upload-other-outputs انجام می‌شود)."
+                  PROCEED=true
+                else
+                  echo "⏭️ نوبت $OTHER_ID است نه $MY_ID. این اجرا بدون هیچ انتظاری رد می‌شود (نه صف، نه sleep)."
+                  PROCEED=false
+                fi
+              fi
+            fi
+
+            echo "proceed=$PROCEED" >> "$GITHUB_OUTPUT"
+          }
+
+      - name: Clone third repository (shallow clone، فقط خواندن)
+        if: steps.turn_check.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git /tmp/third_repo
+          echo "✅ مخزن سوم با موفقیت clone شد (فقط خواندن)."
+
+      - name: Clone مخزن OHLC و محاسبه تعداد فایل‌های مورد انتظار
+        id: file_count
+        if: steps.turn_check.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          OHLC_REPO: ${{ secrets.OHLC_REPO }}
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${OHLC_REPO}.git" /tmp/ohlc_repo
+          cd /tmp/ohlc_repo
+          git sparse-checkout set data/All_Coins_Combined
+          COUNT=$(find data/All_Coins_Combined -maxdepth 1 -name "*.csv" | wc -l)
+          echo "📊 تعداد فایل‌های مورد انتظار (از OHLC_REPO): $COUNT عدد"
+          echo "required_file_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: ساخت لیست حداکثر ۴۰ استراتژی و تقسیم به چانک‌های ۲تایی
+        id: build_chunks
+        if: steps.turn_check.outputs.proceed == 'true'
+        env:
+          MAX_STRATEGIES_PER_RUN: "200"
+          CHUNK_SIZE: "10"
+        run: |
+          {
+            cd /tmp/third_repo
+            if [ ! -d "backtest_results" ]; then
+              echo "ℹ️ پوشه backtest_results وجود ندارد. هیچ استراتژی برای یکپارچه‌سازی یافت نشد."
+              FULL_LIST=""
+            else
+              FULL_LIST=$(find backtest_results -maxdepth 1 -type d -printf '%f\n' | tail -n +2 | sort -u)
+            fi
+            TOTAL_COUNT=$(printf '%s\n' "$FULL_LIST" | grep -c . || true)
+            echo "📊 تعداد کل استراتژی‌های یافت‌شده: $TOTAL_COUNT"
+
+            # حذف دائمی استراتژی‌هایی که قبلاً به یکی از پرچم‌های زیر افزوده شده‌اند
+            # (تا زمانی که کسی دستی نامشان را از فایل پرچم پاک نکند، دیگر وارد
+            # WORK_LIST نمی‌شوند و جای هیچ چانک/اجرایی را اشغال نمی‌کنند):
+            #   - missing_metadata.flag : متادیتای .js/1.json یافت نشد (کلید: BASE_STRAT)
+            #   - incomplete_files.flag : تعداد فایل‌های results.enc با REQUIRED_FILE_COUNT برابر نبود (کلید: STRAT)
+            #   - no_trades.flag        : یکپارچه‌سازی کامل شد اما هیچ معاملهٔ جدیدی یافت نشد (کلید: STRAT)
+            SKIP_FILE=$(mktemp)
+            for F in missing_metadata.flag incomplete_files.flag no_trades.flag; do
+              [ -f "$F" ] && cat "$F" >> "$SKIP_FILE"
+            done
+            sort -u -o "$SKIP_FILE" "$SKIP_FILE"
+            SKIP_COUNT=$(grep -c . "$SKIP_FILE" 2>/dev/null || true)
+            echo "🚫 تعداد نام‌های حذف‌شده به‌دلیل پرچم دائمی (missing_metadata/incomplete/no_trades): $SKIP_COUNT"
+
+            FULL_LIST=$(printf '%s\n' "$FULL_LIST" | while IFS= read -r NAME; do
+              [ -z "$NAME" ] && continue
+              BASE_NAME=$(echo "$NAME" | sed 's/_5m$//;s/_15m$//;s/_30m$//;s/_1h$//')
+              if grep -qxF "$NAME" "$SKIP_FILE" 2>/dev/null || grep -qxF "$BASE_NAME" "$SKIP_FILE" 2>/dev/null; then
+                continue
+              fi
+              printf '%s\n' "$NAME"
+            done)
+            rm -f "$SKIP_FILE"
+            TOTAL_COUNT=$(printf '%s\n' "$FULL_LIST" | grep -c . || true)
+            echo "📊 تعداد استراتژی‌های باقی‌مانده پس از فیلتر پرچم‌های دائمی: $TOTAL_COUNT"
+
+            WORK_LIST=$(printf '%s\n' "$FULL_LIST" | head -n "$MAX_STRATEGIES_PER_RUN")
+            HAS_MORE=false
+            if [ "$TOTAL_COUNT" -gt "$MAX_STRATEGIES_PER_RUN" ]; then
+              HAS_MORE=true
+            fi
+
+            CHUNKS_JSON=$(printf '%s\n' "$WORK_LIST" | jq -R -s -c --argjson n "$CHUNK_SIZE" '
+              def nwise(n): def n1: if length <= n then . else .[0:n], (.[n:] | n1) end; n1;
+              [splits("\n")] | map(select(length>0)) | [nwise($n)]
+            ')
+            CHUNK_COUNT=$(echo "$CHUNKS_JSON" | jq 'length')
+            CHUNK_INDICES=$(echo "$CHUNKS_JSON" | jq -c '[range(0; length)]')
+
+            echo "   📦 تعداد چانک‌ها: $CHUNK_COUNT (هر چانک حداکثر $CHUNK_SIZE استراتژی)"
+            echo "   📋 محتوای چانک‌ها: $CHUNKS_JSON"
+            echo "   ℹ️ has_more=$HAS_MORE (یعنی آیا بیش از $MAX_STRATEGIES_PER_RUN استراتژی در صف باقی مانده)"
+
+            echo "has_more=$HAS_MORE" >> "$GITHUB_OUTPUT"
+            echo "chunk_count=$CHUNK_COUNT" >> "$GITHUB_OUTPUT"
+            echo "chunk_indices=$CHUNK_INDICES" >> "$GITHUB_OUTPUT"
+            {
+              echo "chunks<<CHUNKS_EOF"
+              echo "$CHUNKS_JSON"
+              echo "CHUNKS_EOF"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+  # ============================================================
+  # Job 2b: یکپارچه‌سازی موازی (ماتریکس) — هر چانک ۲ استراتژی
+  # ============================================================
+  aggregate-results:
+    needs: aggregate-prepare
+    if: needs.aggregate-prepare.outputs.proceed == 'true' && needs.aggregate-prepare.outputs.chunk_count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk_index: ${{ fromJSON(needs.aggregate-prepare.outputs.chunk_indices) }}
+    steps:
+      - name: 0. نصب jq
+        run: |
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          fi
+
+      - name: Clone third repository (shallow clone)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git /tmp/third_repo
+          cd /tmp/third_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          echo "✅ مخزن سوم با موفقیت clone شد (چانک ${{ matrix.chunk_index }})."
+
+      - name: یکپارچه‌سازی چانک ${{ matrix.chunk_index }} (حداکثر ۲ استراتژی، با خواندن محلی)
+        id: aggregate
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+          REQUIRED_FILE_COUNT: ${{ needs.aggregate-prepare.outputs.required_file_count }}
+          CHUNKS_JSON: ${{ needs.aggregate-prepare.outputs.chunks }}
+          CHUNK_INDEX: ${{ matrix.chunk_index }}
+        run: |
+          {
+            echo "=============================================="
+            echo "   🔄 شروع یکپارچه‌سازی چانک $CHUNK_INDEX"
+            echo "=============================================="
+            mkdir -p /tmp/chunk_out/files
+            STRATEGIES_LIST=$(echo "$CHUNKS_JSON" | jq -r --argjson i "$CHUNK_INDEX" '.[$i][]')
+            echo "📦 استراتژی‌های محول‌شده به این چانک:"
+            echo "$STRATEGIES_LIST"
+            echo ""
+
+            MISSING_META_FILE="/tmp/third_repo/missing_metadata.flag"
+            MISSING_ADDITIONS="/tmp/chunk_out/missing_additions_${CHUNK_INDEX}.txt"
+            touch "$MISSING_ADDITIONS"
+            # نکته: برخلاف نسخه قبلی، این تابع دیگر مستقیماً missing_metadata.flag
+            # را در clone محلی تغییر نمی‌دهد (چون آن فایل بین همه چانک‌ها مشترک است
+            # و نوشتن هم‌زمان روی آن در ۲۰ چانک باعث تداخل می‌شود). به‌جایش هر چانک
+            # افزوده‌های خودش را در یک فایل جداگانه می‌نویسد و Job aggregate-collect
+            # در پایان همه‌ی این افزوده‌ها را یکجا و بدون تداخل با فایل اصلی ادغام می‌کند.
+            add_missing_metadata() {
+              local NAME="$1"
+              if ! grep -qxF "$NAME" "$MISSING_META_FILE" 2>/dev/null && ! grep -qxF "$NAME" "$MISSING_ADDITIONS" 2>/dev/null; then
+                echo "$NAME" >> "$MISSING_ADDITIONS"
+              fi
+            }
+
+            # همان الگوی missing_metadata: هر چانک افزوده‌های خودش را در فایل
+            # جداگانه می‌نویسد تا با نوشتن هم‌زمان ۲۰ چانک تداخل نکند؛
+            # aggregate-collect در پایان همه را در فایل اصلی ادغام می‌کند.
+            INCOMPLETE_FILE="/tmp/third_repo/incomplete_files.flag"
+            INCOMPLETE_ADDITIONS="/tmp/chunk_out/incomplete_additions_${CHUNK_INDEX}.txt"
+            touch "$INCOMPLETE_ADDITIONS"
+            add_incomplete() {
+              local NAME="$1"
+              if ! grep -qxF "$NAME" "$INCOMPLETE_FILE" 2>/dev/null && ! grep -qxF "$NAME" "$INCOMPLETE_ADDITIONS" 2>/dev/null; then
+                echo "$NAME" >> "$INCOMPLETE_ADDITIONS"
+              fi
+            }
+
+            NO_TRADES_FILE="/tmp/third_repo/no_trades.flag"
+            NO_TRADES_ADDITIONS="/tmp/chunk_out/no_trades_additions_${CHUNK_INDEX}.txt"
+            touch "$NO_TRADES_ADDITIONS"
+            add_no_trades() {
+              local NAME="$1"
+              if ! grep -qxF "$NAME" "$NO_TRADES_FILE" 2>/dev/null && ! grep -qxF "$NAME" "$NO_TRADES_ADDITIONS" 2>/dev/null; then
+                echo "$NAME" >> "$NO_TRADES_ADDITIONS"
+              fi
+            }
+
+            cd /tmp/third_repo
+
+            for STRAT in $STRATEGIES_LIST; do
+              [ -z "$STRAT" ] && continue
+              echo "=============================================="
+              echo "   📊 پردازش استراتژی: $STRAT (چانک $CHUNK_INDEX)"
+              echo "=============================================="
+              BASE_STRAT=$(echo "$STRAT" | sed 's/_5m$//;s/_15m$//;s/_30m$//;s/_1h$//')
+              if [ "$BASE_STRAT" = "$STRAT" ]; then
+                echo "   ℹ️ پسوند تایم‌فریم یافت نشد. BASE_STRAT = STRAT = $STRAT"
+              else
+                echo "   ℹ️ BASE_STRAT: $BASE_STRAT (پسوند تایم‌فریم از $STRAT حذف شد)"
+              fi
+              if [ -f "$MISSING_META_FILE" ] && grep -qxF "$BASE_STRAT" "$MISSING_META_FILE" 2>/dev/null; then
+                echo "   ⏭️ $BASE_STRAT قبلاً به‌دلیل نبود متادیتا در missing_metadata.flag ثبت شده. رد می‌شود."
+                continue
+              fi
+
+              AGG_FILE="aggregated/${STRAT}/${STRAT}_trades.enc"
+              STATUS_FILE="aggregated/${STRAT}/aggregation_status.json"
+              mkdir -p "/tmp/agg_${STRAT}"
+
+              echo "1- بررسی وجود فایل یکپارچه قبلی برای $STRAT ..."
+              EXISTING_TRADES_FILE="/tmp/agg_${STRAT}/existing_trades.json"
+              echo "[]" > "$EXISTING_TRADES_FILE"
+              if [ -f "/tmp/third_repo/$AGG_FILE" ]; then
+                echo "   📥 فایل یکپارچه قبلی وجود دارد. رمزگشایی..."
+                node -e "
+                  const crypto=require('crypto'),fs=require('fs');
+                  const pass=process.env.RESULTS_PASSWORD;
+                  const data=fs.readFileSync('/tmp/third_repo/$AGG_FILE');
+                  const key=crypto.scryptSync(pass,'salt',32);
+                  const iv=data.slice(0,16),enc=data.slice(16);
+                  const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+                  const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+                  const parsed=JSON.parse(dec);
+                  const trades=parsed.trades !== undefined ? parsed.trades : parsed;
+                  fs.writeFileSync('$EXISTING_TRADES_FILE', JSON.stringify(trades));
+                "
+                if [ $? -eq 0 ] && [ -f "$EXISTING_TRADES_FILE" ]; then
+                  echo "   ✅ فایل یکپارچه قبلی با موفقیت بارگذاری شد."
+                else
+                  echo "   ❌ خطا در رمزگشایی فایل یکپارچه قبلی."
+                fi
+              else
+                echo "   ℹ️ فایل یکپارچه قبلی وجود ندارد. یک فایل جدید ساخته خواهد شد."
+              fi
+
+              echo ""
+              echo "2- دریافت لیست فایل‌های results.enc برای $STRAT (اسکن محلی)..."
+              FILES=$(find "/tmp/third_repo/backtest_results/$STRAT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -u)
+              if [ -z "$FILES" ]; then
+                echo "   ⚠️ هیچ فایلی در backtest_results/$STRAT یافت نشد."
+                continue
+              fi
+              FILE_COUNT=$(echo "$FILES" | wc -l)
+              echo "   📊 تعداد فایل‌های یافت‌شده: $FILE_COUNT"
+
+              echo ""
+              echo "2.5- بررسی شرط تعداد فایل‌ها (REQUIRED_FILE_COUNT=$REQUIRED_FILE_COUNT از OHLC_REPO)..."
+              if [ "$FILE_COUNT" -ne "$REQUIRED_FILE_COUNT" ]; then
+                echo "   ⚠️ تعداد فایل‌ها ($FILE_COUNT) برابر با $REQUIRED_FILE_COUNT نیست. یکپارچه‌سازی $STRAT انجام نمی‌شود."
+                mkdir -p "/tmp/third_repo/aggregated/${STRAT}"
+                echo "{\"status\": \"incomplete\", \"file_count\": $FILE_COUNT, \"required_count\": $REQUIRED_FILE_COUNT}" > "/tmp/third_repo/$STATUS_FILE"
+                echo "   📝 وضعیت incomplete با تعداد فایل‌ها در $STATUS_FILE ثبت شد."
+                echo "   📝 $STRAT در incomplete_files.flag ثبت می‌شود و تا حذف دستی دیگر پردازش نمی‌شود."
+                add_incomplete "$STRAT"
+                rm -rf "/tmp/agg_${STRAT}"
+                echo ""
+                continue
+              fi
+              echo "   ✅ تعداد فایل‌ها دقیقاً $REQUIRED_FILE_COUNT است. یکپارچه‌سازی $STRAT انجام می‌شود."
+              echo ""
+
+              NEW_TRADES_FILE="/tmp/agg_${STRAT}/new_trades.json"
+              echo "[]" > "$NEW_TRADES_FILE"
+              SUCCESS_COUNT=0
+              FAIL_COUNT=0
+              for FOLDER in $FILES; do
+                ENC_FILE="/tmp/third_repo/backtest_results/${STRAT}/${FOLDER}/results.enc"
+                echo "   📄 پردازش: $ENC_FILE"
+                if [ ! -f "$ENC_FILE" ]; then
+                  echo "      ❌ فایل یافت نشد. رد می‌شود."
+                  FAIL_COUNT=$((FAIL_COUNT + 1))
+                  continue
+                fi
+                echo "      ⏳ رمزگشایی..."
+                set +e
+                node -e "
+                  const crypto=require('crypto'),fs=require('fs');
+                  const pass=process.env.RESULTS_PASSWORD;
+                  const data=fs.readFileSync('$ENC_FILE');
+                  const key=crypto.scryptSync(pass,'salt',32);
+                  const iv=data.slice(0,16),enc=data.slice(16);
+                  const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+                  const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+                  fs.writeFileSync('/tmp/agg_${STRAT}/temp.tar.gz',dec);
+                " 2>/tmp/agg_${STRAT}/decrypt_error.log
+                NODE_EXIT=$?
+                set -e
+                if [ $NODE_EXIT -ne 0 ]; then
+                  echo "      ❌ خطا در رمزگشایی (کد $NODE_EXIT)."
+                  FAIL_COUNT=$((FAIL_COUNT + 1))
+                  continue
+                fi
+                if [ ! -f "/tmp/agg_${STRAT}/temp.tar.gz" ] || [ ! -s "/tmp/agg_${STRAT}/temp.tar.gz" ]; then
+                  echo "      ❌ فایل tar.gz خروجی ناقص است."
+                  FAIL_COUNT=$((FAIL_COUNT + 1))
+                  continue
+                fi
+                echo "      ✅ رمزگشایی موفق."
+                echo "      ⏳ استخراج..."
+                tar -xzf "/tmp/agg_${STRAT}/temp.tar.gz" -C "/tmp/agg_${STRAT}/" 2>/tmp/agg_${STRAT}/tar_error.log
+                if [ $? -ne 0 ]; then
+                  echo "      ❌ خطا در استخراج tar.gz."
+                  FAIL_COUNT=$((FAIL_COUNT + 1))
+                  rm -f "/tmp/agg_${STRAT}/temp.tar.gz"
+                  continue
+                fi
+                EXTRACTED_DIR="/tmp/agg_${STRAT}/${FOLDER}"
+                TRADE_FILE="$EXTRACTED_DIR/trades_summary.json"
+                if [ -f "$TRADE_FILE" ]; then
+                  echo "      ⏳ خواندن معاملات..."
+                  COIN_NAME=$(basename "$FOLDER" | cut -d'-' -f1-2)
+                  jq -c --arg sym "$COIN_NAME" '[.trades[] | . + {symbol: $sym}]' "$TRADE_FILE" > "/tmp/agg_${STRAT}/current_trades.json" 2>/dev/null
+                  if [ ! -s "/tmp/agg_${STRAT}/current_trades.json" ]; then
+                    echo "      ⚠️ آرایه trades خالی یا null است. نادیده گرفته می‌شود."
+                    echo "[]" > "/tmp/agg_${STRAT}/current_trades.json"
+                  fi
+                else
+                  echo "      ❌ فایل trades_summary.json یافت نشد."
+                  FAIL_COUNT=$((FAIL_COUNT + 1))
+                  echo "[]" > "/tmp/agg_${STRAT}/current_trades.json"
+                fi
+                echo "      ⏳ ادغام با jq..."
+                set +e
+                jq -s '.[0] + .[1]' "$NEW_TRADES_FILE" "/tmp/agg_${STRAT}/current_trades.json" > "/tmp/agg_${STRAT}/merged_tmp.json"
+                JQ_EXIT=$?
+                set -e
+                if [ $JQ_EXIT -eq 0 ]; then
+                  mv "/tmp/agg_${STRAT}/merged_tmp.json" "$NEW_TRADES_FILE"
+                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                  echo "      ✅ معاملات ادغام شدند."
+                else
+                  echo "      ❌ خطا در ادغام JSON (کد $JQ_EXIT)."
+                  FAIL_COUNT=$((FAIL_COUNT + 1))
+                fi
+                rm -rf "$EXTRACTED_DIR" 2>/dev/null
+                rm -f "/tmp/agg_${STRAT}/temp.tar.gz" "/tmp/agg_${STRAT}/current_trades.json" "/tmp/agg_${STRAT}/merged_tmp.json"
+                echo ""
+              done
+              echo "   📊 جمع‌بندی پردازش استراتژی $STRAT: موفق=$SUCCESS_COUNT ناموفق=$FAIL_COUNT"
+              echo ""
+
+              if [ ! -s "$NEW_TRADES_FILE" ] || [ "$(cat "$NEW_TRADES_FILE")" = "[]" ]; then
+                echo "   ⚠️ هیچ معامله جدیدی برای ادغام وجود ندارد."
+                echo "   📝 $STRAT در no_trades.flag ثبت می‌شود و تا حذف دستی دیگر پردازش نمی‌شود."
+                add_no_trades "$STRAT"
+                echo "   🧹 پاک‌سازی results.enc های خام $STRAT (تا این فایل‌ها هم در اسکن بعدی دوباره باز نشوند)..."
+                for FOLDER in $FILES; do
+                  rm -f "/tmp/third_repo/backtest_results/${STRAT}/${FOLDER}/results.enc" 2>/dev/null
+                  rm -rf "/tmp/third_repo/backtest_results/${STRAT}/${FOLDER}" 2>/dev/null
+                done
+                rm -rf "/tmp/agg_${STRAT}"
+                echo ""
+                continue
+              fi
+
+              echo "   ⏳ ادغام نهایی با فایل یکپارچه قبلی..."
+              set +e
+              jq -s '.[0] + .[1]' "$EXISTING_TRADES_FILE" "$NEW_TRADES_FILE" > "/tmp/agg_${STRAT}/combined_trades.json"
+              JQ_EXIT=$?
+              set -e
+              if [ $JQ_EXIT -ne 0 ]; then
+                echo "   ❌ خطا در ادغام نهایی. استفاده از فایل معاملات جدید به تنهایی."
+                cp "$NEW_TRADES_FILE" "/tmp/agg_${STRAT}/combined_trades.json"
+              fi
+              echo "   ✅ ادغام نهایی کامل شد."
+
+              # ========== متادیتا: اولویت ۱ .js، اولویت ۲ 1.json ==========
+              echo "   📥 بررسی متادیتا برای $STRAT (BASE_STRAT=$BASE_STRAT)..."
+              METADATA_SUCCESS=false
+              META_SOURCE=""
+              META_FILE="/tmp/third_repo/strategies/${BASE_STRAT}/1.json"
+              META_DONE_FLAG="/tmp/third_repo/strategies/${BASE_STRAT}/.metadata_generated"
+              JS_FILE="/tmp/third_repo/strategies/${BASE_STRAT}.js"
+              STRAT_DIR="/tmp/third_repo/strategies/${BASE_STRAT}/"
+              mkdir -p "$STRAT_DIR"
+
+              if [ -f "$JS_FILE" ]; then
+                echo "   🔧 [اولویت ۱] فایل ${JS_FILE} یافت شد → استخراج متادیتا از .js..."
+                set +e
+                node -e "
+                  const fs = require('fs');
+                  const jsContent = fs.readFileSync('$JS_FILE', 'utf8');
+                  let move_percents = [];
+                  let source = 'none';
+                  const stagesMatch = jsContent.match(/stopLossStages\s*[:=]\s*\[([\s\S]*?)\]/);
+                  if (stagesMatch) {
+                    const mpMatches = [...stagesMatch[1].matchAll(/movePercent\s*:\s*([\d.]+)/g)];
+                    if (mpMatches.length > 0) { move_percents = mpMatches.map(m => parseFloat(m[1])); source = 'stopLossStages'; }
+                  }
+                  if (move_percents.length === 0) {
+                    const mmArr = jsContent.match(/movePercent\s*[:=]\s*\[(.*?)\]/s);
+                    if (mmArr) {
+                      const numbers = mmArr[1].match(/[\d.]+/g);
+                      if (numbers && numbers.length > 0) { move_percents = numbers.map(Number); source = 'movePercent_direct'; }
+                    }
+                  }
+                  if (move_percents.length === 0) { source = 'empty_fallback'; }
+                  console.log('منبع move_percents: ' + source);
+                  console.log('move_percents استخراج‌شده (' + move_percents.length + ' عنصر): ' + JSON.stringify(move_percents));
+
+                  let stop_loss = null;
+                  let sl_source = 'none';
+                  let slMatch = jsContent.match(/stopLossInitial\s*[:=]\s*(-?[\d.]+)/);
+                  if (slMatch) { stop_loss = parseFloat(slMatch[1]); sl_source = 'stopLossInitial_direct'; }
+                  else {
+                    const slFormulaMatch = jsContent.match(/stopLoss\s*:\s*close\s*\*\s*([\d.]+)/);
+                    if (slFormulaMatch) {
+                      const multiplier = parseFloat(slFormulaMatch[1]);
+                      stop_loss = parseFloat(((1 - multiplier) * 100).toFixed(6));
+                      sl_source = 'stopLoss_close_formula';
+                    }
+                  }
+                  if (stop_loss === null) { console.error('__NO_STOP_LOSS_INITIAL__'); process.exit(1); }
+                  console.log('منبع stop_loss_initial: ' + sl_source);
+                  console.log('stop_loss_initial از .js خوانده شد: ' + stop_loss);
+                  let max_move = move_percents.length ? move_percents[move_percents.length-1] : null;
+                  const meta = { move_percents: move_percents, stop_loss_initial: stop_loss, max_move_percent: max_move };
+                  fs.writeFileSync('$META_FILE', JSON.stringify(meta, null, 2));
+                "
+                JS_META_EXIT=$?
+                set -e
+
+                if [ $JS_META_EXIT -ne 0 ]; then
+                  echo "   ❌ نه stopLossInitial و نه فرمول stopLoss: close * عدد در فایل ${JS_FILE} یافت نشد."
+                  echo "   📝 $BASE_STRAT در فهرست افزوده‌های این چانک ثبت می‌شود و رد می‌شود (بدون fail شدن pipeline)."
+                  add_missing_metadata "$BASE_STRAT"
+                  rm -rf "/tmp/agg_${STRAT}"
+                  continue
+                fi
+
+                if [ -s "$META_FILE" ]; then
+                  echo "   ✅ متادیتا با موفقیت از .js استخراج و در 1.json ذخیره شد."
+                  cp "$META_FILE" "/tmp/agg_${STRAT}/1.json"
+                  METADATA_SUCCESS=true
+                  META_SOURCE=".js"
+                  touch "$META_DONE_FLAG"
+                else
+                  echo "   ❌ ساخت فایل 1.json از .js ناموفق بود."
+                  rm -rf "/tmp/agg_${STRAT}"
+                  continue
+                fi
+              fi
+
+              if [ "$METADATA_SUCCESS" = false ]; then
+                echo "   ℹ️ فایل ${JS_FILE} یافت نشد → بازگشت به fallback (1.json)."
+                if [ -f "$META_FILE" ]; then
+                  HAS_SL=$(jq 'has("stop_loss_initial") and .stop_loss_initial != null' "$META_FILE")
+                  if [ "$HAS_SL" != "true" ]; then
+                    echo "   ❌ stop_loss_initial در فایل ${META_FILE} یافت نشد."
+                    echo "   📝 $BASE_STRAT در فهرست افزوده‌های این چانک ثبت می‌شود و رد می‌شود."
+                    add_missing_metadata "$BASE_STRAT"
+                    rm -rf "/tmp/agg_${STRAT}"
+                    continue
+                  fi
+                  echo "   ✅ فایل 1.json از مخزن محلی یافت شد."
+                  cp "$META_FILE" "/tmp/agg_${STRAT}/1.json"
+                  METADATA_SUCCESS=true
+                  META_SOURCE="1.json"
+                  touch "$META_DONE_FLAG"
+                else
+                  echo "   ❌ نه فایل ${JS_FILE} و نه فایل ${META_FILE} یافت نشد. این استراتژی رد می‌شود."
+                  echo "   📝 $BASE_STRAT در فهرست افزوده‌های این چانک ثبت می‌شود و رد می‌شود."
+                  add_missing_metadata "$BASE_STRAT"
+                  rm -rf "/tmp/agg_${STRAT}"
+                  continue
+                fi
+              fi
+
+              echo "   ✅ [متادیتا] منبع نهایی برای $STRAT: $META_SOURCE"
+
+              MOVE_PERCENTS=$(jq -c '.move_percents // []' "/tmp/agg_${STRAT}/1.json")
+              STOP_LOSS=$(jq '.stop_loss_initial' "/tmp/agg_${STRAT}/1.json")
+              if [ "$STOP_LOSS" = "null" ]; then
+                echo "   ❌ stop_loss_initial اجباری است و در متادیتای نهایی یافت نشد."
+                add_missing_metadata "$BASE_STRAT"
+                rm -rf "/tmp/agg_${STRAT}"
+                continue
+              fi
+              MAX_MOVE=$(jq '.max_move_percent // (if .move_percents then .move_percents[-1] else null end)' "/tmp/agg_${STRAT}/1.json")
+
+              jq -n \
+                --argjson move_percents "$MOVE_PERCENTS" \
+                --argjson stop_loss "$STOP_LOSS" \
+                --argjson max_move "$MAX_MOVE" \
+                --slurpfile trades "/tmp/agg_${STRAT}/combined_trades.json" \
+                '{trades: $trades[0], metadata: {move_percents: $move_percents, stop_loss_initial: $stop_loss, max_move_percent: $max_move}}' \
+                > "/tmp/agg_${STRAT}/final_package.json"
+
+              echo "3- رمزنگاری فایل یکپارچه جدید (شامل متادیتا)..."
+              node -e "
+                const crypto=require('crypto'),fs=require('fs');
+                const pass=process.env.RESULTS_PASSWORD;
+                const data=fs.readFileSync('/tmp/agg_${STRAT}/final_package.json');
+                const key=crypto.scryptSync(pass,'salt',32);
+                const iv=crypto.randomBytes(16);
+                const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+                const enc=Buffer.concat([cipher.update(data),cipher.final()]);
+                fs.writeFileSync('/tmp/agg_${STRAT}/final.enc', Buffer.concat([iv,enc]));
+              "
+              if [ $? -ne 0 ]; then
+                echo "   ❌ خطا در رمزنگاری فایل یکپارچه."
+                rm -rf "/tmp/agg_${STRAT}"
+                continue
+              fi
+              mkdir -p "/tmp/third_repo/aggregated/${STRAT}"
+              cp "/tmp/agg_${STRAT}/final.enc" "/tmp/third_repo/$AGG_FILE"
+              echo "   ✅ فایل یکپارچه در clone محلی ذخیره شد."
+
+              echo "4- پاک‌سازی results.enc های قدیمی $STRAT از clone محلی..."
+              for FOLDER in $FILES; do
+                ENC_PATH="/tmp/third_repo/backtest_results/${STRAT}/${FOLDER}/results.enc"
+                rm -f "$ENC_PATH" 2>/dev/null && echo "   ✅ حذف موفق $ENC_PATH"
+                rm -rf "/tmp/third_repo/backtest_results/${STRAT}/${FOLDER}" 2>/dev/null
+              done
+
+              rm -rf "/tmp/agg_${STRAT}"
+              echo ""
+            done
+
+            echo ""
+            echo "📦 بسته‌بندی تغییرات چانک $CHUNK_INDEX به‌صورت artifact (بدون push مستقیم به مخزن سوم)..."
+            cd /tmp/third_repo
+            git add -A
+            CHANGES_FILE="/tmp/chunk_out/changes_${CHUNK_INDEX}.txt"
+            git diff --cached --name-status > "$CHANGES_FILE" || true
+            while IFS=$'\t' read -r FSTATUS FILEPATH; do
+              [ -z "$FILEPATH" ] && continue
+              case "$FSTATUS" in
+                A|M)
+                  mkdir -p "/tmp/chunk_out/files/$(dirname "$FILEPATH")"
+                  cp "$FILEPATH" "/tmp/chunk_out/files/$FILEPATH"
+                  ;;
+              esac
+            done < "$CHANGES_FILE"
+            CHANGE_COUNT=$(wc -l < "$CHANGES_FILE" | tr -d ' ')
+            echo "✅ تغییرات چانک $CHUNK_INDEX بسته‌بندی شد ($CHANGE_COUNT تغییر)."
+          }
+
+      - name: آپلود artifact چانک ${{ matrix.chunk_index }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agg-chunk-${{ matrix.chunk_index }}
+          path: /tmp/chunk_out
+          retention-days: 1
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 2c: اعمال یکجای تغییرات همه چانک‌ها + تنها push به مخزن سوم
+  # این جاب به aggregate-results وابسته است، پس تا وقتی هر ۲۰ چانک
+  # (یا تعداد کمتر در صورت وجود استراتژی‌های کمتر) تمام نشوند اجرا نمی‌شود.
+  # اگر حتی یک چانک fail/cancel شود، هیچ push ای انجام نمی‌شود.
+  # ============================================================
+  aggregate-collect:
+    needs: [aggregate-prepare, aggregate-results]
+    if: >
+      needs.aggregate-prepare.outputs.proceed == 'true' &&
+      needs.aggregate-results.result != 'failure' &&
+      needs.aggregate-results.result != 'cancelled'
+    runs-on: ubuntu-latest
+    outputs:
+      had_work: ${{ steps.apply.outputs.had_work }}
+    steps:
+      - name: 0. نصب jq
+        run: |
+          if ! command -v jq &> /dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          fi
+
+      - name: دانلود همه artifact های چانک‌ها
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agg-chunk-*
+          path: /tmp/collected
+          merge-multiple: true
+
+      - name: Clone third repository (تنها نویسنده در کل فرآیند — بدون رقابت)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth 1 https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git /tmp/third_repo
+          cd /tmp/third_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          echo "✅ مخزن سوم با موفقیت clone شد."
+
+      - name: اعمال تغییرات همه چانک‌ها روی clone
+        id: apply
+        run: |
+          {
+            TOTAL_CHANGES=0
+            if [ -d /tmp/collected ]; then
+              for CH in /tmp/collected/changes_*.txt; do
+                [ -f "$CH" ] || continue
+                echo "🔧 اعمال $CH ..."
+                while IFS=$'\t' read -r FSTATUS FILEPATH; do
+                  [ -z "$FILEPATH" ] && continue
+                  TOTAL_CHANGES=$((TOTAL_CHANGES + 1))
+                  case "$FSTATUS" in
+                    A|M)
+                      mkdir -p "/tmp/third_repo/$(dirname "$FILEPATH")"
+                      cp "/tmp/collected/files/$FILEPATH" "/tmp/third_repo/$FILEPATH"
+                      ;;
+                    D)
+                      rm -f "/tmp/third_repo/$FILEPATH" 2>/dev/null
+                      ;;
+                  esac
+                done < "$CH"
+              done
+
+              echo "🔧 ادغام افزوده‌های missing_metadata.flag از همه چانک‌ها..."
+              touch /tmp/third_repo/missing_metadata.flag
+              for MF in /tmp/collected/missing_additions_*.txt; do
+                [ -f "$MF" ] || continue
+                while IFS= read -r NAME; do
+                  [ -z "$NAME" ] && continue
+                  grep -qxF "$NAME" /tmp/third_repo/missing_metadata.flag 2>/dev/null || echo "$NAME" >> /tmp/third_repo/missing_metadata.flag
+                done < "$MF"
+              done
+
+              echo "🔧 ادغام افزوده‌های incomplete_files.flag از همه چانک‌ها..."
+              touch /tmp/third_repo/incomplete_files.flag
+              for MF in /tmp/collected/incomplete_additions_*.txt; do
+                [ -f "$MF" ] || continue
+                while IFS= read -r NAME; do
+                  [ -z "$NAME" ] && continue
+                  grep -qxF "$NAME" /tmp/third_repo/incomplete_files.flag 2>/dev/null || echo "$NAME" >> /tmp/third_repo/incomplete_files.flag
+                done < "$MF"
+              done
+
+              echo "🔧 ادغام افزوده‌های no_trades.flag از همه چانک‌ها..."
+              touch /tmp/third_repo/no_trades.flag
+              for MF in /tmp/collected/no_trades_additions_*.txt; do
+                [ -f "$MF" ] || continue
+                while IFS= read -r NAME; do
+                  [ -z "$NAME" ] && continue
+                  grep -qxF "$NAME" /tmp/third_repo/no_trades.flag 2>/dev/null || echo "$NAME" >> /tmp/third_repo/no_trades.flag
+                done < "$MF"
+              done
+            else
+              echo "ℹ️ هیچ artifact ای دانلود نشد."
+            fi
+
+            echo "📊 مجموع تغییرات جمع‌آوری‌شده از همه چانک‌ها: $TOTAL_CHANGES"
+            if [ "$TOTAL_CHANGES" -gt 0 ]; then
+              echo "had_work=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "had_work=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+      - name: Commit and push changes back to third repo (تنها push در کل فرآیند یکپارچه‌سازی)
+        run: |
+          cd /tmp/third_repo
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Aggregate results (matrix chunks) and clean up processed files (run ${{ github.run_id }})"
+            PUSH_SUCCESS=false
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push موفق بود (تلاش $attempt)."
+                PUSH_SUCCESS=true
+                break
+              fi
+              WAIT=$((RANDOM % 10 + 3))
+              echo "⚠️ تلاش $attempt ناموفق (non-fast-forward یا conflict). ${WAIT} ثانیه صبر می‌کنم..."
+              sleep $WAIT
+            done
+            if [ "$PUSH_SUCCESS" = "false" ]; then
+              echo "❌ push پس از ۱۰ تلاش ناموفق بود."
+              exit 1
+            fi
+          fi
+
+
+
+  # ============================================================
+  # Job 2.4: آپلود سایر خروجی‌ها (batch_outputs/ و reports/) از مخزن اصلی
+  # به مخزن سوم، و نوبت‌دهی منصفانه (فقط اگر نوبت این اجرا بود)
+  # ============================================================
+  upload-other-outputs:
+    needs: [aggregate-prepare, aggregate-collect]
+    if: needs.aggregate-prepare.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout مخزن اصلی
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: Clone مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" \
+            /tmp/third_repo
+          cd /tmp/third_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: مهاجرت یک‌باره‌ی خروجی combo که قبلاً اشتباهاً در backtest_results/ ذخیره شده
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          cd /tmp/third_repo
+
+          if [ -f migration_backtest_results_signatures.flag ]; then
+            echo "ℹ️ این مهاجرت قبلاً یک‌بار انجام شده — رد می‌شود."
+            exit 0
+          fi
+
+          if [ ! -d backtest_results ]; then
+            echo "ℹ️ backtest_results/ یافت نشد — چیزی برای مهاجرت نیست."
+            touch migration_backtest_results_signatures.flag
+            git add -f migration_backtest_results_signatures.flag
+            git commit -m "mark migration done (nothing to migrate, run ${{ github.run_id }})" || true
+            git push || true
+            exit 0
+          fi
+
+          # ---------- بخش امن: chunk_*/signatures/{module}/{strategy}/ ----------
+          # این ساختار دقیقاً شناخته‌شده است (خروجی خام batch، رمزنگاری/فشرده‌سازی‌نشده)
+          STRAT_DIRS=$(find backtest_results -mindepth 4 -maxdepth 4 -type d -path "backtest_results/chunk_*/signatures/*/*" 2>/dev/null | sort -u)
+          if [ -n "$STRAT_DIRS" ]; then
+            echo "🔎 خروجی combo در مسیر قدیمی (chunk_*/signatures/...) یافت شد — مهاجرت به signature_archives/ ..."
+            PAIRS=""
+            while IFS= read -r D; do
+              [ -z "$D" ] && continue
+              MODULE=$(basename "$(dirname "$D")")
+              STRAT=$(basename "$D")
+              PAIRS="${PAIRS}${MODULE}|${STRAT}"$'\n'
+            done <<< "$STRAT_DIRS"
+            PAIRS=$(echo "$PAIRS" | sort -u | grep -v '^$' || true)
+
+            mkdir -p /tmp/sig_stage
+            while IFS='|' read -r MODULE STRAT; do
+              [ -z "$MODULE" ] && continue
+              SAFE_STRAT=$(echo "$STRAT" | sed 's/[^a-zA-Z0-9._-]/_/g')
+              STAGE_DIR="/tmp/sig_stage/signatures/${MODULE}/${STRAT}"
+              mkdir -p "$STAGE_DIR"
+              for SRC_DIR in backtest_results/chunk_*/signatures/${MODULE}/${STRAT}; do
+                [ -d "$SRC_DIR" ] || continue
+                cp -r "$SRC_DIR"/. "$STAGE_DIR"/
+              done
+
+              JSONL_COUNT=$(find "$STAGE_DIR" -name '*.jsonl' 2>/dev/null | wc -l)
+              if [ "$JSONL_COUNT" -eq 0 ]; then
+                echo "ℹ️ هیچ JSONL برای $MODULE/$STRAT یافت نشد — رد می‌شود."
+                continue
+              fi
+
+              ARCHIVE="/tmp/${SAFE_STRAT}_migrated.tar.gz"
+              ENC="/tmp/${SAFE_STRAT}_migrated.tar.gz.enc"
+              tar -czf "$ARCHIVE" -C /tmp/sig_stage "signatures/${MODULE}/${STRAT}"
+              node -e "
+                const crypto=require('crypto'),fs=require('fs');
+                const pass=process.env.RESULTS_PASSWORD;
+                const data=fs.readFileSync('$ARCHIVE');
+                const key=crypto.scryptSync(pass,'salt',32);
+                const iv=crypto.randomBytes(16);
+                const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+                const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
+                fs.writeFileSync('$ENC', enc);
+              "
+              DEST_DIR="signature_archives/${MODULE}/${STRAT}"
+              mkdir -p "$DEST_DIR"
+              cp "$ENC" "$DEST_DIR/${SAFE_STRAT}_migrated.tar.gz.enc"
+              echo "✅ مهاجرت: $MODULE/$STRAT → signature_archives/${MODULE}/${STRAT}/ ($JSONL_COUNT فایل)"
+              rm -f "$ARCHIVE" "$ENC"
+            done <<< "$PAIRS"
+            rm -rf /tmp/sig_stage
+
+            # حذف chunk_*/signatures از backtest_results پس از مهاجرت موفق
+            find backtest_results -maxdepth 1 -type d -name "chunk_*" -exec rm -rf {}/signatures \; 2>/dev/null || true
+            # حذف پوشه‌های chunk_* که کاملاً خالی شدند
+            find backtest_results -maxdepth 1 -type d -name "chunk_*" -empty -delete 2>/dev/null || true
+          else
+            echo "ℹ️ هیچ chunk_*/signatures/ ای برای مهاجرت یافت نشد."
+          fi
+
+          # ---------- بخش نامطمئن: پوشه‌های ریشه‌ی backtest_results که با الگوی chunk_* مطابقت ندارند ----------
+          AMBIGUOUS=$(find backtest_results -mindepth 1 -maxdepth 1 -type d ! -name 'chunk_*' 2>/dev/null | sort)
+          if [ -n "$AMBIGUOUS" ]; then
+            echo ""
+            echo "⚠️⚠️⚠️ این پوشه‌ها در ریشه‌ی backtest_results/ هستند و با الگوی شناخته‌شده مطابقت ندارند —"
+            echo "دست‌نخورده باقی می‌مانند چون ماژول (combo_10day یا combo_monthly) آن‌ها مشخص نیست:"
+            echo "$AMBIGUOUS"
+            echo "برای مهاجرت این‌ها، لطفاً ماژول درست هرکدام را مشخص کنید."
+            echo ""
+          fi
+
+          touch migration_backtest_results_signatures.flag
+          git add -A
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "migrate legacy combo signatures to signature_archives (run ${{ github.run_id }})"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push مهاجرت موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+      - name: آپلود batch_outputs/ و reports/ به مخزن سوم (در صورت وجود)
+        id: upload
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          UPLOADED=false
+
+          if [ -d "batch_outputs" ] && [ -n "$(find batch_outputs -type f 2>/dev/null)" ]; then
+            echo "📦 batch_outputs/ در مخزن اصلی یافت شد."
+
+            # ---------- ۱) خروجی combo_10day/combo_monthly: بسته‌بندی+رمزنگاری → signature_archives/ ----------
+            SIG_ROOTS=$(find batch_outputs -type d \( -path "*/signatures/combo_10day" -o -path "*/signatures/combo_monthly" \) 2>/dev/null | sort -u)
+            if [ -n "$SIG_ROOTS" ]; then
+              echo "🔎 خروجی signature (combo_10day/combo_monthly) یافت شد — بسته‌بندی و انتقال به signature_archives/ ..."
+              PAIRS=""
+              for ROOT in $SIG_ROOTS; do
+                MODULE=$(basename "$ROOT")
+                for STRAT_DIR in "$ROOT"/*/; do
+                  [ -d "$STRAT_DIR" ] || continue
+                  STRAT=$(basename "$STRAT_DIR")
+                  PAIRS="${PAIRS}${MODULE}|${STRAT}"$'\n'
+                done
+              done
+              PAIRS=$(echo "$PAIRS" | sort -u | grep -v '^$' || true)
+
+              mkdir -p /tmp/sig_stage
+              while IFS='|' read -r MODULE STRAT; do
+                [ -z "$MODULE" ] && continue
+                SAFE_STRAT=$(echo "$STRAT" | sed 's/[^a-zA-Z0-9._-]/_/g')
+                STAGE_DIR="/tmp/sig_stage/signatures/${MODULE}/${STRAT}"
+                mkdir -p "$STAGE_DIR"
+                for SRC_DIR in batch_outputs/*/signatures/${MODULE}/${STRAT}; do
+                  [ -d "$SRC_DIR" ] || continue
+                  cp -r "$SRC_DIR"/. "$STAGE_DIR"/
+                done
+
+                JSONL_COUNT=$(find "$STAGE_DIR" -name '*.jsonl' 2>/dev/null | wc -l)
+                if [ "$JSONL_COUNT" -eq 0 ]; then
+                  echo "ℹ️ هیچ JSONL برای $MODULE/$STRAT یافت نشد — رد می‌شود."
+                  continue
+                fi
+
+                ARCHIVE="/tmp/${SAFE_STRAT}_signatures.tar.gz"
+                ENC="/tmp/${SAFE_STRAT}_signatures.tar.gz.enc"
+                # -C /tmp/sig_stage signatures/${MODULE}/${STRAT}: دقیقاً مثل نسخه‌ی قدیمی،
+                # مسیر signatures/{module}/{strategy}/... باید داخل خود آرشیو حفظ شود
+                # (نه فقط {strategy}/...)، چون ورک‌فلوهای بعدی همین ساختار را انتظار دارند.
+                tar -czf "$ARCHIVE" -C /tmp/sig_stage "signatures/${MODULE}/${STRAT}"
+                node -e "
+                  const crypto=require('crypto'),fs=require('fs');
+                  const pass=process.env.RESULTS_PASSWORD;
+                  const data=fs.readFileSync('$ARCHIVE');
+                  const key=crypto.scryptSync(pass,'salt',32);
+                  const iv=crypto.randomBytes(16);
+                  const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+                  const enc=Buffer.concat([cipher.update(data),cipher.final()]);
+                  fs.writeFileSync('$ENC', Buffer.concat([iv, enc]));
+                "
+                DEST_DIR="/tmp/third_repo/signature_archives/${MODULE}/${STRAT}"
+                mkdir -p "$DEST_DIR"
+                DEST_FILE="$DEST_DIR/${SAFE_STRAT}_run${{ github.run_id }}.tar.gz.enc"
+                cp "$ENC" "$DEST_FILE"
+                echo "✅ signature_archives/${MODULE}/${STRAT} → $(basename "$DEST_FILE") ($JSONL_COUNT فایل JSONL)"
+                rm -f "$ARCHIVE" "$ENC"
+              done <<< "$PAIRS"
+              rm -rf /tmp/sig_stage
+
+              # حذف زیرشاخه‌های combo_10day/combo_monthly از batch_outputs تا در کپی زیر
+              # به‌اشتباه وارد backtest_results/ نشوند (آنجا فقط مال خروجی خام loop.yml است)
+              find batch_outputs -type d \( -path "*/signatures/combo_10day" -o -path "*/signatures/combo_monthly" \) -exec rm -rf {} + 2>/dev/null || true
+              UPLOADED=true
+            fi
+
+            # ---------- ۱.۵) CSV آستانه/نسبت_شانس combo_10day/combo_monthly → pattern_archives/ ----------
+            # همان الگوی signature_archives، فقط برای CSV اصلی ترکیب‌های تک/چند-شاخصی
+            # (که قبلاً در fixed تولید می‌شد ولی دور ریخته می‌شد و اخیراً به
+            # batch_outputs/{module}_patterns/ اضافه شد). بدون این بخش، این داده‌ها
+            # هم مثل بقیه‌ی CSVها به‌اشتباه وارد backtest_results/ می‌شدند.
+            PAT_ROOTS=$(find batch_outputs -type d \( -path "*/combo_10day_patterns" -o -path "*/combo_monthly_patterns" \) 2>/dev/null | sort -u)
+            if [ -n "$PAT_ROOTS" ]; then
+              echo "🔎 CSV آستانه/نسبت_شانس (combo_10day_patterns/combo_monthly_patterns) یافت شد — بسته‌بندی و انتقال به pattern_archives/ ..."
+              PAT_PAIRS=""
+              for ROOT in $PAT_ROOTS; do
+                MODULE=$(basename "$ROOT" | sed 's/_patterns$//')
+                for STRAT_DIR in "$ROOT"/*/; do
+                  [ -d "$STRAT_DIR" ] || continue
+                  STRAT=$(basename "$STRAT_DIR")
+                  PAT_PAIRS="${PAT_PAIRS}${MODULE}|${STRAT}"$'\n'
+                done
+              done
+              PAT_PAIRS=$(echo "$PAT_PAIRS" | sort -u | grep -v '^$' || true)
+
+              mkdir -p /tmp/pat_stage
+              while IFS='|' read -r MODULE STRAT; do
+                [ -z "$MODULE" ] && continue
+                SAFE_STRAT=$(echo "$STRAT" | sed 's/[^a-zA-Z0-9._-]/_/g')
+                STAGE_DIR="/tmp/pat_stage/patterns/${MODULE}/${STRAT}"
+                mkdir -p "$STAGE_DIR"
+                for SRC_DIR in batch_outputs/*/${MODULE}_patterns/${STRAT}; do
+                  [ -d "$SRC_DIR" ] || continue
+                  cp -r "$SRC_DIR"/. "$STAGE_DIR"/
+                done
+
+                CSV_COUNT=$(find "$STAGE_DIR" -name '*.csv' 2>/dev/null | wc -l)
+                if [ "$CSV_COUNT" -eq 0 ]; then
+                  echo "ℹ️ هیچ CSV برای $MODULE/$STRAT یافت نشد — رد می‌شود."
+                  continue
+                fi
+
+                ARCHIVE="/tmp/${SAFE_STRAT}_patterns.tar.gz"
+                ENC="/tmp/${SAFE_STRAT}_patterns.tar.gz.enc"
+                # همان قرارداد signature_archives: مسیر patterns/{module}/{strategy}/...
+                # داخل خود آرشیو حفظ می‌شود تا مصرف‌کننده‌ی بعدی (build_all_queues.py)
+                # بتواند مشابه signatures/ پردازشش کند.
+                tar -czf "$ARCHIVE" -C /tmp/pat_stage "patterns/${MODULE}/${STRAT}"
+                node -e "
+                  const crypto=require('crypto'),fs=require('fs');
+                  const pass=process.env.RESULTS_PASSWORD;
+                  const data=fs.readFileSync('$ARCHIVE');
+                  const key=crypto.scryptSync(pass,'salt',32);
+                  const iv=crypto.randomBytes(16);
+                  const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+                  const enc=Buffer.concat([cipher.update(data),cipher.final()]);
+                  fs.writeFileSync('$ENC', Buffer.concat([iv, enc]));
+                "
+                DEST_DIR="/tmp/third_repo/pattern_archives/${MODULE}/${STRAT}"
+                mkdir -p "$DEST_DIR"
+                DEST_FILE="$DEST_DIR/${SAFE_STRAT}_run${{ github.run_id }}.tar.gz.enc"
+                cp "$ENC" "$DEST_FILE"
+                echo "✅ pattern_archives/${MODULE}/${STRAT} → $(basename "$DEST_FILE") ($CSV_COUNT فایل CSV)"
+                rm -f "$ARCHIVE" "$ENC"
+              done <<< "$PAT_PAIRS"
+              rm -rf /tmp/pat_stage
+
+              # حذف زیرشاخه‌های *_patterns از batch_outputs تا در کپی زیر
+              # به‌اشتباه وارد backtest_results/ نشوند
+              find batch_outputs -type d \( -path "*/combo_10day_patterns" -o -path "*/combo_monthly_patterns" \) -exec rm -rf {} + 2>/dev/null || true
+              UPLOADED=true
+            fi
+
+            # ---------- ۲) بقیه‌ی batch_outputs/ (CSV سایر ماژول‌ها) طبق روال قبلی ----------
+            if [ -n "$(find batch_outputs -type f 2>/dev/null)" ]; then
+              echo "📦 بقیه‌ی batch_outputs/ — آپلود به backtest_results/ در مخزن سوم..."
+              mkdir -p /tmp/third_repo/backtest_results
+              cp -r batch_outputs/. /tmp/third_repo/backtest_results/
+              UPLOADED=true
+            fi
+          else
+            echo "ℹ️ batch_outputs/ در مخزن اصلی یافت نشد یا خالی است."
+          fi
+
+          if [ -d "reports" ] && [ -n "$(find reports -type f 2>/dev/null)" ]; then
+            echo "📦 reports/ در مخزن اصلی یافت شد — انتقال reports.tar.gz.enc به ریشه‌ی مخزن سوم..."
+            if [ -f "reports/reports.tar.gz.enc" ]; then
+              cp "reports/reports.tar.gz.enc" "/tmp/third_repo/reports.tar.gz.enc"
+              UPLOADED=true
+            else
+              echo "⚠️ فایل reports/reports.tar.gz.enc یافت نشد."
+            fi
+          else
+            echo "ℹ️ reports/ در مخزن اصلی یافت نشد یا خالی است."
+          fi
+
+          # ---------- ۳) golden_outputs/ → ریشه‌ی مخزن سوم (بسته‌بندی+رمزنگاری، مثل نسخه‌ی قدیمی) ----------
+          if [ -d "golden_outputs" ] && [ -n "$(find golden_outputs -type f 2>/dev/null)" ]; then
+            echo "📦 golden_outputs/ یافت شد — بسته‌بندی/رمزنگاری/انتقال به ریشه‌ی مخزن سوم..."
+            for f in golden_outputs/*.csv; do
+              [ -f "$f" ] || continue
+              FNAME=$(basename "$f")
+              tar -czf "/tmp/${FNAME}.tar.gz" -C golden_outputs "$FNAME"
+              node -e "
+                const crypto=require('crypto'),fs=require('fs');
+                const pass=process.env.RESULTS_PASSWORD;
+                const data=fs.readFileSync('/tmp/${FNAME}.tar.gz');
+                const key=crypto.scryptSync(pass,'salt',32);
+                const iv=crypto.randomBytes(16);
+                const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+                const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
+                fs.writeFileSync('/tmp/${FNAME}.tar.gz.enc', enc);
+              "
+              cp "/tmp/${FNAME}.tar.gz.enc" "/tmp/third_repo/${FNAME}.tar.gz.enc"
+              rm -f "/tmp/${FNAME}.tar.gz" "/tmp/${FNAME}.tar.gz.enc"
+              echo "✅ golden_outputs/${FNAME} → ${FNAME}.tar.gz.enc (ریشه‌ی مخزن سوم)"
+            done
+            UPLOADED=true
+          else
+            echo "ℹ️ golden_outputs/ در مخزن اصلی یافت نشد یا خالی است."
+          fi
+
+          # ---------- ۴) portfolios_outputs/ → analysis_results/ در مخزن سوم (بسته‌بندی+رمزنگاری) ----------
+          if [ -d "portfolios_outputs" ] && [ -n "$(find portfolios_outputs -type f 2>/dev/null)" ]; then
+            echo "📦 portfolios_outputs/ یافت شد — بسته‌بندی/رمزنگاری/انتقال به analysis_results/ در مخزن سوم..."
+            mkdir -p /tmp/third_repo/analysis_results
+            for f in portfolios_outputs/*.csv; do
+              [ -f "$f" ] || continue
+              FNAME=$(basename "$f")
+              tar -czf "/tmp/${FNAME}.tar.gz" -C portfolios_outputs "$FNAME"
+              node -e "
+                const crypto=require('crypto'),fs=require('fs');
+                const pass=process.env.RESULTS_PASSWORD;
+                const data=fs.readFileSync('/tmp/${FNAME}.tar.gz');
+                const key=crypto.scryptSync(pass,'salt',32);
+                const iv=crypto.randomBytes(16);
+                const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+                const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
+                fs.writeFileSync('/tmp/${FNAME}.tar.gz.enc', enc);
+              "
+              cp "/tmp/${FNAME}.tar.gz.enc" "/tmp/third_repo/analysis_results/${FNAME}.tar.gz.enc"
+              rm -f "/tmp/${FNAME}.tar.gz" "/tmp/${FNAME}.tar.gz.enc"
+              echo "✅ portfolios_outputs/${FNAME} → analysis_results/${FNAME}.tar.gz.enc"
+            done
+            UPLOADED=true
+          else
+            echo "ℹ️ portfolios_outputs/ در مخزن اصلی یافت نشد یا خالی است."
+          fi
+
+          echo "uploaded=$UPLOADED" >> "$GITHUB_OUTPUT"
+
+          if [ "$UPLOADED" = "true" ]; then
+            cd /tmp/third_repo
+            git add -A
+            if git diff --cached --quiet; then
+              echo "ℹ️ محتوای یکسان بود — چیزی برای commit نیست."
+            else
+              git commit -m "upload batch_outputs/reports/golden_outputs/portfolios_outputs from main repo (run ${{ github.run_id }})"
+              for attempt in $(seq 1 10); do
+                git pull --rebase || true
+                if git push; then
+                  echo "✅ push به مخزن سوم موفق بود (تلاش $attempt)."
+                  break
+                fi
+                sleep $(( (RANDOM % 10) + 3 ))
+              done
+            fi
+          fi
+
+      - name: پاک‌کردن batch_outputs/ و reports/ از مخزن اصلی (پس از آپلود موفق)
+        if: steps.upload.outputs.uploaded == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -rf batch_outputs reports golden_outputs portfolios_outputs manifest.json
+          git add -A
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "clear uploaded batch_outputs/reports/golden_outputs/portfolios_outputs from main repo (run ${{ github.run_id }})"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ پاک‌سازی مخزن اصلی موفق بود (تلاش $attempt)."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+      - name: نوبت‌دهی منصفانه (turn.flag) — تنها جای نوشتن نوبت در کل پایپ‌لاین
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          MY_ID="analysis"
+          OTHER_ID="loop"
+          TURN_FILE="turn.flag"
+          MY_NOWORK_FILE="${MY_ID}_no_work.flag"
+          HAD_WORK="${{ needs.aggregate-collect.outputs.had_work || 'false' }}"
+
+          if [ "$HAD_WORK" = "false" ]; then
+            RESP=$(gh api "repos/$THIRD_REPO/contents/$MY_NOWORK_FILE" 2>/dev/null || true)
+            if [ -z "$RESP" ] || [ "$RESP" = "null" ] || ! echo "$RESP" | jq -e '.sha' >/dev/null 2>&1; then
+              CONTENT=$(echo -n "no work" | base64 -w0)
+              gh api "repos/$THIRD_REPO/contents/$MY_NOWORK_FILE" -X PUT -f message="mark $MY_ID as no-work" -f content="$CONTENT" -f branch="main" >/dev/null 2>&1 || true
+              echo "🚩 پرچم «کاری ندارم» برای $MY_ID ثبت شد؛ از این پس نوبت رعایت نمی‌شود تا وقتی کار جدید بیاید."
+            else
+              echo "ℹ️ پرچم «کاری ندارم» از قبل ثبت شده بود."
+            fi
+          else
+            RESP=$(gh api "repos/$THIRD_REPO/contents/$MY_NOWORK_FILE" 2>/dev/null || true)
+            if [ -n "$RESP" ] && [ "$RESP" != "null" ] && echo "$RESP" | jq -e '.sha' >/dev/null 2>&1; then
+              SHA=$(echo "$RESP" | jq -r '.sha')
+              gh api "repos/$THIRD_REPO/contents/$MY_NOWORK_FILE" -X DELETE -f message="clear no-work ($MY_ID)" -f sha="$SHA" -f branch="main" >/dev/null 2>&1 || true
+              echo "🧹 پرچم «کاری ندارم» خودمان ($MY_ID) پاک شد."
+            fi
+          fi
+
+          TURN_RESP=$(gh api "repos/$THIRD_REPO/contents/$TURN_FILE" 2>/dev/null || true)
+          if [ -z "$TURN_RESP" ] || [ "$TURN_RESP" = "null" ] || ! echo "$TURN_RESP" | jq -e '.sha' >/dev/null 2>&1; then
+            CONTENT=$(echo -n "$OTHER_ID" | base64 -w0)
+            gh api "repos/$THIRD_REPO/contents/$TURN_FILE" -X PUT -f message="init turn -> $OTHER_ID next" -f content="$CONTENT" -f branch="main" >/dev/null 2>&1 || true
+            echo "✅ فایل نوبت ساخته شد → نوبت بعدی: $OTHER_ID"
+          else
+            SHA=$(echo "$TURN_RESP" | jq -r '.sha')
+            CONTENT=$(echo -n "$OTHER_ID" | base64 -w0)
+            gh api "repos/$THIRD_REPO/contents/$TURN_FILE" -X PUT -f message="turn -> $OTHER_ID next" -f content="$CONTENT" -f sha="$SHA" -f branch="main" >/dev/null 2>&1 || true
+            echo "✅ نوبت بعدی ثبت شد: $OTHER_ID"
+          fi
+
+  # ============================================================
+  # Job 2.5: تولید گزارش‌های جامع نسخه ۵ از داده‌های یکپارچه
+  # ============================================================
+  generate-reports:
+    needs: [aggregate-collect, upload-other-outputs]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout مخزن اصلی
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: نصب پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Clone مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" \
+            /tmp/third_repo
+
+      - name: اجرای loader.py
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/loader.py \
+            --news-dir data/news \
+            --results-dir /tmp/third_repo/aggregated \
+            --strategies-dir /tmp/third_repo/strategies \
+            --output-news /tmp/news.pickle \
+            --output-strategies /tmp/strategies.json
+
+      - name: اجرای calculator_stoploss.py
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculator_stoploss.py \
+            --strategies-json /tmp/strategies.json \
+            --results-base /tmp/third_repo/aggregated \
+            --strategies-dir /tmp/third_repo/strategies \
+            --output /tmp/stoploss.json
+
+      - name: اجرای calculators.py returns
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculators.py returns \
+            --strategies-json /tmp/strategies.json \
+            --results-base /tmp/third_repo/aggregated \
+            --output /tmp/returns.json \
+            --password "$RESULTS_PASSWORD" \
+            --previous-report /tmp/third_repo/reports.tar.gz.enc
+
+      - name: اجرای calculators.py risk
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculators.py risk \
+            --strategies-json /tmp/strategies.json \
+            --results-base /tmp/third_repo/aggregated \
+            --stoploss-cache /tmp/stoploss.json \
+            --output /tmp/risk.json \
+            --password "$RESULTS_PASSWORD" \
+            --previous-report /tmp/third_repo/reports.tar.gz.enc
+
+      - name: اجرای calculators.py inverse
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculators.py inverse \
+            --strategies-json /tmp/strategies.json \
+            --results-base /tmp/third_repo/aggregated \
+            --stoploss-cache /tmp/stoploss.json \
+            --output /tmp/inverse.json \
+            --password "$RESULTS_PASSWORD"
+
+      - name: اجرای calculators.py report
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/reports
+          python modules/calculators.py report \
+            --returns-cache /tmp/returns.json \
+            --strategies-json /tmp/strategies.json \
+            --risk-cache /tmp/risk.json \
+            --inverse-cache /tmp/inverse.json \
+            --results-base /tmp/third_repo/aggregated \
+            --news-pickle /tmp/news.pickle \
+            --output-dir /tmp/reports \
+            --password "$RESULTS_PASSWORD" \
+            --previous-report /tmp/third_repo/reports.tar.gz.enc
+
+      - name: فشرده‌سازی و رمزنگاری پوشه reports
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          echo "📦 فشرده‌سازی پوشه /tmp/reports به reports.tar.gz ..."
+          tar -czf /tmp/reports.tar.gz -C /tmp reports
+          echo "✅ فشرده‌سازی کامل شد."
+
+          echo "🔒 رمزنگاری reports.tar.gz ..."
+          node -e "
+            const crypto = require('crypto'), fs = require('fs');
+            const pass = process.env.RESULTS_PASSWORD;
+            const data = fs.readFileSync('/tmp/reports.tar.gz');
+            const key = crypto.scryptSync(pass, 'salt', 32);
+            const iv = crypto.randomBytes(16);
+            const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+            const enc = Buffer.concat([cipher.update(data), cipher.final()]);
+            fs.writeFileSync('/tmp/reports.tar.gz.enc', Buffer.concat([iv, enc]));
+          "
+          echo "✅ رمزنگاری کامل شد: /tmp/reports.tar.gz.enc"
+
+          echo "🗑️ حذف پوشه /tmp/reports و فایل موقت..."
+          rm -rf /tmp/reports /tmp/reports.tar.gz
+          echo "✅ پاکسازی انجام شد."
+
+      - name: Commit و Push گزارش‌ها به مخزن اصلی
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p reports
+          cp /tmp/reports.tar.gz.enc reports/reports.tar.gz.enc
+          git add -f reports/reports.tar.gz.enc
+          git commit -m "update reports (run ${{ github.run_id }})" || echo "No changes to commit"
+          for attempt in $(seq 1 10); do
+            git pull --rebase || true
+            if git push; then
+              echo "✅ push گزارش به مخزن اصلی موفق بود (تلاش $attempt)."
+              break
+            fi
+            sleep $(( (RANDOM % 10) + 3 ))
+          done
+
+  # ============================================================
+  # Job 2.6: هنوز استراتژی پردازش‌نشده باقی مانده → فراخوانی مجدد همین ورک‌فلو
+  # (تمام مراحل بعدی skip می‌شوند، فقط خود loop_analysis.yml دوباره صدا زده می‌شود)
+  # ============================================================
+  continue-loop:
+    needs: [aggregate-prepare, generate-reports]
+    if: needs.aggregate-prepare.outputs.has_more == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+      - name: فراخوانی مجدد loop_analysis.yml (ادامه‌ی یکپارچه‌سازی)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "🔁 هنوز استراتژی‌های پردازش‌نشده باقی مانده‌اند. فراخوانی مجدد خودِ loop_analysis.yml..."
+            SUCCESS=false
+            for attempt in 1 2 3; do
+              if gh workflow run loop_analysis.yml --ref main 2>&1; then
+                echo "✅ فراخوانی مجدد loop_analysis.yml موفق بود (تلاش $attempt)."
+                SUCCESS=true
+                break
+              else
+                echo "⚠️ تلاش $attempt ناموفق بود. 5 ثانیه صبر می‌کنم..."
+                sleep 5
+              fi
+            done
+            if [ "$SUCCESS" = "false" ]; then
+              echo "❌ هر سه تلاش برای فراخوانی مجدد loop_analysis.yml ناموفق بود."
+              exit 1
+            fi
+          }
+
+  # ============================================================
+  # Job 3: آماده‌سازی صف کارها (ساخت all_combinations.json) با اصلاح کش
+  # ============================================================
+  prepare-dispatch:
+    needs: [aggregate-collect, generate-reports]
+    runs-on: ubuntu-latest
+    outputs:
+      total_batches: ${{ steps.queue.outputs.total_batches }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+      - name: راه‌اندازی پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: دریافت داده‌های لازم از مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          STRATEGIES=$(gh api "repos/$THIRD_REPO/contents/aggregated" -q '.[].name' 2>/dev/null || true)
+          if [ -z "$STRATEGIES" ]; then
+            echo "❌ دریافت لیست استراتژی‌ها از aggregated ناموفق بود یا خالی برگشت."
+            # تلاش با منبع پشتیبان: backtest_results
+            STRATEGIES=$(gh api "repos/$THIRD_REPO/contents/backtest_results" -q '.[].name' 2>/dev/null || true)
+            if [ -z "$STRATEGIES" ]; then
+              echo "❌ منبع پشتیبان (backtest_results) نیز خالی است. job متوقف می‌شود."
+              exit 1
+            fi
+            echo "⚠️ از منبع پشتیبان backtest_results استفاده شد."
+          fi
+          echo "$STRATEGIES" > /tmp/strategies.txt
+          echo "✅ لیست استراتژی‌ها دریافت شد ($(wc -l < /tmp/strategies.txt) مورد)."
+      - name: ساخت و به‌روزرسانی all_combinations.json (با اسکریپت پایتون اصلاح شده)
+        id: queue
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          {
+            echo "🚀 اجرای build_all_queues.py برای ساخت صف کارها (و رفرش golden/portfolios)..."
+            pip install pandas pyarrow --quiet --break-system-packages 2>&1 || \
+              pip install pandas pyarrow --quiet 2>&1
+            python scripts/build_all_queues.py \
+              --progress /tmp/dummy \
+              --strategies /tmp/strategies.txt \
+              --output-dir /tmp/dummy \
+              --batch-size 500 2>&1
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "❌ build_all_queues.py با خطا مواجه شد (کد $EXIT_CODE)"
+              exit $EXIT_CODE
+            fi
+            echo "✅ build_all_queues.py با موفقیت اجرا شد."
+          }
+
+          echo "🔄 دریافت all_combinations.json با retry..."
+          for attempt in 1 2 3 4 5; do
+            TIMESTAMP=$(date +%s%N)
+            ALL_COMBOS_CONTENT=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations.json?t=$TIMESTAMP" \
+              -H "Accept: application/vnd.github.v3.raw" 2>/dev/null)
+            if [ -n "$ALL_COMBOS_CONTENT" ] && [ "$ALL_COMBOS_CONTENT" != "null" ]; then
+              TOTAL_COMBOS=$(echo "$ALL_COMBOS_CONTENT" | jq 'length' 2>/dev/null)
+              if [ -z "$TOTAL_COMBOS" ] || ! [[ "$TOTAL_COMBOS" =~ ^[0-9]+$ ]]; then
+                echo "❌ jq نتوانست طول آرایه را محاسبه کند. پاسخ نامعتبر است."
+                TOTAL_BATCHES=0
+                echo "total_batches=0" >> $GITHUB_OUTPUT
+                break
+              fi
+              TOTAL_BATCHES=$(( (TOTAL_COMBOS + 499) / 500 ))
+              echo "total_batches=$TOTAL_BATCHES" >> $GITHUB_OUTPUT
+              echo "✅ تعداد بسته‌ها: $TOTAL_BATCHES"
+              break
+            fi
+            echo "⏳ تلاش $attempt: فایل در دسترس نیست، 3 ثانیه صبر..."
+            sleep 3
+          done
+          if [ -z "$TOTAL_BATCHES" ]; then
+            echo "❌ تعداد بسته‌ها صفر در نظر گرفته می‌شود."
+            echo "total_batches=0" >> $GITHUB_OUTPUT
+          fi
+
+
+  # ============================================================
+  # Job 4: بررسی اینکه کدام فیلتر باید اجرا شود (skip cascade gate)
+  # منطق: fixed > golden > portfolios
+  # هر فیلتر فقط وقتی اجرا میشه که همه فیلترهای قبلی خالی باشن
+  # ============================================================
+  check-queues:
+    needs: prepare-dispatch
+    runs-on: ubuntu-latest
+    outputs:
+      run_fixed: ${{ steps.gate.outputs.run_fixed }}
+      run_golden: ${{ steps.gate.outputs.run_golden }}
+      run_portfolios: ${{ steps.gate.outputs.run_portfolios }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+      - name: بررسی وضعیت همه صف‌ها
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          {
+            echo "🔍 بررسی وضعیت صف‌ها برای تعیین فیلتر فعال..."
+
+            # بررسی interrupt.flag
+            if gh api "repos/$THIRD_REPO/contents/interrupt.flag" -i 2>/dev/null | head -n1 | grep -q 200; then
+              echo "⚠️ interrupt.flag فعال است — همه فیلترها skip."
+              echo "run_fixed=false" >> $GITHUB_OUTPUT
+              echo "run_golden=false" >> $GITHUB_OUTPUT
+              echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            get_len() {
+              local FILE="$1"
+              local RESP
+              RESP=$(curl -s -H "Authorization: token $GH_TOKEN"                 -H "Accept: application/vnd.github.v3.raw"                 "https://api.github.com/repos/$THIRD_REPO/contents/${FILE}?t=$(date +%s)" 2>/dev/null)
+              if [ -z "$RESP" ] || [ "$RESP" = "null" ]; then
+                echo "0"
+              else
+                echo "$RESP" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "0"
+              fi
+            }
+
+            LEN_FIXED=$(get_len "all_combinations.json")
+            LEN_GOLDEN=$(get_len "all_combinations_golden.json")
+            LEN_PORT=$(get_len "all_combinations_portfolios.json")
+
+            echo "[DEBUG] fixed=$LEN_FIXED  golden=$LEN_GOLDEN  portfolios=$LEN_PORT"
+
+            # منطق cascade: اولین صف غیر‌خالی اجرا میشه، بقیه skip
+            if [ "$LEN_FIXED" -gt 0 ]; then
+              echo "▶ fixed کار دارد ($LEN_FIXED) — بقیه skip."
+              echo "run_fixed=true"  >> $GITHUB_OUTPUT
+              echo "run_golden=false" >> $GITHUB_OUTPUT
+              echo "run_portfolios=false" >> $GITHUB_OUTPUT
+            elif [ "$LEN_GOLDEN" -gt 0 ]; then
+              echo "▶ golden کار دارد ($LEN_GOLDEN) — fixed خالی، بقیه skip."
+              echo "run_fixed=false" >> $GITHUB_OUTPUT
+              echo "run_golden=true"  >> $GITHUB_OUTPUT
+              echo "run_portfolios=false" >> $GITHUB_OUTPUT
+            elif [ "$LEN_PORT" -gt 0 ]; then
+              echo "▶ portfolios کار دارد ($LEN_PORT) — بقیه خالی."
+              echo "run_fixed=false" >> $GITHUB_OUTPUT
+              echo "run_golden=false" >> $GITHUB_OUTPUT
+              echo "run_portfolios=true"  >> $GITHUB_OUTPUT
+            else
+              echo "ℹ️ همه صف‌ها خالی هستند — loop ادامه می‌یابد."
+              echo "run_fixed=false" >> $GITHUB_OUTPUT
+              echo "run_golden=false" >> $GITHUB_OUTPUT
+              echo "run_portfolios=false" >> $GITHUB_OUTPUT
+            fi
+          }
+
+  # ============================================================
+  # Job 4: اجرای fixed (فیلتر ۱)
+  # ============================================================
+  dispatch-fixed:
+    needs: [prepare-dispatch, check-queues]
+    if: needs.check-queues.outputs.run_fixed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+      - name: فراخوانی analysis_fixed_batch.yml (با retry)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "🔄 فراخوانی analysis_fixed_batch.yml..."
+            SUCCESS=false
+            for attempt in 1 2 3; do
+              if gh workflow run analysis_fixed_batch.yml --ref main 2>&1; then
+                echo "✅ فراخوانی analysis_fixed_batch.yml موفق بود (تلاش $attempt)."
+                SUCCESS=true
+                break
+              else
+                echo "⚠️ تلاش $attempt ناموفق بود. 5 ثانیه صبر می‌کنم..."
+                sleep 5
+              fi
+            done
+            if [ "$SUCCESS" = "false" ]; then
+              echo "❌ هر سه تلاش برای dispatch-fixed ناموفق بود."
+              exit 1
+            fi
+          }
+
+  # ============================================================
+  # Job 5: ساخت صف golden + اجرا (فیلتر ۲)
+  # ============================================================
+  dispatch-golden:
+    needs: [prepare-dispatch, check-queues]
+    if: needs.check-queues.outputs.run_golden == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+      - name: راه‌اندازی پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: گرفتن قفل مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          command -v jq &> /dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq jq)
+          LOCK_PATH="automation.lock"
+          LOCK_TTL=1800
+          LOCK_OWNER="${GITHUB_REPOSITORY}-run${GITHUB_RUN_ID}-dispatch-golden"
+          ACQUIRED=false
+          for i in $(seq 1 60); do
+            RESP=$(gh api "repos/$THIRD_REPO/contents/$LOCK_PATH" 2>/dev/null || true)
+            if [ -z "$RESP" ] || [ "$RESP" = "null" ] || ! echo "$RESP" | jq -e '.sha' >/dev/null 2>&1; then
+              CONTENT=$(echo "{\"owner\":\"$LOCK_OWNER\",\"acquired_at\":$(date +%s)}" | base64 -w0)
+              if gh api "repos/$THIRD_REPO/contents/$LOCK_PATH" -X PUT -f message="acquire lock ($LOCK_OWNER)" -f content="$CONTENT" -f branch="main" >/dev/null 2>&1; then
+                echo "✅ قفل مخزن سوم گرفته شد."
+                ACQUIRED=true
+                break
+              fi
+            else
+              SHA=$(echo "$RESP" | jq -r '.sha')
+              LOCK_CONTENT=$(echo "$RESP" | jq -r '.content' | base64 -d 2>/dev/null || echo "{}")
+              LOCK_TS=$(echo "$LOCK_CONTENT" | jq -r '.acquired_at // 0')
+              AGE=$(( $(date +%s) - LOCK_TS ))
+              if [ "$AGE" -gt "$LOCK_TTL" ]; then
+                echo "⚠️ قفل قدیمی (سن ${AGE}s) یافت شد؛ تصرف اجباری..."
+                CONTENT=$(echo "{\"owner\":\"$LOCK_OWNER\",\"acquired_at\":$(date +%s)}" | base64 -w0)
+                if gh api "repos/$THIRD_REPO/contents/$LOCK_PATH" -X PUT -f message="force-acquire stale lock ($LOCK_OWNER)" -f content="$CONTENT" -f sha="$SHA" -f branch="main" >/dev/null 2>&1; then
+                  echo "✅ قفل به‌صورت اجباری گرفته شد."
+                  ACQUIRED=true
+                  break
+                fi
+              else
+                echo "⏳ قفل در دست $(echo "$LOCK_CONTENT" | jq -r '.owner // "نامشخص"') است (سن ${AGE}s). صبر می‌کنم... (تلاش $i/60)"
+              fi
+            fi
+            sleep $(( (RANDOM % 10) + 5 ))
+          done
+          if [ "$ACQUIRED" != "true" ]; then
+            echo "❌ گرفتن قفل مخزن سوم پس از تلاش‌های متعدد ناموفق بود."
+            exit 1
+          fi
+
+      - name: ساخت و به‌روزرسانی all_combinations_golden.json
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          {
+            echo "🚀 اجرای build_all_queues.py برای ساخت صف golden..."
+            python scripts/build_all_queues.py               --progress /tmp/dummy               --output-dir /tmp/dummy               --batch-size 500 2>&1
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "❌ build_all_queues.py (golden queue) با خطا مواجه شد (کد $EXIT_CODE)"
+              exit $EXIT_CODE
+            fi
+            echo "✅ build_all_queues.py (golden queue) با موفقیت اجرا شد."
+          }
+
+      - name: آزاد کردن قفل مخزن سوم
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          RESP=$(gh api "repos/$THIRD_REPO/contents/automation.lock" 2>/dev/null || true)
+          if [ -n "$RESP" ] && [ "$RESP" != "null" ] && echo "$RESP" | jq -e '.sha' >/dev/null 2>&1; then
+            SHA=$(echo "$RESP" | jq -r '.sha')
+            gh api "repos/$THIRD_REPO/contents/automation.lock" -X DELETE -f message="release lock" -f sha="$SHA" -f branch="main" >/dev/null 2>&1 || true
+            echo "🔓 قفل مخزن سوم آزاد شد."
+          else
+            echo "ℹ️ قفلی برای آزاد کردن یافت نشد."
+          fi
+
+      - name: فراخوانی analysis_golden.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "🔄 فراخوانی analysis_golden.yml..."
+            SUCCESS=false
+            for attempt in 1 2 3; do
+              if gh workflow run analysis_golden.yml --ref main 2>&1; then
+                echo "✅ فراخوانی golden موفق بود (تلاش $attempt)."
+                SUCCESS=true
+                break
+              else
+                echo "⚠️ تلاش $attempt ناموفق بود. 5 ثانیه صبر می‌کنم..."
+                sleep 5
+              fi
+            done
+            if [ "$SUCCESS" = "false" ]; then
+              echo "❌ هر سه تلاش برای dispatch-golden ناموفق بود."
+              exit 1
+            fi
+          }
+
+  # ============================================================
+  # Job 7: ساخت صف portfolios + اجرا (فیلتر ۴)
+  # ============================================================
+  dispatch-portfolios:
+    needs: [prepare-dispatch, check-queues]
+    if: needs.check-queues.outputs.run_portfolios == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+      - name: راه‌اندازی پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: گرفتن قفل مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          command -v jq &> /dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq jq)
+          LOCK_PATH="automation.lock"
+          LOCK_TTL=1800
+          LOCK_OWNER="${GITHUB_REPOSITORY}-run${GITHUB_RUN_ID}-dispatch-portfolios"
+          ACQUIRED=false
+          for i in $(seq 1 60); do
+            RESP=$(gh api "repos/$THIRD_REPO/contents/$LOCK_PATH" 2>/dev/null || true)
+            if [ -z "$RESP" ] || [ "$RESP" = "null" ] || ! echo "$RESP" | jq -e '.sha' >/dev/null 2>&1; then
+              CONTENT=$(echo "{\"owner\":\"$LOCK_OWNER\",\"acquired_at\":$(date +%s)}" | base64 -w0)
+              if gh api "repos/$THIRD_REPO/contents/$LOCK_PATH" -X PUT -f message="acquire lock ($LOCK_OWNER)" -f content="$CONTENT" -f branch="main" >/dev/null 2>&1; then
+                echo "✅ قفل مخزن سوم گرفته شد."
+                ACQUIRED=true
+                break
+              fi
+            else
+              SHA=$(echo "$RESP" | jq -r '.sha')
+              LOCK_CONTENT=$(echo "$RESP" | jq -r '.content' | base64 -d 2>/dev/null || echo "{}")
+              LOCK_TS=$(echo "$LOCK_CONTENT" | jq -r '.acquired_at // 0')
+              AGE=$(( $(date +%s) - LOCK_TS ))
+              if [ "$AGE" -gt "$LOCK_TTL" ]; then
+                echo "⚠️ قفل قدیمی (سن ${AGE}s) یافت شد؛ تصرف اجباری..."
+                CONTENT=$(echo "{\"owner\":\"$LOCK_OWNER\",\"acquired_at\":$(date +%s)}" | base64 -w0)
+                if gh api "repos/$THIRD_REPO/contents/$LOCK_PATH" -X PUT -f message="force-acquire stale lock ($LOCK_OWNER)" -f content="$CONTENT" -f sha="$SHA" -f branch="main" >/dev/null 2>&1; then
+                  echo "✅ قفل به‌صورت اجباری گرفته شد."
+                  ACQUIRED=true
+                  break
+                fi
+              else
+                echo "⏳ قفل در دست $(echo "$LOCK_CONTENT" | jq -r '.owner // "نامشخص"') است (سن ${AGE}s). صبر می‌کنم... (تلاش $i/60)"
+              fi
+            fi
+            sleep $(( (RANDOM % 10) + 5 ))
+          done
+          if [ "$ACQUIRED" != "true" ]; then
+            echo "❌ گرفتن قفل مخزن سوم پس از تلاش‌های متعدد ناموفق بود."
+            exit 1
+          fi
+
+      - name: ساخت و به‌روزرسانی all_combinations_portfolios.json
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          {
+            pip install pandas pyarrow --quiet --break-system-packages 2>&1 ||               pip install pandas pyarrow --quiet 2>&1
+            echo "🚀 اجرای build_all_queues.py برای ساخت صف portfolios..."
+            python scripts/build_all_queues.py               --progress /tmp/dummy               --output-dir /tmp/dummy               --batch-size 500               --min-score 45 2>&1
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "❌ build_all_queues.py (portfolios queue) با خطا مواجه شد (کد $EXIT_CODE)"
+              exit $EXIT_CODE
+            fi
+            echo "✅ build_all_queues.py (portfolios queue) با موفقیت اجرا شد."
+          }
+
+      - name: آزاد کردن قفل مخزن سوم
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          RESP=$(gh api "repos/$THIRD_REPO/contents/automation.lock" 2>/dev/null || true)
+          if [ -n "$RESP" ] && [ "$RESP" != "null" ] && echo "$RESP" | jq -e '.sha' >/dev/null 2>&1; then
+            SHA=$(echo "$RESP" | jq -r '.sha')
+            gh api "repos/$THIRD_REPO/contents/automation.lock" -X DELETE -f message="release lock" -f sha="$SHA" -f branch="main" >/dev/null 2>&1 || true
+            echo "🔓 قفل مخزن سوم آزاد شد."
+          else
+            echo "ℹ️ قفلی برای آزاد کردن یافت نشد."
+          fi
+
+      - name: فراخوانی analysis_portfolios.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "🔄 فراخوانی analysis_portfolios.yml..."
+            SUCCESS=false
+            for attempt in 1 2 3; do
+              if gh workflow run analysis_portfolios.yml --ref main 2>&1; then
+                echo "✅ فراخوانی portfolios موفق بود (تلاش $attempt)."
+                SUCCESS=true
+                break
+              else
+                echo "⚠️ تلاش $attempt ناموفق بود. 5 ثانیه صبر می‌کنم..."
+                sleep 5
+              fi
+            done
+            if [ "$SUCCESS" = "false" ]; then
+              echo "❌ هر سه تلاش برای dispatch-portfolios ناموفق بود."
+              exit 1
+            fi
+          }

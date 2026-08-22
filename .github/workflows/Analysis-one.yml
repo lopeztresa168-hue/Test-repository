@@ -1,0 +1,154 @@
+name: Analysis - Best Timeframes (5m/15m/30m/1h)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  analyze-best-timeframes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: راه‌اندازی پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Sparse-clone مخزن سوم (۴ پوشه aggregated + متادیتای پایه Best)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          cd /tmp/third_repo
+          git sparse-checkout set \
+            aggregated/Best_5m \
+            aggregated/Best_15m \
+            aggregated/Best_30m \
+            aggregated/Best_1h \
+            strategies/Best
+          echo "✅ مخزن سوم (sparse) با موفقیت clone شد."
+
+      - name: کپی فایل‌های remote → local
+        run: |
+          set -e
+          declare -A FILES=(
+            ["Best_5m"]="aggregated/Best_5m/Best_5m_trades.enc"
+            ["Best_15m"]="aggregated/Best_15m/Best_15m_trades.enc"
+            ["Best_30m"]="aggregated/Best_30m/Best_30m_trades.enc"
+            ["Best_1h"]="aggregated/Best_1h/Best_1h_trades.enc"
+          )
+          for FOLDER in "${!FILES[@]}"; do
+            REMOTE="/tmp/third_repo/${FILES[$FOLDER]}"
+            LOCAL="نتایج/${FOLDER}/${FOLDER}_trades.enc"
+            mkdir -p "$(dirname "$LOCAL")"
+            if [ ! -f "$REMOTE" ]; then
+              echo "❌ فایل remote یافت نشد: $REMOTE"
+              exit 1
+            fi
+            cp "$REMOTE" "$LOCAL"
+            echo "✅ کپی شد: $REMOTE → $LOCAL"
+          done
+
+      - name: ساخت strategies.json (فقط ۴ استراتژی موردنظر)
+        run: |
+          cat > strategies.json << 'EOF'
+          {
+            "strategies": [
+              { "folder": "Best_5m" },
+              { "folder": "Best_15m" },
+              { "folder": "Best_30m" },
+              { "folder": "Best_1h" }
+            ]
+          }
+          EOF
+
+      - name: آماده‌سازی strategies-dir برای calculator_stoploss.py
+        run: |
+          # calculator_stoploss.py دنبال strategies-dir/<folder>/1.json می‌گردد (با نام کامل پوشه، مثل Best_5m)
+          # اما 1.json در مخزن سوم فقط زیر strategies/Best (بدون پسوند تایم‌فریم) وجود دارد،
+          # چون طبق loop_analysis.yml این متادیتا بین همه تایم‌فریم‌های یک استراتژی پایه مشترک است.
+          # پس همان یک فایل را زیر هر ۴ نام کپی می‌کنیم تا اسکریپت پیدایش کند.
+          SRC="/tmp/third_repo/strategies/Best/1.json"
+          if [ ! -f "$SRC" ]; then
+            echo "❌ فایل متادیتای پایه یافت نشد: $SRC"
+            exit 1
+          fi
+          for FOLDER in Best_5m Best_15m Best_30m Best_1h; do
+            mkdir -p "/tmp/strategies_dir/${FOLDER}"
+            cp "$SRC" "/tmp/strategies_dir/${FOLDER}/1.json"
+          done
+          echo "✅ strategies-dir محلی آماده شد."
+
+      - name: اجرای calculator_stoploss.py
+        run: |
+          python modules/calculator_stoploss.py \
+            --strategies-json strategies.json \
+            --results-base "نتایج" \
+            --strategies-dir /tmp/strategies_dir \
+            --output cache/stoploss_cache.json
+
+      - name: اجرای calculators.py returns
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculators.py returns \
+            --strategies-json strategies.json \
+            --results-base "نتایج" \
+            --output cache/returns_cache.json \
+            --password "$RESULTS_PASSWORD"
+
+      - name: اجرای calculators.py risk
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculators.py risk \
+            --strategies-json strategies.json \
+            --results-base "نتایج" \
+            --stoploss-cache cache/stoploss_cache.json \
+            --output cache/risk_cache.json \
+            --password "$RESULTS_PASSWORD"
+
+      - name: اجرای calculators.py inverse
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculators.py inverse \
+            --strategies-json strategies.json \
+            --results-base "نتایج" \
+            --stoploss-cache cache/stoploss_cache.json \
+            --output cache/inverse_cache.json \
+            --password "$RESULTS_PASSWORD"
+
+      - name: اجرای calculators.py report
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          python modules/calculators.py report \
+            --returns-cache cache/returns_cache.json \
+            --strategies-json strategies.json \
+            --risk-cache cache/risk_cache.json \
+            --inverse-cache cache/inverse_cache.json \
+            --results-base "نتایج" \
+            --output-dir "نتایج/گزارش" \
+            --password "$RESULTS_PASSWORD"
+
+      - name: Commit نتایج به ریپو
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add "نتایج/"
+          if git diff --cached --quiet; then
+            echo "ℹ️ تغییری برای commit وجود ندارد."
+          else
+            git commit -m "chore: به‌روزرسانی نتایج تحلیل Best_5m/15m/30m/1h"
+            git push
+          fi
