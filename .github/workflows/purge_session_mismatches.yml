@@ -1,13 +1,10 @@
 name: پاک‌سازی خروجی‌های fixed با سشن نادرست
 
-# اجرای دستی — چون این یه عملیات maintenance/یک‌بارمصرفه (بعد از فیکس granularity)
-# نه بخشی از چرخه‌ی معمول پایپ‌لاین. با scan-only می‌تونی اول فقط گزارش رو ببینی،
-# بعد با apply=true واقعاً حذف/ری‌کیو کن.
 on:
   workflow_dispatch:
     inputs:
       apply:
-        description: "اگر true باشه واقعاً حذف/ری‌کیو انجام می‌شه؛ اگر false فقط گزارش می‌ده (dry-run، هیچ تغییری اعمال نمی‌شه)"
+        description: "اگر true باشه واقعاً حذف/ری‌کیو انجام می‌شه؛ اگر false فقط گزارش می‌ده (dry-run)"
         required: true
         type: boolean
         default: false
@@ -24,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: چک‌اوت مخزن اصلی (همانی که batch_outputs/ توش هست)
+      - name: چک‌اوت مخزن اصلی
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -34,12 +31,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: نصب Node.js (برای رمزگشایی AES) و gh CLI
+      - name: نصب Node.js و gh CLI
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # در صورت نیاز به وابستگی‌های پایتون، این مرحله را اضافه کنید
       - name: نصب وابستگی‌های پایتون (اختیاری)
         run: |
           if [ -f requirements.txt ]; then
@@ -48,13 +44,13 @@ jobs:
 
       - name: بررسی دسترسی gh CLI
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: gh auth status || echo "gh auth از طریق GH_TOKEN env انجام می‌شود، نه login جدا"
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}   # ← تغییر نام
+        run: gh auth status || echo "gh auth از طریق GH_TOKEN env انجام می‌شود"
 
-      - name: اجرای اسکریپت پاک‌سازی/ری‌کیو
+      - name: اجرای اسکریپت پاک‌سازی
         env:
           THIRD_REPO: ${{ secrets.THIRD_REPO }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}   # ← تغییر نام
           RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD }}
           BATCH_OUTPUTS_ROOT: batch_outputs
         run: |
@@ -63,10 +59,9 @@ jobs:
             MODE_FLAG="--apply"
           fi
           echo "🔧 اجرا با فلگ: $MODE_FLAG"
-          # ✅ تصحیح مسیر اسکریپت
           python3 scripts/purge_session_mismatches.py $MODE_FLAG
 
-      - name: آپلود گزارش کامل به‌عنوان artifact
+      - name: آپلود گزارش
         if: always()
         uses: actions/upload-artifact@v4
         with:
