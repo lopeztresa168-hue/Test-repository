@@ -504,6 +504,39 @@ def load_skeep_tp_sl(trades_json_path):
         return False, None, None
 
 
+# ══════════════════════════════════════════════════════════════
+# سشن‌های معاملاتی (به وقت UTC) — دقیقاً هم‌راستا با SESSION_WINDOWS در
+# calculators.py و combo_10day.py. اگر --session داده شود، فقط معاملاتی که
+# ساعت ورودشان (entryTime، UTC) داخل این بازه باشد پردازش می‌شوند؛ اگر داده
+# نشود (پیش‌فرض None)، رفتار قبلی (کل ۲۴ ساعت) دقیقاً حفظ می‌شود.
+# ══════════════════════════════════════════════════════════════
+SESSION_WINDOWS = {
+    "asia_tokyo":       (0, 9),
+    "london":           (8, 17),
+    "newyork":          (13, 22),
+    "london_ny_overlap": (13, 17),
+}
+
+
+def _trade_hour_utc(time_str):
+    """استخراج سریع ساعت UTC (0-23) از رشته‌ی زمان معامله. در صورت شکست،
+    None برمی‌گرداند تا معامله نادیده گرفته شود (نه اینکه به‌اشتباه قبول شود)."""
+    s = str(time_str).strip()
+    try:
+        if 'T' in s:
+            time_part = s.split('T', 1)[1]
+        elif ' ' in s:
+            time_part = s.split(' ', 1)[1]
+        else:
+            return None
+        hh = time_part[0:2]
+        if hh.isdigit():
+            return int(hh)
+        return None
+    except Exception:
+        return None
+
+
 def normalize_symbol(sym):
     """
     نرمال‌سازی نماد معامله برای تطبیق با --coin.
@@ -526,7 +559,7 @@ def _importance(actual, forecast, distance_days):
 def process_analysis(trades_json_path, news_dir, target_coin,
                      chunk_start, chunk_end, output_path, model,
                      ohlc_dir=None, jsonl_out=None, min_sample_count=1,
-                     strategy_folder=""):
+                     strategy_folder="", session=None):
     """
     تحلیل ماهانه.
     [اولویت ۱] ohlc_dir اجباری است (enforce در main()).
@@ -590,6 +623,12 @@ def process_analysis(trades_json_path, news_dir, target_coin,
     # هر کوین منفرد از فایل استخراج و به‌عنوان ترکیب ساخته می‌شود.
     target_coins = [normalize_symbol(c.strip()) for c in target_coin.split('+')]
 
+    if session:
+        if session not in SESSION_WINDOWS:
+            raise ValueError(f"--session نامعتبر: {session} (باید یکی از {list(SESSION_WINDOWS.keys())} باشد)")
+        sess_start_h, sess_end_h = SESSION_WINDOWS[session]
+        print(f"🕐 فیلتر سشن فعال: {session} (ساعت UTC {sess_start_h}:00 تا {sess_end_h}:00)")
+
     monthly_profits = defaultdict(list)
     for t in trades:
         symbol = t.get("symbol") or t.get("pair") or t.get("coin")
@@ -600,6 +639,11 @@ def process_analysis(trades_json_path, news_dir, target_coin,
                     t.get("open_time") or t.get("time") or t.get("timestamp"))
         if not time_str:
             continue
+
+        if session:
+            hour = _trade_hour_utc(time_str)
+            if hour is None or not (sess_start_h <= hour < sess_end_h):
+                continue
 
         try:
             if 'T' in str(time_str):
@@ -641,7 +685,8 @@ def process_analysis(trades_json_path, news_dir, target_coin,
         monthly_profits[ym].append(profit)
 
     if not monthly_profits:
-        print(f"⚠️ هیچ معامله‌ای برای {target_coin} یافت نشد.")
+        sess_suffix = f" (سشن {session})" if session else ""
+        print(f"⚠️ هیچ معامله‌ای برای {target_coin}{sess_suffix} یافت نشد.")
         _write_empty_csv(output_path)
         if jsonl_out:
             _write_jsonl(jsonl_out, [])
@@ -928,6 +973,10 @@ def main():
     parser.add_argument("--coin",            required=True)
     parser.add_argument("--interval",        required=True)
     parser.add_argument("--model",           required=True, choices=VALID_MODELS)
+    parser.add_argument("--session",         required=False, default=None,
+                        choices=list(SESSION_WINDOWS.keys()),
+                        help="اختیاری. اگر داده شود فقط معاملات داخل بازه‌ی ساعتی این سشن "
+                             "(UTC) پردازش می‌شوند. اگر داده نشود، کل ۲۴ ساعت (رفتار قبلی) پردازش می‌شود.")
     parser.add_argument("--chunk-start",     type=int, default=0)
     parser.add_argument("--chunk-end",       type=int, default=None)
 
@@ -957,7 +1006,8 @@ def main():
 
     print(f"✅ [OHLC] پوشه معتبر یافت شد با {csv_count} فایل CSV: {args.ohlc_dir}")
 
-    output_file = f"{args.strategy_folder}_{args.coin}_{args.interval}_{args.model}.csv"
+    session_suffix = f"_{args.session}" if args.session else ""
+    output_file = f"{args.strategy_folder}_{args.coin}_{args.interval}_{args.model}{session_suffix}.csv"
     output_path = os.path.join(os.getcwd(), output_file)
 
     process_analysis(
@@ -972,6 +1022,7 @@ def main():
         jsonl_out=args.jsonl_out,
         min_sample_count=args.min_sample_count,
         strategy_folder=args.strategy_folder,
+        session=args.session,
     )
 
 
