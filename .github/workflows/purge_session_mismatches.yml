@@ -19,7 +19,10 @@ concurrency:
 jobs:
   purge:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # ۹۰ دقیقه (به‌جای ۶۰): اسکریپت حالا علاوه بر batch_outputs محلی، آرشیوهای
+    # signature_archives/pattern_archives را هم در مخزن سوم دانلود/رمزگشایی/
+    # بازفشرده‌سازی/آپلود می‌کند که می‌تواند به‌ازای هر آرشیو چند ثانیه طول بکشد.
+    timeout-minutes: 90
     steps:
       - name: چک‌اوت مخزن اصلی
         uses: actions/checkout@v4
