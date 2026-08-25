@@ -6,11 +6,13 @@
 import os
 import sys
 import json
+import re
 import subprocess
 import base64
 import shutil
 from datetime import datetime
 from pathlib import Path
+from collections import defaultdict
 
 # ================================ لاگ‌گیری ================================
 
@@ -790,40 +792,74 @@ def _decrypt_enc_bytes(enc_path, password):
         raise RuntimeError(f"رمزگشایی ناموفق: {result.stderr.decode()}")
     return result.stdout
 
-# ================================ مرحله ۱: Work Queue ================================
+# ================================ ثابت‌های صف fixed (قابل استفاده در سایر اسکریپت‌ها) ================================
+# این‌ها قبلاً داخل build_work_queue تعریف می‌شدند؛ حالا در سطح ماژول‌اند تا
+# اسکریپت‌های دیگر (مثل purge_session_mismatches.py) بتوانند بدون کپی/تکرار
+# و بدون ریسک ناهماهنگی، همین لیست‌ها را import کنند.
+INTERVALS_10DAY = [
+    "fixed_5d", "fixed_10d", "fixed_15d", "fixed_30d",
+    "CPI_post_5d", "CPI_post_10d", "CPI_post_15d", "CPI_post_30d",
+    "CoreCPI_post_5d", "CoreCPI_post_10d", "CoreCPI_post_15d", "CoreCPI_post_30d",
+    "PPI_post_5d", "PPI_post_10d", "PPI_post_15d", "PPI_post_30d",
+    "CorePPI_post_5d", "CorePPI_post_10d", "CorePPI_post_15d", "CorePPI_post_30d",
+    "FOMC_pre_5d", "FOMC_post_5d", "FOMC_post_10d", "FOMC_post_15d", "FOMC_post_30d",
+    "CPI_y_y_post_5d", "CPI_y_y_post_10d", "CPI_y_y_post_15d", "CPI_y_y_post_30d"
+]
+INTERVALS_MONTHLY = ["monthly"]
+MODULE_INTERVALS = {
+    "combo_10day": INTERVALS_10DAY,
+    "combo_monthly": INTERVALS_MONTHLY,
+}
+MODELS = ["simple_hybrid"]
 
-def filter_strategies_by_conditions(repo, token, password=None):
-    """فیلتر استراتژی‌ها بر اساس ۷ شرط، با استفاده از _internal_all_results.json
-    (تولیدشده توسط calculators.py report در جاب generate-reports، در ریشه‌ی
-    مخزن سوم). مجموعه‌ای از folder_name های قبول‌شده برمی‌گرداند.
 
-    اگر فایل موجود نبود یا خراب بود، هیچ fallback ای وجود ندارد — RuntimeError
-    raise می‌شود تا اسکریپت با exit(1) متوقف شود (طبق نیازمندی صریح).
+def _passes_seven_conditions(item):
+    """همان ۷ شرط پذیرش که در filter_strategies_by_conditions استفاده می‌شود،
+    به‌صورت یک تابع مجزا تا هم آنجا و هم اسکریپت‌های دیگر (مثل
+    purge_session_mismatches.py) دقیقاً از یک منبع واحد استفاده کنند و در طول
+    زمان از هم واگرا نشوند.
 
-    برای رکوردهایی که یکی از ستون‌های مورد نیاز را ندارند، از مقدار پیش‌فرضی
-    استفاده می‌شود که همیشه شرط مربوطه را نقض می‌کند (یعنی رکورد رد می‌شود، نه
-    اینکه به‌اشتباه قبول شود).
+    مقادیر پیش‌فرض طوری انتخاب شده‌اند که در صورت غیبت ستون، شرط مربوطه
+    همیشه نقض شود (یعنی رکورد رد شود، نه اینکه به‌اشتباه قبول شود).
     """
-    log("=" * 60)
-    log("🔍 فیلتر استراتژی‌ها بر اساس ۷ شرط (_internal_all_results.json)")
-    log("=" * 60)
+    pct_profitable_months = item.get("pct_profitable_months", -1)
+    total_trades = item.get("total_trades", -1)
+    win_rate = item.get("win_rate", -1)
+    real_return = item.get("real_return", -1)
+    avg_profit_in_profitable_months = item.get("avg_profit_in_profitable_months", -1)
+    max_consecutive_monthly_loss = item.get("max_consecutive_monthly_loss", float("inf"))
+    avg_loss_in_loss_months = item.get("avg_loss_in_loss_months", float("-inf"))
+    sharpe_monthly = item.get("sharpe_monthly", float("-inf"))
 
+    cond1 = pct_profitable_months > 10
+    cond2 = (total_trades > 100) or (total_trades <= 100 and win_rate >= 75 and real_return > 0)
+    cond3 = avg_profit_in_profitable_months > 0.5
+    cond4 = win_rate >= 25
+    cond5 = max_consecutive_monthly_loss < 12
+    cond6 = avg_loss_in_loss_months >= -100
+    cond7 = sharpe_monthly > -0.2
+    return cond1 and cond2 and cond3 and cond4 and cond5 and cond6 and cond7
+
+
+def fetch_internal_all_results(repo, password):
+    """دانلود و رمزگشایی reports.tar.gz.enc از ریشه‌ی مخزن سوم و بازگرداندن
+    محتوای _internal_all_results.json به‌صورت لیست پارس‌شده. دقیقاً همان
+    مسیری که filter_strategies_by_conditions طی می‌کند، اما به‌صورت تابع
+    مستقل تا purge_session_mismatches.py هم بتواند بدون تکرار کد از آن
+    استفاده کند. بدون fallback — در صورت خطا RuntimeError raise می‌شود."""
     log("  دانلود reports.tar.gz.enc از ریشه‌ی مخزن سوم...")
     enc_path = "/tmp/_filter_reports.tar.gz.enc"
     if os.path.exists(enc_path):
         os.remove(enc_path)
     if not gh_api_get_binary(repo, "reports.tar.gz.enc", enc_path):
-        log("  ❌ reports.tar.gz.enc در مخزن سوم یافت نشد", 'ERROR')
         raise RuntimeError("reports.tar.gz.enc در مخزن سوم یافت نشد — هیچ fallback ای وجود ندارد")
 
     if not password:
-        log("  ❌ رمز عبور (RESULTS_PASSWORD) برای رمزگشایی reports.tar.gz.enc تنظیم نشده", 'ERROR')
         raise RuntimeError("رمز عبور برای رمزگشایی reports.tar.gz.enc موجود نیست")
 
     try:
         raw = _decrypt_enc_bytes(enc_path, password)
     except Exception as e:
-        log(f"  ❌ خطا در رمزگشایی reports.tar.gz.enc: {e}", 'ERROR')
         raise RuntimeError(f"رمزگشایی reports.tar.gz.enc ناموفق بود: {e}")
 
     import tarfile
@@ -837,14 +873,12 @@ def filter_strategies_by_conditions(repo, token, password=None):
                 tf.extractall(td)
             snap_path = os.path.join(td, "reports", "_internal_all_results.json")
             if not os.path.exists(snap_path):
-                log("  ❌ _internal_all_results.json درون reports.tar.gz.enc یافت نشد", 'ERROR')
                 raise RuntimeError("_internal_all_results.json درون reports.tar.gz.enc یافت نشد — هیچ fallback ای وجود ندارد")
             with open(snap_path, "r", encoding="utf-8") as f:
                 content = f.read()
     except RuntimeError:
         raise
     except Exception as e:
-        log(f"  ❌ خطا در استخراج reports.tar.gz.enc: {e}", 'ERROR')
         raise RuntimeError(f"استخراج reports.tar.gz.enc ناموفق بود: {e}")
     finally:
         if os.path.exists(enc_path):
@@ -853,14 +887,70 @@ def filter_strategies_by_conditions(repo, token, password=None):
     try:
         records = json.loads(content)
     except Exception as e:
-        log(f"  ❌ خطا در parse کردن _internal_all_results.json: {e}", 'ERROR')
         raise RuntimeError(f"_internal_all_results.json خراب است و parse نشد: {e}")
 
     if not isinstance(records, list):
-        log("  ❌ محتوای _internal_all_results.json از نوع لیست نیست", 'ERROR')
         raise RuntimeError("_internal_all_results.json فرمت نامعتبر دارد (یک لیست از رکوردها انتظار می‌رفت)")
 
-    log(f"  تعداد کل استراتژی‌های موجود در _internal_all_results.json: {len(records)}")
+    log(f"  تعداد کل رکوردهای موجود در _internal_all_results.json: {len(records)}")
+    return records
+
+
+# ================================ مرحله ۱: Work Queue ================================
+
+def _parse_symbol_to_coin_session(symbol):
+    """symbol خروجی calculators.py را به (coin, session) تجزیه می‌کند.
+
+    فرمت‌های ممکن symbol (بر اساس نمونه‌ی واقعی _internal_all_results.json):
+      - "BTCUSDT-1m"                          → coin="BTCUSDT", session=None (کل روز)
+      - "BTCUSDT-1m_ETHUSDT-1m"                → coin="BTCUSDT+ETHUSDT", session=None
+        (ترکیب چندکوینی؛ calculators.py با combo_label از '_' برای اتصال
+        استفاده می‌کند، در حالی که لیست coins در build_work_queue از '+'
+        استفاده می‌کند — این تابع این ناهماهنگی فرمت را اصلاح می‌کند.
+        سشن هرگز برای ترکیب چندکوینی محاسبه نمی‌شود، فقط برای تک‌کوین‌ها.)
+      - "BTCUSDT-1m__session_london"           → coin="BTCUSDT", session="london"
+
+    نکته: هر جزء کوین معمولاً پسوند تایم‌فریم دارد (مثل -1m) که باید حذف شود
+    تا با فرمت coin در build_work_queue (بدون پسوند، مثل "BTCUSDT") یکی باشد
+    — دقیقاً همان کاری که normalize_symbol در combo_10day.py/combo_monthly.py
+    انجام می‌دهد.
+    """
+    if "__session_" in symbol:
+        coin_part, _, session = symbol.partition("__session_")
+    else:
+        coin_part, session = symbol, None
+    coin_tokens = [re.sub(r'-\d+[mhdwM]$', '', tok.strip()).upper() for tok in coin_part.split("_")]
+    coin = "+".join(coin_tokens)
+    return coin, session
+
+
+def filter_strategies_by_conditions(repo, token, password=None):
+    """فیلتر استراتژی‌ها بر اساس ۷ شرط، با استفاده از _internal_all_results.json
+    (تولیدشده توسط calculators.py report در جاب generate-reports، در ریشه‌ی
+    مخزن سوم). مجموعه‌ای از تاپل‌های (period_name, coin, session) قبول‌شده
+    برمی‌گرداند — نه فقط نام استراتژی.
+
+    نکته‌ی مهم (فیکس «قاطی شدن»): calculators.py برای هر استراتژی، به ازای هر
+    ترکیب کوین و هر سشن معاملاتی (کل‌روز + london/asia_tokyo/newyork/overlap)
+    یک رکورد جداگانه با symbol متفاوت اما period_name یکسان می‌سازد. قبلاً این
+    تابع فقط period_name را نگه می‌داشت و symbol/session را دور می‌ریخت، که
+    باعث می‌شد قبول‌شدن یک ترکیب خاص (مثلاً فقط BTC در سشن لندن) باعث صف‌شدن
+    کل ماتریس (همه کوین‌ها × همه سشن‌ها) برای آن استراتژی در build_work_queue
+    شود. حالا دقیقاً همان (coin, session) ای که قبول شده برگردانده می‌شود تا
+    build_work_queue فقط همان را صف کند.
+
+    اگر فایل موجود نبود یا خراب بود، هیچ fallback ای وجود ندارد — RuntimeError
+    raise می‌شود تا اسکریپت با exit(1) متوقف شود (طبق نیازمندی صریح).
+
+    برای رکوردهایی که یکی از ستون‌های مورد نیاز را ندارند، از مقدار پیش‌فرضی
+    استفاده می‌شود که همیشه شرط مربوطه را نقض می‌کند (یعنی رکورد رد می‌شود، نه
+    اینکه به‌اشتباه قبول شود).
+    """
+    log("=" * 60)
+    log("🔍 فیلتر استراتژی‌ها بر اساس ۷ شرط (_internal_all_results.json)")
+    log("=" * 60)
+
+    records = fetch_internal_all_results(repo, password)
 
     accepted = set()
     skipped_no_folder = 0
@@ -879,32 +969,21 @@ def filter_strategies_by_conditions(repo, token, password=None):
             skipped_no_folder += 1
             continue
 
-        # مقادیر پیش‌فرض طوری انتخاب شده‌اند که در صورت غیبت ستون، شرط مربوطه
-        # همیشه نقض شود (یعنی رکورد رد شود).
-        pct_profitable_months = item.get("pct_profitable_months", -1)
-        total_trades = item.get("total_trades", -1)
-        win_rate = item.get("win_rate", -1)
-        real_return = item.get("real_return", -1)
-        avg_profit_in_profitable_months = item.get("avg_profit_in_profitable_months", -1)
-        max_consecutive_monthly_loss = item.get("max_consecutive_monthly_loss", float("inf"))
-        avg_loss_in_loss_months = item.get("avg_loss_in_loss_months", float("-inf"))
-        sharpe_monthly = item.get("sharpe_monthly", float("-inf"))
+        symbol = item.get("symbol") or ""
+        if not symbol:
+            skipped_no_folder += 1
+            continue
+        coin, session = _parse_symbol_to_coin_session(symbol)
 
-        cond1 = pct_profitable_months > 10
-        cond2 = (total_trades > 100) or (total_trades <= 100 and win_rate >= 75 and real_return > 0)
-        cond3 = avg_profit_in_profitable_months > 0.5
-        cond4 = win_rate >= 25
-        cond5 = max_consecutive_monthly_loss < 12
-        cond6 = avg_loss_in_loss_months >= -100
-        cond7 = sharpe_monthly > -0.2
-
-        if cond1 and cond2 and cond3 and cond4 and cond5 and cond6 and cond7:
-            accepted.add(folder_name)
+        if _passes_seven_conditions(item):
+            accepted.add((folder_name, coin, session))
 
     if skipped_no_folder:
-        log(f"  ⚠️ {skipped_no_folder} رکورد بدون folder_name معتبر رد شد", 'WARNING')
+        log(f"  ⚠️ {skipped_no_folder} رکورد بدون folder_name/symbol معتبر رد شد", 'WARNING')
 
-    log(f"  تعداد استراتژی‌های واجد شرایط (پس از فیلتر ۷ شرطی): {len(accepted)}")
+    accepted_strategies = {a[0] for a in accepted}
+    log(f"  تعداد رکورد (استراتژی+کوین+سشن) واجد شرایط (پس از فیلتر ۷ شرطی): {len(accepted)}")
+    log(f"  تعداد استراتژی‌های یکتای واجد شرایط: {len(accepted_strategies)}")
     return accepted
 
 def build_work_queue(repo, token, filtered_set=None):
@@ -915,7 +994,9 @@ def build_work_queue(repo, token, filtered_set=None):
     MAX_COMBOS = 50000
 
     fixed_modules = ["combo_10day", "combo_monthly"]
-    coins = [
+    # این لیست کامل فقط برای اعتبارسنجی/fallback نگه داشته شده (ببین پایین‌تر)؛
+    # منبع اصلی کوین‌هایی که واقعاً صف می‌شوند حالا accepted_pairs است، نه این لیست.
+    ALL_KNOWN_COINS = [
         "BTCUSDT", "ETHUSDT", "XRPUSDT", "SOLUSDT", "PAXGUSDT",
         "BTCUSDT+ETHUSDT", "BTCUSDT+XRPUSDT", "BTCUSDT+SOLUSDT", "BTCUSDT+PAXGUSDT",
         "ETHUSDT+XRPUSDT", "ETHUSDT+SOLUSDT", "ETHUSDT+PAXGUSDT",
@@ -930,21 +1011,11 @@ def build_work_queue(repo, token, filtered_set=None):
         "ETHUSDT+XRPUSDT+SOLUSDT+PAXGUSDT",
         "BTCUSDT+ETHUSDT+XRPUSDT+SOLUSDT+PAXGUSDT",
     ]
-    intervals_10day = [
-        "fixed_5d", "fixed_10d", "fixed_15d", "fixed_30d",
-        "CPI_post_5d", "CPI_post_10d", "CPI_post_15d", "CPI_post_30d",
-        "CoreCPI_post_5d", "CoreCPI_post_10d", "CoreCPI_post_15d", "CoreCPI_post_30d",
-        "PPI_post_5d", "PPI_post_10d", "PPI_post_15d", "PPI_post_30d",
-        "CorePPI_post_5d", "CorePPI_post_10d", "CorePPI_post_15d", "CorePPI_post_30d",
-        "FOMC_pre_5d", "FOMC_post_5d", "FOMC_post_10d", "FOMC_post_15d", "FOMC_post_30d",
-        "CPI_y_y_post_5d", "CPI_y_y_post_10d", "CPI_y_y_post_15d", "CPI_y_y_post_30d"
-    ]
-    intervals_monthly = ["monthly"]
-    module_intervals = {
-        "combo_10day": intervals_10day,
-        "combo_monthly": intervals_monthly,
-    }
-    models = ["simple_hybrid"]
+    # intervals/models حالا از ثابت‌های سطح ماژول می‌آیند (بالای فایل) تا با
+    # purge_session_mismatches.py و هر اسکریپت دیگری که همین ترکیب‌ها را باید
+    # بسازد، همیشه دقیقاً یکسان بمانند.
+    module_intervals = MODULE_INTERVALS
+    models = MODELS
 
     strategies_file = os.environ.get('STRATEGIES_FILE', '/tmp/strategies.txt')
     log(f"  خواندن استراتژی‌ها از: {strategies_file}")
@@ -967,12 +1038,23 @@ def build_work_queue(repo, token, filtered_set=None):
         log("  هیچ استراتژی‌ای یافت نشد", 'WARNING')
         return 0
 
+    # filtered_set حالا مجموعه‌ای از تاپل‌های (period_name, coin, session) است
+    # (خروجی filter_strategies_by_conditions)، نه فقط اسم استراتژی. از آن یک
+    # نگاشت strat -> [(coin, session), ...] می‌سازیم تا فقط دقیقاً همان
+    # ترکیب‌های کوین/سشنی که ۷ شرط را پاس کرده‌اند صف شوند — نه کل ماتریس.
+    accepted_pairs_by_strat = defaultdict(list)
     if filtered_set is not None:
         if not filtered_set:
             log("  ⚠️ filtered_set خالی است — هیچ استراتژی مجازی برای پردازش وجود ندارد", 'WARNING')
             return 0
+        for period_name, coin, session in filtered_set:
+            pair = (coin, session)
+            if pair not in accepted_pairs_by_strat[period_name]:
+                accepted_pairs_by_strat[period_name].append(pair)
+
+        accepted_strategies = set(accepted_pairs_by_strat.keys())
         before_count = len(strategies)
-        strategies = [s for s in strategies if s in filtered_set]
+        strategies = [s for s in strategies if s in accepted_strategies]
         log(f"  اعمال filtered_set: از {before_count} استراتژی، {len(strategies)} استراتژی مجاز (فیلترشده) باقی ماند")
         if not strategies:
             log("  هیچ‌کدام از استراتژی‌های خوانده‌شده در filtered_set نبودند", 'WARNING')
@@ -1033,16 +1115,26 @@ def build_work_queue(repo, token, filtered_set=None):
             deferred_strategies.append(strat)
             continue
 
+        # فقط دقیقاً همان (coin, session) هایی که برای این استراتژی ۷ شرط را
+        # پاس کرده‌اند صف می‌شوند — نه کل ۳۱ ترکیب کوین. اگر به هر دلیلی
+        # (نباید پیش بیاید، چون strategies قبلاً بر همین accepted_strategies
+        # فیلتر شده) این استراتژی هیچ pair ای نداشت، رد می‌شود.
+        strat_pairs = accepted_pairs_by_strat.get(strat, [])
+        if not strat_pairs:
+            log(f"  ⚠️ استراتژی '{strat}' هیچ (coin, session) پذیرفته‌شده‌ای ندارد — رد شد", 'WARNING')
+            continue
+
         strat_combos = []
         for mod in fixed_modules:
             mod_intervals = module_intervals[mod]
-            for coin in coins:
+            for coin, session in strat_pairs:
                 for interval in mod_intervals:
                     for model in models:
                         strat_combos.append({
                             "module": mod,
                             "strat": strat,
                             "coin": coin,
+                            "session": session,
                             "interval": interval,
                             "model": model
                         })
