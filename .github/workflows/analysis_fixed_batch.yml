@@ -452,19 +452,29 @@ jobs:
               SAFE_COIN=$(echo "$COIN" | tr '+' '_')
               INTERVAL=$(echo "$ITEM" | jq -r '.interval')
               MODEL=$(echo "$ITEM"    | jq -r '.model')
-              echo "   📊 پردازش: $STRAT_I / $COIN / $INTERVAL / $MODEL"
+              # session ممکن است در آیتم اصلاً وجود نداشته باشد (صف‌های قدیمی
+              # قبل از این فیکس) یا null باشد (یعنی کل‌روز، بدون فیلتر سشن) —
+              # هر دو حالت با // empty به رشته‌ی خالی نگاشته می‌شوند.
+              SESSION=$(echo "$ITEM"  | jq -r '.session // empty')
+              SESSION_SUFFIX=""
+              SESSION_ARG=""
+              if [ -n "$SESSION" ]; then
+                SESSION_SUFFIX="_${SESSION}"
+                SESSION_ARG="--session $SESSION"
+              fi
+              echo "   📊 پردازش: $STRAT_I / $COIN / $INTERVAL / $MODEL${SESSION:+ / سشن=$SESSION}"
 
               if [ "$MODULE" == "deep" ]; then
                 echo "   ⚠️ ماژول deep پشتیبانی نمی‌شود – رد می‌شود."
-                jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" \
-                  '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo}]' \
+                jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                  '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se == "" then null else $se end)}]' \
                   /tmp/failed_items.json > /tmp/failed_items.json.tmp && mv /tmp/failed_items.json.tmp /tmp/failed_items.json
                 continue
               fi
 
               JSONL_OUT_ARG=""
               if [[ "$MODULE" == "combo_10day" || "$MODULE" == "combo_monthly" ]]; then
-                SIG_OUT="/tmp/results/signatures/${MODULE}/${STRAT_I}/${SAFE_COIN}/${INTERVAL}_${MODEL}.jsonl"
+                SIG_OUT="/tmp/results/signatures/${MODULE}/${STRAT_I}/${SAFE_COIN}/${INTERVAL}_${MODEL}${SESSION_SUFFIX}.jsonl"
                 mkdir -p "$(dirname $SIG_OUT)"
                 JSONL_OUT_ARG="--jsonl-out $SIG_OUT --min-sample-count 2"
               fi
@@ -474,8 +484,8 @@ jobs:
                 OHLC_ARG="--ohlc-dir $OHLC_DIR"
               else
                 echo "   ❌ OHLC_DIR تنظیم نشده — این ترکیب fail می‌شود."
-                jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" \
-                  '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo}]' \
+                jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                  '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se == "" then null else $se end)}]' \
                   /tmp/failed_items.json > /tmp/failed_items.json.tmp && mv /tmp/failed_items.json.tmp /tmp/failed_items.json
                 continue
               fi
@@ -487,6 +497,7 @@ jobs:
                 --coin $COIN \
                 --interval $INTERVAL \
                 --model $MODEL \
+                $SESSION_ARG \
                 $OHLC_ARG \
                 $JSONL_OUT_ARG"
               : > /tmp/item_output.log
@@ -496,11 +507,11 @@ jobs:
               set +o pipefail
 
               if [ $EXIT_CODE -ne 0 ]; then
-                echo "   ❌ خطا در ترکیب $COIN $INTERVAL $MODEL"
+                echo "   ❌ خطا در ترکیب $COIN $INTERVAL $MODEL${SESSION:+ سشن=$SESSION}"
                 SAFE_STRAT=$(echo "$STRAT_I" | sed 's/[^a-zA-Z0-9._-]/_/g')
-                cp /tmp/item_output.log "/tmp/errors/error_${MODULE}_${SAFE_COIN}_${SAFE_STRAT}_${INTERVAL}_${MODEL}.log"
-                jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" \
-                  '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo}]' \
+                cp /tmp/item_output.log "/tmp/errors/error_${MODULE}_${SAFE_COIN}_${SAFE_STRAT}_${INTERVAL}_${MODEL}${SESSION_SUFFIX}.log"
+                jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                  '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se == "" then null else $se end)}]' \
                   /tmp/failed_items.json > /tmp/failed_items.json.tmp && mv /tmp/failed_items.json.tmp /tmp/failed_items.json
                 continue
               fi
@@ -510,24 +521,27 @@ jobs:
                 # می‌کنند که قبلاً اینجا نادیده گرفته و دور ریخته می‌شد؛ الان مثل
                 # بقیه‌ی ماژول‌ها ذخیره می‌شود (در زیرپوشه‌ی جدای patterns/، چون
                 # داده‌اش با CSV سایر ماژول‌ها فرق دارد و نباید قاطی شود).
-                OUTPUT_FILE="${STRAT_I}_${COIN}_${INTERVAL}_${MODEL}.csv"
+                # نکته: نام فایل خروجی اسکریپت پایتون هم _session را در انتها
+                # دارد (ببین session_suffix در combo_10day.py/combo_monthly.py)
+                # تا با اجرای همون کوین/interval بدون فیلتر سشن تداخل نکند.
+                OUTPUT_FILE="${STRAT_I}_${COIN}_${INTERVAL}_${MODEL}${SESSION_SUFFIX}.csv"
                 if [ -f "$OUTPUT_FILE" ]; then
                   PATTERN_DEST_DIR="/tmp/results/${MODULE}_patterns/${STRAT_I}/${SAFE_COIN}"
                   mkdir -p "$PATTERN_DEST_DIR"
-                  mv "$OUTPUT_FILE" "$PATTERN_DEST_DIR/${INTERVAL}_${MODEL}.csv"
+                  mv "$OUTPUT_FILE" "$PATTERN_DEST_DIR/${INTERVAL}_${MODEL}${SESSION_SUFFIX}.csv"
                 fi
                 # معیار موفقیت همچنان «اجرای بدون خطا + ساخته‌شدن فایل JSONL» است.
                 if [ -f "$SIG_OUT" ]; then
                   if [ ! -s "$SIG_OUT" ]; then
                     echo "   ℹ️ JSONL خروجی خالی است (دوره‌ای واجد شرط min-sample-count نبود) — نتیجه‌ی معتبر، علامت‌گذاری به‌عنوان انجام‌شده."
                   fi
-                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" \
-                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo}]' \
+                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se == "" then null else $se end)}]' \
                     /tmp/done_items.json > /tmp/done_items.json.tmp && mv /tmp/done_items.json.tmp /tmp/done_items.json
                 else
                   echo "   ⚠️ فایل JSONL خروجی $SIG_OUT یافت نشد (اسکریپت آن را نساخت با وجود EXIT_CODE=0)."
-                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" \
-                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo}]' \
+                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se == "" then null else $se end)}]' \
                     /tmp/failed_items.json > /tmp/failed_items.json.tmp && mv /tmp/failed_items.json.tmp /tmp/failed_items.json
                 fi
               else
@@ -536,13 +550,13 @@ jobs:
                   DEST_DIR="/tmp/results/${MODULE}/${STRAT_I}/${SAFE_COIN}"
                   mkdir -p "$DEST_DIR"
                   mv "$OUTPUT_FILE" "$DEST_DIR/${INTERVAL}_${MODEL}.csv"
-                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" \
-                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo}]' \
+                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se == "" then null else $se end)}]' \
                     /tmp/done_items.json > /tmp/done_items.json.tmp && mv /tmp/done_items.json.tmp /tmp/done_items.json
                 else
                   echo "   ⚠️ فایل خروجی $OUTPUT_FILE یافت نشد."
-                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" \
-                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo}]' \
+                  jq --arg m "$MODULE" --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                    '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se == "" then null else $se end)}]' \
                     /tmp/failed_items.json > /tmp/failed_items.json.tmp && mv /tmp/failed_items.json.tmp /tmp/failed_items.json
                 fi
               fi
@@ -648,7 +662,10 @@ jobs:
           [ -s /tmp/merged_done.json ] || echo "[]" > /tmp/merged_done.json
 
           # اعمال unique_by با کلیدهای ترکیبی برای جلوگیری از خطای jq با آیتم‌های تکراری یا null
-          jq 'map(select(. != null)) | unique_by(.module, .strat, .coin, .interval, .model)' \
+          # session هم جزو کلید یکتایی است — چون یک (strat, coin, interval, model)
+          # با session=london و همان با session=null (کل روز) دو ترکیب کاملاً
+          # متفاوت‌اند و نباید یکی حساب شوند.
+          jq 'map(select(. != null)) | unique_by(.module, .strat, .coin, .interval, .model, .session)' \
             /tmp/merged_done.json > /tmp/merged_done_unique.json
           mv /tmp/merged_done_unique.json /tmp/merged_done.json
 
@@ -677,9 +694,12 @@ jobs:
               RETRY=$((RETRY+1)); sleep $(( (RANDOM % 5) + 3 )); continue
             fi
 
-            # حذف دقیق با مقایسه کلیدهای ترکیبی (module, strat, coin, interval, model)
+            # حذف دقیق با مقایسه کلیدهای ترکیبی (module, strat, coin, interval, model, session)
+            # نکته: صف‌های ساخته‌شده قبل از این فیکس فیلد session را اصلاً ندارند؛
+            # در آن حالت هر دو طرف با // null به null نگاشته می‌شوند، پس رفتار
+            # قدیمی برای آیتم‌های قدیمی دقیقاً حفظ می‌شود.
             jq -s '.[0] as $c | .[1] as $d
-              | ($d | unique_by(.module, .strat, .coin, .interval, .model)) as $done_set
+              | ($d | unique_by(.module, .strat, .coin, .interval, .model, (.session // null))) as $done_set
               | $c | map(
                   . as $i |
                   select(
@@ -689,7 +709,8 @@ jobs:
                         .strat    == $i.strat    and
                         .coin     == $i.coin     and
                         .interval == $i.interval and
-                        .model    == $i.model
+                        .model    == $i.model    and
+                        (.session // null) == ($i.session // null)
                       )
                     ) | length) == 0
                   )
