@@ -348,19 +348,22 @@ jobs:
         run: |
           mkdir -p /tmp/golden_scores
           # نکته: فایل در ریشه‌ی مخزن سوم است، نه زیر analysis_results/
+          # نکته ۲: نام واقعی فایل "golden_scores.csv.tar.gz.enc" است (نه
+          # "golden_scores.csv.enc") چون loop_analysis.yml هنگام بسته‌بندی
+          # FNAME را که از قبل شامل ".csv" است با ".tar.gz.enc" ترکیب می‌کند.
           HTTP_CODE=$(curl -s -o /tmp/golden_scores.csv.enc -w "%{http_code}" \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3.raw" \
-            "https://api.github.com/repos/$THIRD_REPO/contents/golden_scores.csv.enc")
+            "https://api.github.com/repos/$THIRD_REPO/contents/golden_scores.csv.tar.gz.enc")
 
           # اصلاح: اگر فایل وجود نداشت (۴۰۴)، با موفقیت ادامه می‌دهیم (بدون golden_scores)
           if [ "$HTTP_CODE" = "404" ]; then
-            echo "ℹ️ golden_scores.csv.enc هنوز در مخزن سوم موجود نیست (HTTP 404) — portfolios بدون golden_scores اجرا می‌شود."
+            echo "ℹ️ golden_scores.csv.tar.gz.enc هنوز در مخزن سوم موجود نیست (HTTP 404) — portfolios بدون golden_scores اجرا می‌شود."
             exit 0
           fi
 
           if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/golden_scores.csv.enc ]; then
-            echo "❌ golden_scores.csv.enc دریافت نشد (HTTP $HTTP_CODE)."
+            echo "❌ golden_scores.csv.tar.gz.enc دریافت نشد (HTTP $HTTP_CODE)."
             exit 1
           fi
 
