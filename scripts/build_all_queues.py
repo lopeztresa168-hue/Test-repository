@@ -1467,14 +1467,17 @@ def build_portfolios_queue(repo, token, password, min_score=45.0):
     targz_path = "/tmp/golden_scores.tar.gz"
     extract_dir = "/tmp/golden_scores_extract"
 
-    log("  دانلود golden_scores.csv.enc...")
-    if not gh_api_get_binary(repo, "golden_scores.csv.enc", enc_path):
-        log("  golden_scores.csv.enc یافت نشد — احتمالاً golden هنوز اجرا نشده. رد می‌شویم.", 'WARNING')
+    # نکته: نام واقعی فایل در ریشه‌ی مخزن سوم "golden_scores.csv.tar.gz.enc" است
+    # (نه "golden_scores.csv.enc") چون loop_analysis.yml هنگام بسته‌بندی FNAME
+    # را که از قبل شامل ".csv" است با ".tar.gz.enc" ترکیب می‌کند.
+    log("  دانلود golden_scores.csv.tar.gz.enc...")
+    if not gh_api_get_binary(repo, "golden_scores.csv.tar.gz.enc", enc_path):
+        log("  golden_scores.csv.tar.gz.enc یافت نشد — احتمالاً golden هنوز اجرا نشده. رد می‌شویم.", 'WARNING')
         return 0
 
-    log("  رمزگشایی golden_scores.csv.enc...")
+    log("  رمزگشایی golden_scores.csv.tar.gz.enc...")
     if not decrypt_file(enc_path, targz_path, password):
-        raise RuntimeError("رمزگشایی golden_scores.csv.enc ناموفق بود")
+        raise RuntimeError("رمزگشایی golden_scores.csv.tar.gz.enc ناموفق بود")
 
     if not os.path.exists(targz_path) or os.path.getsize(targz_path) == 0:
         raise RuntimeError("فایل رمزگشایی‌شده خالی است")
