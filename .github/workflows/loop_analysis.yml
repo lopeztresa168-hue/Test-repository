@@ -1148,9 +1148,9 @@ jobs:
                 const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
                 fs.writeFileSync('/tmp/${FNAME}.tar.gz.enc', enc);
               "
-              cp "/tmp/${FNAME}.tar.gz.enc" "/tmp/third_repo/analysis_results/${FNAME}.tar.gz.enc"
+              cp "/tmp/${FNAME}.tar.gz.enc" "/tmp/third_repo/analysis_results/${FNAME}.enc"
               rm -f "/tmp/${FNAME}.tar.gz" "/tmp/${FNAME}.tar.gz.enc"
-              echo "✅ portfolios_outputs/${FNAME} → analysis_results/${FNAME}.tar.gz.enc"
+              echo "✅ portfolios_outputs/${FNAME} → analysis_results/${FNAME}.enc"
             done
             UPLOADED=true
           else
