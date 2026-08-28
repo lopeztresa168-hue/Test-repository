@@ -404,6 +404,70 @@ def compute_market_regime(coin_ohlc_index, coin, start_date):
     return "unknown"
 
 
+def _precompute_regime_series(coin_ohlc_index):
+    """[فیکس: رژیم per-trade] برای هر کوین، رژیم را برای *تمام* موقعیت‌های
+    ممکنِ idx در دیتای آن کوین یک‌بار و به‌صورت کاملاً vectorized (numpy)
+    پیش‌محاسبه می‌کند — دقیقاً با همان فرمول compute_market_regime (بدون
+    آینده‌نگری: MA50/MA200/ATR14 روی idx-200:idx و امثال آن).
+
+    خروجی: dict به ازای هر کوین → (dates_list, regimes_by_idx)
+    regimes_by_idx یک آرایه numpy به طول len(dates_list)+1 است، به‌طوری‌که
+    regimes_by_idx[idx] دقیقاً همان چیزی است که compute_market_regime وقتی
+    idx = bisect_right(dates_list, cutoff) باشد برمی‌گرداند.
+    """
+    regime_index = {}
+    for coin, (dates_list, close_arr, high_arr, low_arr) in coin_ohlc_index.items():
+        n = len(close_arr)
+        regimes = np.full(n + 1, "unknown", dtype=object)
+        if n < 200:
+            regime_index[coin] = (dates_list, regimes)
+            continue
+
+        close_s = pd.Series(close_arr)
+        ma50_arr  = close_s.rolling(window=50,  min_periods=50).mean().to_numpy()
+        ma200_arr = close_s.rolling(window=200, min_periods=200).mean().to_numpy()
+        atr_arr   = pd.Series(high_arr - low_arr).rolling(window=14, min_periods=14).mean().to_numpy()
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            safe_price = np.where(close_arr == 0, np.nan, close_arr)
+            atr_ratio  = atr_arr / safe_price
+            ma_diff_pct = np.abs(ma50_arr - ma200_arr) / safe_price
+
+        cond_volatile = atr_ratio > 0.02
+        cond_up       = (~cond_volatile) & (ma50_arr > ma200_arr)
+        cond_down     = (~cond_volatile) & (ma50_arr < ma200_arr)
+        cond_ranging  = (~cond_volatile) & (~cond_up) & (~cond_down) & (ma_diff_pct < 0.05)
+
+        labels = np.full(n, "unknown", dtype=object)
+        labels[cond_volatile] = "volatile"
+        labels[cond_up]       = "trending_up"
+        labels[cond_down]     = "trending_down"
+        labels[cond_ranging]  = "ranging"
+
+        regimes[1:] = labels
+        regimes[:200] = "unknown"
+        regime_index[coin] = (dates_list, regimes)
+    return regime_index
+
+
+def lookup_market_regime(regime_index, coin, trade_date):
+    """[فیکس: رژیم per-trade] معادل دقیق compute_market_regime(...، trade_date)
+    ولی با لوکاپ ارزان (bisect) روی جدول از پیش‌ساخته‌ی _precompute_regime_series."""
+    if not regime_index or coin is None:
+        return "unknown"
+    entry = regime_index.get(coin)
+    if entry is None:
+        return "unknown"
+    dates_list, regimes = entry
+    if len(dates_list) == 0:
+        return "unknown"
+    cutoff = pd.Timestamp(trade_date) - timedelta(days=1)
+    idx = bisect_right(dates_list, cutoff)
+    if idx == 0 or idx < 200 or idx >= len(regimes):
+        return "unknown"
+    return regimes[idx]
+
+
 # ================================ توابع کمکی بازه‌های زمانی ================================
 
 def parse_interval(interval):
@@ -788,7 +852,7 @@ def _importance(actual, forecast, distance_days):
 def process_analysis(trades_json_path, news_dir, interval, target_coin,
                      chunk_start, chunk_end, output_path, model,
                      ohlc_dir=None, jsonl_out=None, min_sample_count=1,
-                     session=None):
+                     session=None, strategy_folder=""):
     """
     تحلیل اصلی.
     [اولویت ۱] ohlc_dir اجباری است — بدون آن، پردازش ادامه می‌یابد اما
@@ -955,7 +1019,8 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
         if period_key is None:
             skipped += 1
             continue
-        period_groups[period_key].append(profit)
+        # [فیکس: رژیم per-trade] تاریخ دقیق معامله دیگر دور ریخته نمی‌شود.
+        period_groups[period_key].append((date, profit))
 
     if skipped > 0:
         print(f"   ℹ️ {skipped} معامله بدون بازه معتبر نادیده گرفته شد.")
@@ -969,7 +1034,9 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
 
     print(f"📊 تعداد دوره‌های تشکیل‌شده: {len(period_groups)}")
 
-    period_returns = {period: sum(profits) for period, profits in period_groups.items()}
+    # [فیکس: رژیم per-trade] period_groups اکنون (trade_date, profit) است؛
+    # period_returns (فقط برای CSV الگوی خبری، بی‌ربط به رژیم) مثل قبل مجموع کل دوره است.
+    period_returns = {period: sum(p for _, p in profits) for period, profits in period_groups.items()}
 
     # ---------- مرحله ۵: محاسبه وضعیت خبری هر دوره ----------
     period_status = {}
@@ -999,7 +1066,9 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
 
     # ---------- مرحله ۶: تولید ترکیب‌های شاخص/آستانه و CSV ----------
     all_combinations = []
-    for r in range(1, len(INDICATORS) + 1):
+    # [فیکس: محدود به حداکثر دوشاخصی] r=1 (همه‌ی شاخص‌های تکی) و r=2 (همه‌ی
+    # ترکیبات دوبه‌دو) — ترکیبات ۳تایی به بالا دیگر اصلاً تولید نمی‌شوند.
+    for r in range(1, 3):
         for subset_tuple in itertools.combinations(INDICATORS, r):
             for thr in THRESHOLDS:
                 all_combinations.append((thr, list(subset_tuple)))
@@ -1058,15 +1127,20 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
         distance_days = parsed_iv[2] if parsed_iv else None
         first_coin    = target_coins[0] if target_coins else None
 
+        # [فیکس: رژیم per-trade] یک‌بار برای این کوین جدول رژیم روزانه
+        # پیش‌محاسبه می‌شود؛ رژیم هر معامله از روی تاریخ خودش لوکاپ می‌شود.
+        regime_index = _precompute_regime_series(coin_ohlc_index)
+
         records = []
         for period_key, (status_dict, ret, start_date, end_date) in period_status.items():
-            profits = period_groups.get(period_key, [])
-            if len(profits) < min_sample_count:
+            dated_profits = period_groups.get(period_key, [])
+            if len(dated_profits) < min_sample_count:
                 continue
 
             sorted_dates, sorted_events = sorted_event_index
             events_in_range = _events_in_range_fast(sorted_dates, sorted_events, start_date, end_date)
 
+            # ویژگی‌های خبری در سطح کل دوره محاسبه می‌شوند — بی‌ربط به رژیم، بدون تغییر.
             dominant_indicator = None
             dominant_score = -1.0
             diffs_all = []
@@ -1083,42 +1157,60 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
                     dominant_score = score
                     dominant_indicator = ev["indicator"]
 
-            total_return   = sum(profits)
-            trade_count    = len(profits)
-            avg_trade_ret  = (total_return / trade_count) if trade_count else 0.0
-            period_len     = (end_date - start_date).days + 1
-            avg_daily_ret  = (avg_trade_ret / period_len) if period_len else 0.0
-            secondary      = sorted(indicators_present - ({dominant_indicator} if dominant_indicator else set()))
+            period_len = (end_date - start_date).days + 1
+            secondary  = sorted(indicators_present - ({dominant_indicator} if dominant_indicator else set()))
 
-            market_regime  = compute_market_regime(coin_ohlc_index, first_coin, start_date)
+            # [فیکس: رژیم per-trade] معاملات این دوره را بر اساس رژیمِ روزِ
+            # خودشان (نه رژیم ثابتِ ابتدای دوره) به زیرگروه تقسیم می‌کنیم.
+            regime_buckets = defaultdict(list)
+            for trade_date, profit in dated_profits:
+                regime = lookup_market_regime(regime_index, first_coin, trade_date)
+                regime_buckets[regime].append(profit)
 
-            records.append({
-                "coin_composition":                target_coin,
-                "model":                           model,
-                "interval":                        interval,
-                "indicator_key":                   indicator_key,
-                "position":                        direction,
-                "distance_days":                   distance_days,
-                "period_start":                    start_date.isoformat(),
-                "period_end":                      end_date.isoformat(),
-                "period_length_days":              period_len,
-                "total_return":                    total_return,
-                "trade_count":                     trade_count,
-                "avg_trade_return":                avg_trade_ret,
-                "avg_daily_return":                avg_daily_ret,
-                "dominant_indicator":              dominant_indicator,
-                "dominant_indicator_importance":   (dominant_score if dominant_score >= 0 else None),
-                "secondary_indicators":            secondary,
-                "diff_avg":    (statistics.mean(diffs_all) if diffs_all else None),
-                "diff_std":    (statistics.pstdev(diffs_all) if len(diffs_all) > 1 else (0.0 if diffs_all else None)),
-                "event_count":         len(events_in_range),
-                "indicator_diversity": len(indicators_present),
-                "use_tp_sl":    use_tp_sl,
-                "take_profit":  take_profit,
-                "stop_loss":    stop_loss,
-                "strategy_folder": "",  # در main تنظیم می‌شود
-                "market_regime": market_regime,
-            })
+            for market_regime, bucket_profits in regime_buckets.items():
+                if len(bucket_profits) < min_sample_count:
+                    continue
+                total_return  = sum(bucket_profits)
+                trade_count   = len(bucket_profits)
+                avg_trade_ret = (total_return / trade_count) if trade_count else 0.0
+                avg_daily_ret = (avg_trade_ret / period_len) if period_len else 0.0
+
+                records.append({
+                    "coin_composition":                target_coin,
+                    "model":                           model,
+                    "interval":                        interval,
+                    "indicator_key":                   indicator_key,
+                    "position":                        direction,
+                    "distance_days":                   distance_days,
+                    "period_start":                    start_date.isoformat(),
+                    "period_end":                      end_date.isoformat(),
+                    "period_length_days":              period_len,
+                    "total_return":                    total_return,
+                    "trade_count":                     trade_count,
+                    "avg_trade_return":                avg_trade_ret,
+                    "avg_daily_return":                avg_daily_ret,
+                    "dominant_indicator":              dominant_indicator,
+                    "dominant_indicator_importance":   (dominant_score if dominant_score >= 0 else None),
+                    "secondary_indicators":            secondary,
+                    "diff_avg":    (statistics.mean(diffs_all) if diffs_all else None),
+                    "diff_std":    (statistics.pstdev(diffs_all) if len(diffs_all) > 1 else (0.0 if diffs_all else None)),
+                    "event_count":         len(events_in_range),
+                    "indicator_diversity": len(indicators_present),
+                    "use_tp_sl":    use_tp_sl,
+                    "take_profit":  take_profit,
+                    "stop_loss":    stop_loss,
+                    "strategy_folder": strategy_folder,
+                    # [فیکس ۱۰] قبلاً این فیلد همیشه "" بود (process_analysis
+                    # اصلاً پارامتر strategy_folder نداشت) — یعنی هر استراتژی
+                    # پردازش‌شده با combo_10day.py توی golden.py با
+                    # strategy_id="" یکسان می‌شد و همه‌ی استراتژی‌های متفاوت
+                    # قاطی می‌شدند.
+                    "market_regime": market_regime,
+                    # [فیکس ۹] سشن معاملاتی (مثل london) باید در امضای نهایی
+                    # لحاظ شود، وگرنه «استراتژی A همیشه» و «استراتژی A فقط
+                    # سشن لندن» به‌عنوان یک ترکیب یکسان با هم قاطی می‌شوند.
+                    "session": session if session else "none",
+                })
 
         _write_jsonl(jsonl_out, records)
 
@@ -1300,6 +1392,7 @@ def main():
         jsonl_out=args.jsonl_out,
         min_sample_count=args.min_sample_count,
         session=args.session,
+        strategy_folder=args.strategy_folder,
     )
 
 

@@ -10,6 +10,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -137,8 +138,8 @@ def load_patterns(patterns_dir: str | None) -> pd.DataFrame:
     خود فایل‌های CSV هیچ ستون coin/strategy/module ندارند — این‌ها از مسیر
     فایل استخراج می‌شوند.
 
-    فقط ردیف‌های تک‌شاخصی (تعداد_شاخص‌ها == 1) نگه داشته می‌شوند — طبق تصمیم
-    فعلی، ترکیب چند شاخص با هم فعلاً استفاده نمی‌شود.
+    فقط ردیف‌های تک‌شاخصی و دوشاخصی (تعداد_شاخص‌ها <= 2) نگه داشته می‌شوند —
+    طبق تصمیم فعلی، ترکیب ۳ شاخص یا بیشتر استفاده نمی‌شود.
 
     اگر مسیر داده نشود یا خالی/ناموجود باشد، DataFrame خالی برمی‌گردد (بدون
     خطا) — این قابلیت کاملاً اختیاری و مکمل جریان اصلی golden است.
@@ -163,24 +164,27 @@ def load_patterns(patterns_dir: str | None) -> pd.DataFrame:
             df = pd.read_csv(csv_path)
             if "تعداد_شاخص‌ها" not in df.columns:
                 continue
-            df = df[df["تعداد_شاخص‌ها"] == 1].copy()
+            df = df[df["تعداد_شاخص‌ها"] <= 2].copy()
             if df.empty:
                 continue
             df["module"] = module
             df["strategy_folder"] = strategy
             df["safe_coin"] = safe_coin
-            df["indicator"] = df["لیست_شاخص‌ها"]  # تک‌شاخصی، پس همان یک نام شاخص است
+            # تک‌شاخصی: یک نام (مثلاً "CPI m/m"). دوشاخصی: دو نام با "|" به‌هم
+            # چسبیده (مثلاً "CPI m/m|FOMC") — همان فرمتی که combo_monthly.py/
+            # combo_10day.py با '|'.join(subset) تولید می‌کنند.
+            df["indicator"] = df["لیست_شاخص‌ها"]
             rows.append(df)
         except Exception as e:
             log.warning(f"[PATTERNS] خطا در خواندن {csv_path}: {e} — رد می‌شود.")
             continue
 
     if not rows:
-        log.info(f"[PATTERNS] هیچ ردیف تک‌شاخصی معتبری در {pdir} یافت نشد.")
+        log.info(f"[PATTERNS] هیچ ردیف تک/دوشاخصی معتبری در {pdir} یافت نشد.")
         return pd.DataFrame()
 
     result = pd.concat(rows, ignore_index=True)
-    log.info(f"[PATTERNS] {len(result):,} ردیف تک‌شاخصی از {len(csv_files)} فایل CSV بارگذاری شد.")
+    log.info(f"[PATTERNS] {len(result):,} ردیف تک/دوشاخصی از {len(csv_files)} فایل CSV بارگذاری شد.")
     return result
 
 
@@ -241,7 +245,13 @@ def build_signature(row: pd.Series) -> str:
     if distance is None or (isinstance(distance, float) and pd.isna(distance)):
         distance = 0
     model = row.get("model", "")
-    return f"{coin}_{indicator}_{position}_{distance}_{model}_{regime}"
+    # [فیکس ۹] سشن معاملاتی (مثل london) باید بخشی از امضا باشد، وگرنه
+    # «استراتژی A همیشه» و «استراتژی A فقط سشن لندن» یک ترکیب یکسان حساب
+    # می‌شوند و در golden.py با هم قاطی/میانگین‌گیری می‌شوند.
+    session = row.get("session")
+    if session is None or (isinstance(session, float) and pd.isna(session)) or session == "":
+        session = "none"
+    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}"
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +330,20 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
         _representative_value(group["dominant_indicator"]) if "dominant_indicator" in group.columns else None
     )
 
+    # [فیکس: پشتیبانی ترکیب دوشاخصی] برای اینکه بعداً بشود CSVهای الگوی
+    # دوشاخصی (patterns_df با تعداد_شاخص‌ها==2) را هم به این گروه مچ کرد،
+    # اتحاد تمام شاخص‌هایی که در طول همه‌ی دوره‌های این گروه به‌عنوان
+    # dominant_indicator یا در secondary_indicators دیده شده‌اند نگه داشته
+    # می‌شود. صرفاً dominant_indicator (تک‌شاخصی) برای تشخیص یک *جفت* شاخص
+    # کافی نیست.
+    all_indicators_seen = set()
+    if "dominant_indicator" in group.columns:
+        all_indicators_seen.update(x for x in group["dominant_indicator"].dropna().tolist() if x)
+    if "secondary_indicators" in group.columns:
+        for lst in group["secondary_indicators"].dropna():
+            if isinstance(lst, (list, tuple, set)):
+                all_indicators_seen.update(lst)
+
     return {
         "win_rate": win_rate,
         "profit_factor": profit_factor,
@@ -327,6 +351,7 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
         "avg_daily_return": avg_daily_return,
         "avg_indicator_importance": avg_indicator_importance,
         "dominant_indicator": dominant_indicator,
+        "all_indicators_seen": sorted(all_indicators_seen),
         "sample_count": n,
         "total_return_sum": sum(returns),
         "signature_path": signature_path,
@@ -526,6 +551,79 @@ def write_summary(
 # ---------------------------------------------------------------------------
 # پردازش اصلی
 # ---------------------------------------------------------------------------
+
+def merge_pattern_thresholds(recommendation_df: pd.DataFrame, patterns_df: pd.DataFrame) -> pd.DataFrame:
+    """ادغام ستون‌های نسبت_شانس_آستانه_* (تک‌شاخصی + دوشاخصی) از patterns_df
+    به recommendation_df.
+
+    [فیکس ۱] قبلاً pivot_table با aggfunc="first" روی (indicator, آستانه)
+    بدون "الگوی_وضعیت" در index، ۲ از هر ۳ مقدار (Good/Bad/Neutral) را
+    بی‌صدا دور می‌ریخت. راه‌حل درست ادغام بر اساس وضعیت واقعیِ آن سیگنال نیست،
+    چون آن وضعیت اصلاً در سطح norm_df/recommendation_df ثبت نشده (فقط
+    dominant_indicator نگه داشته می‌شود، نه اینکه در آن دوره وضعیتش Good بوده
+    یا Bad). پس به‌جای حدس زدن یک وضعیت، هر سه وضعیت به‌صورت ستون‌های جدا
+    نگه داشته می‌شوند: نسبت_شانس_آستانه_{thr}_{Good|Bad|Neutral}
+
+    [فیکس ۲] برای ردیف‌های دوشاخصی (indicator = "A|B")، مچ‌کردن مستقیم با
+    dominant_indicator (که همیشه تک‌شاخصی است) امکان‌پذیر نیست. به‌جایش، چک
+    می‌شود که آیا هر دو شاخص A و B در all_indicators_seen آن گروه (اتحاد
+    dominant_indicator + secondary_indicators در تمام دوره‌های آن گروه)
+    حضور داشته‌اند یا نه.
+    """
+    recommendation_df = recommendation_df.copy()
+    if patterns_df.empty:
+        log.info("[PATTERNS] patterns_df خالی است — ستون‌های آستانه اضافه نمی‌شوند.")
+        return recommendation_df
+
+    recommendation_df["_safe_coin"] = (
+        recommendation_df["coin_composition"].astype(str).str.replace("+", "_", regex=False)
+    )
+
+    # نگاشت سریع: (strategy_folder, safe_coin) -> لیستی از رکوردهای پترن
+    pattern_lookup = defaultdict(list)
+    for _, prow in patterns_df.iterrows():
+        key = (prow["strategy_folder"], prow["safe_coin"])
+        indicator_names = tuple(str(prow["indicator"]).split("|"))
+        pattern_lookup[key].append({
+            "indicators": indicator_names,
+            "threshold": prow["آستانه"],
+            "status": prow["الگوی_وضعیت"],
+            "odds": prow["نسبت_شانس"],
+        })
+
+    def _match_row(row):
+        key = (row["strategy_id"], row["_safe_coin"])
+        candidates = pattern_lookup.get(key)
+        if not candidates:
+            return {}
+        dom = row["dominant_indicator"]
+        seen = set(row["all_indicators_seen"]) if isinstance(row["all_indicators_seen"], (list, tuple, set)) else set()
+        out = {}
+        for cand in candidates:
+            inds = cand["indicators"]
+            if len(inds) == 1:
+                if inds[0] != dom:
+                    continue
+            else:
+                if not set(inds).issubset(seen):
+                    continue
+            col = f"نسبت_شانس_آستانه_{cand['threshold']}_{cand['status']}"
+            # اگر چند رکورد پترن (مثلاً از فایل‌های تکه‌ای مختلف) به یک ستون
+            # برسند، اولین مقدار نگه داشته می‌شود (به‌ندرت رخ می‌دهد).
+            if col not in out:
+                out[col] = cand["odds"]
+        return out
+
+    matched_series = recommendation_df.apply(_match_row, axis=1)
+    matched_df = pd.DataFrame(list(matched_series), index=recommendation_df.index)
+    recommendation_df = pd.concat([recommendation_df, matched_df], axis=1)
+    recommendation_df.drop(columns=["_safe_coin"], errors="ignore", inplace=True)
+
+    thr_cols = [c for c in recommendation_df.columns if c.startswith("نسبت_شانس_آستانه_")]
+    matched = recommendation_df[thr_cols].notna().any(axis=1).sum() if thr_cols else 0
+    log.info(f"[PATTERNS] {matched:,} از {len(recommendation_df):,} ردیف پیشنهاد با آستانه/نسبت_شانس تطبیق یافتند.")
+    return recommendation_df
+
 
 def run(
     signatures_dir: str,
@@ -753,39 +851,15 @@ def run(
     # (این دو ستون به‌عمد به golden_scores.csv اضافه نشدند تا فرمت آن فایل،
     # که در بخش‌های دیگر pipeline استفاده می‌شود، دست‌نخورده بماند).
     recommendation_df = norm_df[
-        ["strategy_id", "coin_composition", "signature", "sample_count", "win_rate", "avg_daily_return", "dominant_indicator"]
+        ["strategy_id", "coin_composition", "signature", "sample_count", "win_rate", "avg_daily_return",
+         "dominant_indicator", "all_indicators_seen"]
     ].copy()
 
-    # ── ادغام اختیاری آستانه/نسبت_شانس (تک‌شاخصی) از patterns_df ──────────
+    # ── ادغام اختیاری آستانه/نسبت_شانس (تک‌شاخصی + دوشاخصی) از patterns_df ──
     # فقط به دو خروجی پیشنهاد استراتژی اضافه می‌شود، نه golden_scores.csv
-    # (طبق همان اصل بالا — فرمت golden_scores.csv دست‌نخورده می‌ماند).
-    if not patterns_df.empty:
-        recommendation_df["_safe_coin"] = (
-            recommendation_df["coin_composition"].astype(str).str.replace("+", "_", regex=False)
-        )
-        pivot = patterns_df.pivot_table(
-            index=["strategy_folder", "safe_coin", "indicator"],
-            columns="آستانه",
-            values="نسبت_شانس",
-            aggfunc="first",
-        )
-        pivot.columns = [f"نسبت_شانس_آستانه_{c}" for c in pivot.columns]
-        pivot = pivot.reset_index()
-        recommendation_df = recommendation_df.merge(
-            pivot,
-            left_on=["strategy_id", "_safe_coin", "dominant_indicator"],
-            right_on=["strategy_folder", "safe_coin", "indicator"],
-            how="left",
-        )
-        recommendation_df.drop(
-            columns=["_safe_coin", "strategy_folder", "safe_coin", "indicator"],
-            errors="ignore", inplace=True,
-        )
-        thr_cols = [c for c in recommendation_df.columns if c.startswith("نسبت_شانس_آستانه_")]
-        matched = recommendation_df[thr_cols].notna().any(axis=1).sum() if thr_cols else 0
-        log.info(f"[PATTERNS] {matched:,} از {len(recommendation_df):,} ردیف پیشنهاد با آستانه/نسبت_شانس تطبیق یافتند.")
-    else:
-        log.info("[PATTERNS] patterns_df خالی است — ستون‌های آستانه اضافه نمی‌شوند.")
+    # (فرمت golden_scores.csv دست‌نخورده می‌ماند).
+    recommendation_df = merge_pattern_thresholds(recommendation_df, patterns_df)
+    recommendation_df.drop(columns=["all_indicators_seen"], errors="ignore", inplace=True)
 
     generate_news_pattern_recommendation(recommendation_df, output_path)
     generate_market_regime_recommendation(recommendation_df, output_path)
@@ -841,28 +915,48 @@ def _threshold_columns(df: pd.DataFrame) -> list[str]:
     return sorted(c for c in df.columns if c.startswith("نسبت_شانس_آستانه_"))
 
 
-def _prepare_group_aggregates(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+def _strip_market_regime(signature) -> str:
+    """[فیکس ۹/۱۱] معکوس _extract_market_regime: امضا را بدون پسوند رژیم
+    برمی‌گرداند (یعنی coin_indicator_position_distance_model_session)."""
+    if not isinstance(signature, str) or not signature:
+        return ""
+    for regime in sorted(KNOWN_MARKET_REGIMES, key=len, reverse=True):
+        suffix = "_" + regime
+        if signature.endswith(suffix):
+            return signature[: -len(suffix)]
+        if signature == regime:
+            return ""
+    return signature
+
+
+def _prepare_group_aggregates(df: pd.DataFrame, group_col: str, include_thr_cols: bool = True) -> pd.DataFrame:
     """تجمیع رکوردها بر اساس (گروه، نام_استراتژی) و محاسبه معیارهای خام.
 
-    نام_استراتژی به‌صورت "{strategy_id} ({coin_composition})" ساخته می‌شود تا
-    استراتژی‌های یکسان با ترکیب کوین متفاوت از هم متمایز بمانند. تعداد_سود و
-    تعداد_ضرر از sample_count و win_rate (وزن‌دهی‌شده) تخمین زده می‌شوند، چون
-    scores_out_df/norm_df شمارش خام سود/ضرر را نگه نمی‌دارد.
+    اگر ستون «نام_استراتژی» از قبل در df موجود باشد، همان استفاده می‌شود
+    (این حالت را generate_market_regime_recommendation برای [فیکس ۱۱] به‌کار
+    می‌برد تا هر ردیف دقیقاً یک ترکیب یکتا بماند). در غیر این صورت، مثل قبل
+    از "{strategy_id} ({coin_composition})" ساخته می‌شود — این حالت پیش‌فرض
+    برای «الگوی خبری» کاملاً کافی است چون group_col آنجا خودِ signature
+    یکتاست و هیچ ادغام اضافه‌ای رخ نمی‌دهد.
 
-    اگر ستون‌های نسبت_شانس_آستانه_* موجود باشند (یعنی --patterns-dir داده
-    شده)، این‌ها هم با همان وزن‌دهی sample_count میانگین‌گیری و نگه داشته
-    می‌شوند — برای گروه‌بندی «الگوی خبری» چون هر گروه = یک signature یکتا با
-    یک شاخص ثابت است، این میانگین عملاً همیشه برابر همان مقدار تک است؛ برای
-    «رژیم بازار» که چند شاخص متفاوت می‌توانند زیر یک رژیم قرار بگیرند، میانگین
-    وزنی یک خلاصه‌ی معنادار (نه لزوماً مقدار یک شاخص خاص) است.
+    تعداد_سود و تعداد_ضرر از sample_count و win_rate (وزن‌دهی‌شده) تخمین زده
+    می‌شوند، چون scores_out_df/norm_df شمارش خام سود/ضرر را نگه نمی‌دارد.
+
+    [فیکس ۸] ستون‌های نسبت_شانس_آستانه_* فقط وقتی include_thr_cols=True باشد
+    محاسبه/نگه داشته می‌شوند. برای گروه‌بندی «الگوی خبری» (group_col=
+    گروه_خبری=signature) این درست است چون هر گروه دقیقاً یک ترکیب شاخص
+    یکتاست، پس این ستون‌ها هرگز بین دو ترکیب متفاوت میانگین‌گیری نمی‌شوند. اما
+    برای «رژیم بازار» (group_col=رژیم_بازار)، include_thr_cols=False پاس داده
+    می‌شود.
     """
     work = df.copy()
-    work["نام_استراتژی"] = work["strategy_id"].astype(str) + " (" + work["coin_composition"].astype(str) + ")"
+    if "نام_استراتژی" not in work.columns:
+        work["نام_استراتژی"] = work["strategy_id"].astype(str) + " (" + work["coin_composition"].astype(str) + ")"
     work["sample_count"] = work["sample_count"].fillna(0)
     work["_win_raw"] = work["sample_count"] * (work["win_rate"].fillna(0) / 100.0)
     work["_return_weighted"] = work["sample_count"] * work["avg_daily_return"].fillna(0)
 
-    thr_cols = _threshold_columns(work)
+    thr_cols = _threshold_columns(work) if include_thr_cols else []
     thr_weighted_cols = []
     for tc in thr_cols:
         wcol = f"_w_{tc}"
@@ -988,13 +1082,14 @@ def _generate_recommendation_output(
     output_path: Path,
     filename: str,
     label: str,
+    include_thr_cols: bool = True,
 ) -> None:
     """منطق مشترک تولید یک خروجی پیشنهاد استراتژی (افزایشی) بر اساس ستون گروه‌بندی مشخص."""
     if df.empty or group_col not in df.columns:
         log.warning(f"[{label}] داده‌ای برای تولید خروجی یافت نشد — رد می‌شود.")
         return
 
-    new_agg = _prepare_group_aggregates(df, group_col)
+    new_agg = _prepare_group_aggregates(df, group_col, include_thr_cols=include_thr_cols)
 
     out_file = output_path / filename
     old_final = None
@@ -1006,9 +1101,17 @@ def _generate_recommendation_output(
 
     old_raw = None
     if old_final is not None and not old_final.empty:
-        old_raw = old_final[
-            ["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
-        ].copy()
+        # [فیکس ۶] قبلاً فقط ۷ ستون ثابت از فایل قبلی خوانده می‌شد و ستون‌های
+        # نسبت_شانس_آستانه_* (در صورت وجود از اجرای قبلی) دور ریخته می‌شدند —
+        # یعنی از اجرای دوم incremental به بعد، میانگین وزنی آستانه‌ها با
+        # وزن صفر/None برای ردیف‌های قدیمی رقیق و غلط می‌شد. حالا هر ستونی که
+        # با نسبت_شانس_آستانه_ شروع شود هم (در صورت وجود در فایل قبلی) نگه
+        # داشته می‌شود — مگر برای گزارش‌هایی که include_thr_cols=False دارند
+        # ([فیکس ۸]: مثلاً رژیم بازار)، که آنجا این ستون‌ها عمداً همیشه کنار
+        # گذاشته می‌شوند، حتی اگر (مثلاً از یک نسخه‌ی قدیمی‌تر) در فایل قبلی مانده باشند.
+        base_cols = ["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
+        old_thr_cols = [c for c in old_final.columns if c.startswith("نسبت_شانس_آستانه_")] if include_thr_cols else []
+        old_raw = old_final[base_cols + old_thr_cols].copy()
 
     merged_agg = _merge_with_previous(new_agg, old_raw)
     new_final = _rank_and_select(merged_agg)
@@ -1034,11 +1137,24 @@ def generate_news_pattern_recommendation(df: pd.DataFrame, output_dir) -> None:
     )
 
 
+KNOWN_MARKET_REGIMES = ["trending_up", "trending_down", "volatile", "ranging", "unknown"]
+
+
 def _extract_market_regime(signature) -> str:
-    """استخراج رژیم بازار (آخرین بخش امضا، مطابق build_signature) از رشته signature."""
-    if not isinstance(signature, str) or "_" not in signature:
+    """استخراج رژیم بازار از رشته signature (مطابق build_signature).
+
+    [فیکس ۷] قبلاً با signature.rsplit("_", 1)[-1] فقط آخرین تکه‌ی بعد از
+    آخرین "_" برداشته می‌شد — که برای رژیم‌های حاوی خودِ "_" (trending_up،
+    trending_down) نصف اسم رو قطع می‌کرد (مثلاً "up" به‌جای "trending_up").
+    حالا در برابر لیست رژیم‌های شناخته‌شده (طولانی‌ترین اول) به‌عنوان پسوند
+    کامل چک می‌شود.
+    """
+    if not isinstance(signature, str) or not signature:
         return "unknown"
-    return signature.rsplit("_", 1)[-1]
+    for regime in sorted(KNOWN_MARKET_REGIMES, key=len, reverse=True):
+        if signature == regime or signature.endswith("_" + regime):
+            return regime
+    return "unknown"
 
 
 def generate_market_regime_recommendation(df: pd.DataFrame, output_dir) -> None:
@@ -1046,12 +1162,37 @@ def generate_market_regime_recommendation(df: pd.DataFrame, output_dir) -> None:
     output_path = Path(output_dir)
     work = df.copy()
     work["رژیم_بازار"] = work["signature"].apply(_extract_market_regime)
+    # [فیکس ۳] رکوردهای unknown عمدتاً به‌خاطر warm-up period (کمتر از ۲۰۰
+    # روز دیتای OHLC قبلی برای MA200) هستند، نه یک رژیم واقعی بازار — حذف می‌شوند.
+    before = len(work)
+    work = work[work["رژیم_بازار"] != "unknown"]
+    dropped = before - len(work)
+    if dropped:
+        log.info(f"[رژیم بازار] {dropped:,} ردیف با رژیم 'unknown' حذف شد.")
+    # [فیکس ۱۱] قبلاً کلید دوم گروه‌بندی («نام_استراتژی») فقط strategy_id+coin
+    # بود — یعنی ده‌ها/صدها ترکیب کاملاً متفاوت (اندیکاتور/موقعیت/فاصله/مدل/
+    # سشن متفاوت) که فقط strategy_id و کوینشان یکی بود، زیر یک رژیم در یک
+    # ردیف با میانگین‌گیری قاطی می‌شدند — دقیقاً همان «میانگین بین ۱۰۰۰ ترکیب»
+    # که هدف (پیدا کردن دقیق‌ترین ترکیب سودده) را از بین می‌برد. حالا
+    # «نام_استراتژی» شامل کل هویت ترکیب (strategy_id + امضای کامل بدون پسوند
+    # رژیم — که خودش کوین/اندیکاتور/موقعیت/فاصله/مدل/سشن را در بر دارد)
+    # است، پس هر ردیف در خروجی نهایی دقیقاً یک ترکیب یکتا را نشان می‌دهد، نه
+    # میانگینی از چند ترکیب مختلف.
+    work["نام_استراتژی"] = (
+        work["strategy_id"].astype(str) + " | " + work["signature"].apply(_strip_market_regime)
+    )
+    # [فیکس ۸] یک گروهِ «رژیم بازار» می‌تواند شامل چندین ترکیب شاخص متفاوت
+    # باشد؛ نسبت_شانس_آستانه_* ذاتاً مال یک ترکیب خاص است، پس اینجا اصلاً
+    # محاسبه/نمایش داده نمی‌شود تا هرگز دو ترکیب نامرتبط با هم قاطی نشوند.
+    # این ستون‌ها همچنان کامل و درست در فایل «الگوی خبری» موجودند (آنجا هر
+    # گروه = دقیقاً یک ترکیب یکتاست).
     _generate_recommendation_output(
         work,
         "رژیم_بازار",
         output_path,
         "پیشنهاد_استراتژی_بر_اساس_رژیم_بازار.csv",
         "رژیم بازار",
+        include_thr_cols=False,
     )
 
 
