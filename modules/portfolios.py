@@ -506,7 +506,15 @@ def parse_position(signature: str) -> Optional[str]:
 
 
 def compute_release_date(row: pd.Series) -> pd.Timestamp:
-    """تخمین تاریخ انتشار شاخص غالب برای یک رکورد دوره."""
+    """تخمین تاریخ انتشار شاخص غالب برای یک رکورد دوره.
+
+    [فیکس ۱۴] قبلاً مسیر پیش‌فرض (بدون ستون release_date، که رایج‌ترین حالت
+    است چون JSONLهای خام اصلاً چنین ستونی ندارند) مستقیماً period_end/
+    period_start را برمی‌گرداند — که در JSONL یک رشته‌ی متنی است ("2020-01-01")
+    نه pd.Timestamp، برخلاف امضای خود تابع. تا الان چون هیچ‌جا از این مقدار
+    متد Timestamp-محور (مثل .date()) صدا زده نمی‌شد، این ناسازگاری خودش را
+    نشان نمی‌داد.
+    """
     if "release_date" in row and pd.notna(row["release_date"]):
         return pd.to_datetime(row["release_date"])
 
@@ -515,8 +523,8 @@ def compute_release_date(row: pd.Series) -> pd.Timestamp:
         position = parse_position(row["signature"])
 
     if position == "pre":
-        return row["period_end"]
-    return row["period_start"]
+        return pd.to_datetime(row["period_end"])
+    return pd.to_datetime(row["period_start"])
 
 
 def build_release_dates(group: pd.DataFrame) -> pd.DataFrame:
@@ -693,6 +701,17 @@ def evaluate_group(
         index="release_date", columns="strategy_id", values="total_return", aggfunc="mean"
     )
 
+    # [فیکس ۱۳] برای هر دوره (release_date)، طول واقعی آن دوره (period_length_days)
+    # را نگه می‌داریم تا بعداً بشود «تعداد_روز_فعال» یک سبد را (مجموع طول
+    # دوره‌های مشترک اعضا) حساب کرد. اگر این ستون در داده موجود نباشد (نسخه‌ی
+    # قدیمی JSONL)، به تعداد دوره‌ها (نه روز) بازمی‌گردیم و این محدودیت را
+    # صریحاً مستند می‌کنیم.
+    period_length_by_date = {}
+    if "period_length_days" in group.columns:
+        period_length_by_date = (
+            group.groupby("release_date")["period_length_days"].max().to_dict()
+        )
+
     portfolios = []
     raw_candidate_count = 0  # ========== باگ ۷ رفع شد: شمارش کاندیدها پیش از فیلتر مطلق ==========
     for size in PORTFOLIO_SIZES:
@@ -722,6 +741,19 @@ def evaluate_group(
             if ar < ABS_MIN_AVG_RETURN:
                 continue
 
+            # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد: اولین/آخرین دوره‌ی
+            # مشترک اعضا، و مجموع طول واقعی دوره‌های مشترک (نه کل فاصله‌ی
+            # تقویمی — چون بین دوره‌ها ممکن است شکاف باشد).
+            sorted_shared = sorted(shared_periods)
+            بازه_شروع = sorted_shared[0]
+            بازه_پایان = sorted_shared[-1]
+            if period_length_by_date:
+                روز_فعال = int(sum(period_length_by_date.get(d, 0) for d in sorted_shared))
+            else:
+                # داده‌ی قدیمی بدون period_length_days: به تعداد دوره (نه
+                # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
+                روز_فعال = len(sorted_shared)
+
             portfolios.append({
                 "coin_composition": coin_composition,
                 "signature": signature,
@@ -731,6 +763,10 @@ def evaluate_group(
                 "avg_return": ar,
                 "avg_correlation": ac,
                 "sample_count": len(shared_periods),
+                "بازه_زمانی_شروع": بازه_شروع.date().isoformat(),
+                "بازه_زمانی_پایان": بازه_پایان.date().isoformat(),
+                "تعداد_روز_فعال": روز_فعال,
+                "تعداد_روز_کل_بازه": (بازه_پایان - بازه_شروع).days + 1,
             })
 
     if not portfolios:
@@ -990,11 +1026,15 @@ def run(
         return output_dir / "portfolios.csv"
 
     # ---- گام ۶: پس از اتمام همه chunk‌ها ----
+    # [فیکس] طبق درخواست کاربر، version_id و created_at از خروجی
+    # portfolios.csv حذف شدند — این دو ستون صرفاً متادیتای اجرا بودن، نه
+    # چیزی که برای تصمیم معاملاتی لازم باشه.
     columns = [
         "coin_composition", "signature", "شاخص_خبری", "members", "survival_rate",
         "compensation_ratio", "avg_return", "avg_correlation", "score",
         "sample_count",
-        "version_id", "created_at",
+        # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد
+        "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
     ]
 
     # ========== باگ ۷ رفع شد ==========
@@ -1008,8 +1048,6 @@ def run(
         out_df = pd.DataFrame(columns=columns)
     else:
         out_df = pd.DataFrame(all_portfolios)
-        out_df["version_id"] = version_id
-        out_df["created_at"] = datetime.now(timezone.utc).isoformat()
         out_df = out_df[[c for c in columns if c in out_df.columns]]
 
     output_path = output_dir / "portfolios"
@@ -1120,10 +1158,14 @@ def run_whole_time(
         log.info("  coin=%s | %d سبد یافت شد (از %d کاندید خام)",
                   coin_composition, len(result), raw_count)
 
+    # [فیکس] طبق درخواست کاربر، version_id و created_at از خروجی
+    # portfolios_whole_time.csv هم حذف شدند.
     columns = [
         "coin_composition", "signature", "members", "survival_rate",
         "compensation_ratio", "avg_return", "avg_correlation", "score",
-        "sample_count", "version_id", "created_at",
+        "sample_count",
+        # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد
+        "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
     ]
 
     if not all_portfolios:
@@ -1131,8 +1173,6 @@ def run_whole_time(
         out_df = pd.DataFrame(columns=columns)
     else:
         out_df = pd.DataFrame(all_portfolios)
-        out_df["version_id"] = version_id
-        out_df["created_at"] = datetime.now(timezone.utc).isoformat()
         out_df = out_df[[c for c in columns if c in out_df.columns]]
 
     output_path = output_dir / "portfolios_whole_time"

@@ -304,6 +304,24 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
 
     avg_daily_return = group["avg_daily_return"].mean() if "avg_daily_return" in group.columns else 0.0
 
+    # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این ترکیب: اولین و آخرین تاریخ دوره‌ای که
+    # این signature در آن معامله داشته، به‌علاوه‌ی مجموع طول واقعی دوره‌هایی
+    # که توشون معامله ثبت شده (نه کل فاصله‌ی تقویمی — چون بین دوره‌ها ممکن
+    # است شکاف باشد، مثلاً ماه‌هایی با کمتر از min_sample_count معامله که
+    # اصلاً به JSONL نرسیده‌اند).
+    period_start_min = None
+    period_end_max = None
+    active_days_sum = 0
+    if "period_start" in group.columns and "period_end" in group.columns:
+        starts = pd.to_datetime(group["period_start"], errors="coerce").dropna()
+        ends = pd.to_datetime(group["period_end"], errors="coerce").dropna()
+        if not starts.empty:
+            period_start_min = starts.min().date().isoformat()
+        if not ends.empty:
+            period_end_max = ends.max().date().isoformat()
+    if "period_length_days" in group.columns:
+        active_days_sum = int(pd.to_numeric(group["period_length_days"], errors="coerce").fillna(0).sum())
+
     # میانگین شدت «تعجب خبری» (|actual-forecast|) شاخص غالب این گروه — از
     # dominant_indicator_importance که در JSONL خام موجود است ولی قبلاً اینجا
     # هیچ‌وقت استفاده نمی‌شد. مقادیر None (رویدادهای هنوز-منتشرنشده، مثلاً
@@ -355,6 +373,9 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
         "sample_count": n,
         "total_return_sum": sum(returns),
         "signature_path": signature_path,
+        "بازه_زمانی_شروع": period_start_min,
+        "بازه_زمانی_پایان": period_end_max,
+        "تعداد_روز_فعال": active_days_sum,
     }
 
 
@@ -852,7 +873,8 @@ def run(
     # که در بخش‌های دیگر pipeline استفاده می‌شود، دست‌نخورده بماند).
     recommendation_df = norm_df[
         ["strategy_id", "coin_composition", "signature", "sample_count", "win_rate", "avg_daily_return",
-         "dominant_indicator", "all_indicators_seen"]
+         "dominant_indicator", "all_indicators_seen",
+         "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال"]
     ].copy()
 
     # ── ادغام اختیاری آستانه/نسبت_شانس (تک‌شاخصی + دوشاخصی) از patterns_df ──
@@ -968,6 +990,16 @@ def _prepare_group_aggregates(df: pd.DataFrame, group_col: str, include_thr_cols
         _win_raw_sum=("_win_raw", "sum"),
         _return_weighted_sum=("_return_weighted", "sum"),
     )
+    # [فیکس ۱۳] بازه‌ی زمانی بک‌تست: min/max رشته‌های تاریخ ISO (YYYY-MM-DD)
+    # به‌درستی lexicographically هم‌ترازِ ترتیب زمانی‌ست، پس نیازی به تبدیل
+    # datetime قبل از min/max نیست. NaN/None به‌طور خودکار توسط pandas
+    # نادیده گرفته می‌شوند.
+    if "بازه_زمانی_شروع" in work.columns:
+        agg_spec["بازه_زمانی_شروع"] = ("بازه_زمانی_شروع", "min")
+    if "بازه_زمانی_پایان" in work.columns:
+        agg_spec["بازه_زمانی_پایان"] = ("بازه_زمانی_پایان", "max")
+    if "تعداد_روز_فعال" in work.columns:
+        agg_spec["تعداد_روز_فعال"] = ("تعداد_روز_فعال", "sum")
     for wcol in thr_weighted_cols:
         agg_spec[f"{wcol}_sum"] = (wcol, "sum")
 
@@ -986,8 +1018,21 @@ def _prepare_group_aggregates(df: pd.DataFrame, group_col: str, include_thr_cols
             lambda r, wcol=wcol: (r[f"{wcol}_sum"] / r["تعداد_تکرار"]) if r["تعداد_تکرار"] else None, axis=1
         )
 
+    period_cols = []
+    if "بازه_زمانی_شروع" in agg.columns and "بازه_زمانی_پایان" in agg.columns:
+        # [فیکس ۱۳] تعداد_روز_کل_بازه = فاصله‌ی تقویمی شروع تا پایان (شامل
+        # شکاف‌های احتمالی بین دوره‌ها) — در تضاد عمدی با تعداد_روز_فعال که
+        # فقط طول دوره‌هایی با معامله‌ی واقعی را می‌شمارد.
+        start_dt = pd.to_datetime(agg["بازه_زمانی_شروع"], errors="coerce")
+        end_dt = pd.to_datetime(agg["بازه_زمانی_پایان"], errors="coerce")
+        agg["تعداد_روز_کل_بازه"] = (end_dt - start_dt).dt.days + 1
+        period_cols = ["بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه"]
+
     agg = agg.rename(columns={group_col: "گروه"})
-    return agg[["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"] + thr_cols]
+    return agg[
+        ["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
+        + period_cols + thr_cols
+    ]
 
 
 def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) -> pd.DataFrame:
@@ -998,6 +1043,10 @@ def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) ->
     نسبت_شانس_آستانه_* در new_agg موجود باشند، همان‌طور و با همان وزن‌دهی حفظ
     می‌شوند (وگرنه بعد از اولین ادغام با فایل قبلی، این ستون‌ها بی‌صدا از بین
     می‌رفتند).
+
+    [فیکس ۱۳] بازه_زمانی_شروع/پایان و تعداد_روز_فعال هم به همین ترتیب دوباره
+    (min/max/sum) محاسبه می‌شوند تا وقتی رکورد قدیمی و جدید با هم ادغام
+    می‌شوند، بازه‌ی نهایی درست‌ترین (گسترده‌ترین) بازه‌ی ممکن باشد.
     """
     if old_raw is None or old_raw.empty:
         return new_agg
@@ -1014,12 +1063,19 @@ def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) ->
         combined[wcol] = combined[tc].fillna(0) * combined["تعداد_تکرار"]
         thr_weighted_cols.append(wcol)
 
+    has_period_cols = "بازه_زمانی_شروع" in combined.columns and "بازه_زمانی_پایان" in combined.columns
+
     agg_spec = dict(
         تعداد_تکرار=("تعداد_تکرار", "sum"),
         تعداد_سود=("تعداد_سود", "sum"),
         تعداد_ضرر=("تعداد_ضرر", "sum"),
         _return_weighted=("_return_weighted", "sum"),
     )
+    if has_period_cols:
+        agg_spec["بازه_زمانی_شروع"] = ("بازه_زمانی_شروع", "min")
+        agg_spec["بازه_زمانی_پایان"] = ("بازه_زمانی_پایان", "max")
+    if "تعداد_روز_فعال" in combined.columns:
+        agg_spec["تعداد_روز_فعال"] = ("تعداد_روز_فعال", "sum")
     for wcol in thr_weighted_cols:
         agg_spec[f"{wcol}_sum"] = (wcol, "sum")
 
@@ -1034,6 +1090,10 @@ def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) ->
         merged[tc] = merged.apply(
             lambda r, wcol=wcol: (r[f"{wcol}_sum"] / r["تعداد_تکرار"]) if r["تعداد_تکرار"] else None, axis=1
         )
+    if has_period_cols:
+        start_dt = pd.to_datetime(merged["بازه_زمانی_شروع"], errors="coerce")
+        end_dt = pd.to_datetime(merged["بازه_زمانی_پایان"], errors="coerce")
+        merged["تعداد_روز_کل_بازه"] = (end_dt - start_dt).dt.days + 1
     merged.drop(columns=["_return_weighted"], inplace=True)
     return merged
 
@@ -1042,7 +1102,10 @@ def _rank_and_select(agg: pd.DataFrame) -> pd.DataFrame:
     """رتبه‌بندی هر گروه (تعداد_تکرار نزولی → میانگین_بازده نزولی) و اعمال
     شرط نمایش: فقط رتبه ۱ اگر (میانگین_بازده ≥ ۰.۵٪ و وین‌ریت > ۸۰٪)، وگرنه ۵ رتبه اول."""
     thr_cols = _threshold_columns(agg)
-    out_columns = RECOMMENDATION_GROUP_COLUMNS + thr_cols
+    # [فیکس ۱۳] ستون‌های بازه‌ی زمانی هم باید در خروجی نهایی حفظ بشن — قبلاً
+    # اینجا هاردکد به RECOMMENDATION_GROUP_COLUMNS بود و بی‌صدا حذف می‌شدند.
+    period_cols = [c for c in ["بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه"] if c in agg.columns]
+    out_columns = RECOMMENDATION_GROUP_COLUMNS + period_cols + thr_cols
     if agg.empty:
         return pd.DataFrame(columns=out_columns)
 
@@ -1111,7 +1174,11 @@ def _generate_recommendation_output(
         # گذاشته می‌شوند، حتی اگر (مثلاً از یک نسخه‌ی قدیمی‌تر) در فایل قبلی مانده باشند.
         base_cols = ["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
         old_thr_cols = [c for c in old_final.columns if c.startswith("نسبت_شانس_آستانه_")] if include_thr_cols else []
-        old_raw = old_final[base_cols + old_thr_cols].copy()
+        # [فیکس ۱۳] بازه‌ی زمانی هم مثل ستون‌های آستانه باید از فایل قبلی حفظ
+        # شود، وگرنه با هر اجرای incremental، بازه‌ی محاسبه‌شده فقط شامل
+        # جدیدترین داده می‌شد نه کل تاریخچه.
+        old_period_cols = [c for c in ["بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال"] if c in old_final.columns]
+        old_raw = old_final[base_cols + old_period_cols + old_thr_cols].copy()
 
     merged_agg = _merge_with_previous(new_agg, old_raw)
     new_final = _rank_and_select(merged_agg)
