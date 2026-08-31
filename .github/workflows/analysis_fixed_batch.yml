@@ -56,8 +56,13 @@ jobs:
           TOTAL_COMBOS=$(jq length /tmp/all_combinations.json)
           echo "[DEBUG] تعداد کل ترکیب‌ها (قبل از cap): $TOTAL_COMBOS"
 
-          # محدود کردن به حداکثر ۱۵۰۰۰ ترکیب در هر اجرا
-          MAX_COMBOS_PER_RUN=15000
+          # [فیکس] سقف هر اجرا از ۱۵۰۰۰ به ۲۰×۳۷۵=۷۵۰۰ تغییر کرد — طوری که با
+          # فرمول ۲۰-چانکِ زیر، اندازه‌ی هر چانک هیچ‌وقت از ۳۷۵ رد نشود.
+          # مازاد بر این سقف برای اجرای بعدی در صف (all_combinations.json)
+          # باقی می‌ماند (این بخش برش/cap از قبل بود، فقط عددش عوض شده).
+          DESIRED_CHUNK_COUNT=20
+          MAX_CHUNK_SIZE=375
+          MAX_COMBOS_PER_RUN=$((DESIRED_CHUNK_COUNT * MAX_CHUNK_SIZE))
           if [ "$TOTAL_COMBOS" -gt "$MAX_COMBOS_PER_RUN" ]; then
             echo "[DEBUG] تعداد ترکیب‌ها ($TOTAL_COMBOS) از سقف ($MAX_COMBOS_PER_RUN) بیشتر است — برش اعمال می‌شود."
             jq ".[:$MAX_COMBOS_PER_RUN]" /tmp/all_combinations.json > /tmp/all_combinations_capped.json
@@ -67,13 +72,26 @@ jobs:
           echo "[DEBUG] تعداد ترکیب‌های پردازش‌شونده این اجرا: $TOTAL_COMBOS"
           echo "total_combos=$TOTAL_COMBOS" >> $GITHUB_OUTPUT
 
-          CHUNK_SIZE=375
-          CHUNK_COUNT=$(( (TOTAL_COMBOS + CHUNK_SIZE - 1) / CHUNK_SIZE ))
-          if [ "$CHUNK_COUNT" -gt 256 ]; then
-            CHUNK_SIZE=$(( (TOTAL_COMBOS + 255) / 256 ))
-            CHUNK_COUNT=$(( (TOTAL_COMBOS + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+          # [فیکس] قبلاً CHUNK_SIZE=375 هاردکد بود — یعنی با رشد/کاهش تعداد
+          # ترکیب‌ها، تعداد چانک از ۲۰ فاصله می‌گرفت (مثلاً با ۳۷۶۰ ترکیب،
+          # ۱۱ چانک می‌شد نه ۲۰) و موازی‌سازی کامل (max-parallel: 20) استفاده
+          # نمی‌شد.
+          #
+          # راه‌حل: به‌جای یک CHUNK_SIZE ثابت (که با گرد-به-بالای دوباره روی
+          # تعداد چانک، می‌تواند کمتر از ۲۰ چانک تولید کند — مثلاً برای
+          # TOTAL_COMBOS=21: CHUNK_SIZE=ceil(21/20)=2 سپس CHUNK_COUNT=ceil(21/2)=11،
+          # نه ۲۰)، مرز هر چانک i جداگانه با floor(TOTAL×i/N) محاسبه می‌شود.
+          # این روش همیشه دقیقاً N چانک تولید می‌کند (وقتی TOTAL_COMBOS>=N)،
+          # با اندازه‌های متوازن (حداکثر یک واحد اختلاف بین چانک‌ها) و بدون جا
+          # افتادن هیچ ترکیبی — حتی وقتی TOTAL_COMBOS بر N بخش‌پذیر نیست.
+          # (DESIRED_CHUNK_COUNT بالاتر، همراه با MAX_CHUNK_SIZE/MAX_COMBOS_PER_RUN، تعریف شده.)
+          CHUNK_COUNT=$DESIRED_CHUNK_COUNT
+          if [ "$TOTAL_COMBOS" -lt "$DESIRED_CHUNK_COUNT" ]; then
+            # کمتر از ۲۰ ترکیب: نمی‌شود ۲۰ چانک غیرخالی ساخت، پس به تعداد
+            # خودِ ترکیب‌ها چانک می‌سازیم (هر چانک دقیقاً ۱ ترکیب).
+            CHUNK_COUNT=$TOTAL_COMBOS
           fi
-          echo "[DEBUG] chunk_size=$CHUNK_SIZE chunk_count=$CHUNK_COUNT"
+          echo "[DEBUG] total_combos=$TOTAL_COMBOS chunk_count=$CHUNK_COUNT"
 
           if [ "$TOTAL_COMBOS" -eq 0 ]; then
             echo "empty=true" >> $GITHUB_OUTPUT
@@ -84,8 +102,8 @@ jobs:
 
           INDICES="["
           for ((i=0; i<CHUNK_COUNT; i++)); do
-            START=$((i * CHUNK_SIZE))
-            END=$((START + CHUNK_SIZE))
+            START=$(( TOTAL_COMBOS * i / CHUNK_COUNT ))
+            END=$(( TOTAL_COMBOS * (i + 1) / CHUNK_COUNT ))
             jq ".[$START:$END]" /tmp/all_combinations.json > /tmp/chunks/chunk_${i}.json
             if [ $i -gt 0 ]; then INDICES+=", "; fi
             INDICES+="$i"
