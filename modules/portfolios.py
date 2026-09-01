@@ -214,7 +214,16 @@ def build_signature(row: pd.Series) -> str:
     if distance is None or (isinstance(distance, float) and pd.isna(distance)):
         distance = 0
     model = row.get("model", "")
-    return f"{coin}_{indicator}_{position}_{distance}_{model}_{regime}"
+    # ========== رفع باگ اصلی (ریشه‌ی خالی ماندن portfolios): این تابع فیلد
+    # "session" را نداشت، در حالی که golden.py ([فیکس ۹]) آن را به signature
+    # اضافه کرده بود. نتیجه: signature ساخته‌شده اینجا همیشه یک segment کمتر
+    # از signature داخل golden_scores.csv داشت و merge در prefilter_candidates
+    # برای صددرصد رکوردها (نه فقط بعضی) بی‌صدا صفر می‌شد. این فرمول باید
+    # کلمه‌به‌کلمه با golden.py یکی بماند. ==========
+    session = row.get("session")
+    if session is None or (isinstance(session, float) and pd.isna(session)) or session == "":
+        session = "none"
+    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}"
 
 
 def load_signatures(signatures_dir: Path, signatures_filter: Optional[Path] = None) -> pd.DataFrame:
@@ -492,6 +501,44 @@ def prefilter_candidates(signatures: pd.DataFrame, golden: pd.DataFrame) -> pd.D
         "پیش‌فیلتر Golden (score >= %s): %d/%d رکورد signatures واجد شرایط شدند",
         GOLDEN_SCORE_THRESHOLD, len(merged), len(signatures),
     )
+
+    # ========== تشخیص موقت: صفر مطلق در merged یعنی یکی از دو نیمه‌ی کلید
+    # (strategy_id یا signature) اصلاً match نمی‌خورد. این بلوک با join روی
+    # هرکدام به‌تنهایی مشخص می‌کند کدام نیمه مقصر است، بدون نیاز به اجرای
+    # جداگانه یا حدس زدن — لاگ زیر مستقیماً نمونه‌های عدم تطابق را نشان
+    # می‌دهد. بعد از رفع باگ اصلی می‌توان این بلوک را حذف کرد. ==========
+    if merged.empty and not signatures.empty and not qualified.empty:
+        sig_strategy_ids = set(signatures["strategy_id"].unique())
+        sig_signatures = set(signatures["signature"].unique())
+        gold_strategy_ids = set(qualified["strategy_id"].unique())
+        gold_signatures = set(qualified["signature"].unique())
+
+        overlap_sid = sig_strategy_ids & gold_strategy_ids
+        overlap_sig = sig_signatures & gold_signatures
+
+        log.warning(
+            "[DIAG] تطابق strategy_id به‌تنهایی: %d/%d (سمت signatures) | "
+            "تطابق signature به‌تنهایی: %d/%d (سمت signatures)",
+            len(overlap_sid), len(sig_strategy_ids),
+            len(overlap_sig), len(sig_signatures),
+        )
+        log.warning(
+            "[DIAG] نمونه strategy_id در signatures: %s",
+            sorted(sig_strategy_ids)[:5],
+        )
+        log.warning(
+            "[DIAG] نمونه strategy_id در golden (qualified): %s",
+            sorted(gold_strategy_ids)[:5],
+        )
+        log.warning(
+            "[DIAG] نمونه signature در signatures: %s",
+            sorted(sig_signatures)[:3],
+        )
+        log.warning(
+            "[DIAG] نمونه signature در golden (qualified): %s",
+            sorted(gold_signatures)[:3],
+        )
+
     return merged
 
 
