@@ -932,45 +932,41 @@ jobs:
           python-version: '3.10'
       - run: pip install pandas numpy scipy pyarrow
 
-      - name: 1. دانلود صف کامل all_combinations_portfolios.json از مخزن سوم
+      - name: 1. دانلود چانک‌های صف از آرتیفکت portfolios-generate-matrix (بدون وابستگی به تایمینگ cleanup)
+        id: download_chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-chunks-${{ github.run_id }}
+          path: /tmp/portfolios_chunks
+        continue-on-error: true
+
+      - name: بازسازی all_combinations_portfolios.json از چانک‌های تغییرناپذیر آرتیفکت
         id: queue_full
-        env:
-          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
-          THIRD_REPO: ${{ secrets.THIRD_REPO }}
         run: |
-          # همان منطق دقیق «دانلود صف» در portfolios-generate-matrix (متادیتا
-          # سپس download_url، چون هدر raw برای فایل‌های >~1MB خاموش می‌شکند).
-          META_HTTP_CODE=$(curl -s -o /tmp/queue_meta.json -w "%{http_code}" \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_portfolios.json")
-
-          if [ "$META_HTTP_CODE" != "200" ]; then
-            echo "⚠️ متادیتای صف دریافت نشد (HTTP $META_HTTP_CODE) — رد می‌شویم."
+          # [فیکس race condition] قبلاً این استپ صف را مستقیماً از مخزن سوم
+          # دوباره دانلود می‌کرد. چون portfolios-whole-time هیچ وابستگی‌ای به
+          # portfolios-cleanup نداشت، ترتیب اجرا تضمین‌شده نبود: اگر cleanup
+          # زودتر از این استپ اجرا می‌شد، صف را قبلاً خالی کرده بود و اینجا
+          # QUEUE_TOTAL=0 دیده می‌شد — بدون خطا، بدون warning. حالا به‌جای
+          # دانلود مجدد، از همان آرتیفکت portfolios-chunks-${{ github.run_id }}
+          # که در job portfolios-generate-matrix آپلود شده استفاده می‌شود؛
+          # این آرتیفکت تغییرناپذیر است و به cleanup وابسته نیست.
+          if [ "${{ steps.download_chunks.outcome }}" != "success" ]; then
+            echo "⚠️ آرتیفکت portfolios-chunks-${{ github.run_id }} یافت نشد — رد می‌شویم."
             echo "queue_empty=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          DOWNLOAD_URL=$(jq -r '.download_url // empty' /tmp/queue_meta.json)
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            echo "⚠️ download_url یافت نشد — رد می‌شویم."
+          CHUNK_FILES=$(ls /tmp/portfolios_chunks/chunk_*.json 2>/dev/null | sort -t_ -k2 -n)
+          if [ -z "$CHUNK_FILES" ]; then
+            echo "⚠️ هیچ chunk_*.json در آرتیفکت یافت نشد — رد می‌شویم."
             echo "queue_empty=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          HTTP_CODE=$(curl -sL -o /tmp/all_combinations_portfolios.json -w "%{http_code}" \
-            -H "Authorization: token $GH_TOKEN" \
-            "$DOWNLOAD_URL")
-
-          if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/all_combinations_portfolios.json ] || \
-             ! jq -e 'type == "array"' /tmp/all_combinations_portfolios.json > /dev/null 2>&1; then
-            echo "⚠️ صف نامعتبر یا یافت نشد (HTTP $HTTP_CODE) — رد می‌شویم."
-            echo "queue_empty=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
+          jq -s 'add' $CHUNK_FILES > /tmp/all_combinations_portfolios.json
           QUEUE_TOTAL=$(jq 'length' /tmp/all_combinations_portfolios.json)
-          echo "ℹ️ تعداد آیتم‌های صف: $QUEUE_TOTAL"
+          echo "ℹ️ تعداد آیتم‌های صف (بازسازی‌شده از آرتیفکت، نه دانلود مجدد): $QUEUE_TOTAL"
           if [ "$QUEUE_TOTAL" -eq 0 ]; then
             echo "queue_empty=true" >> $GITHUB_OUTPUT
           else
