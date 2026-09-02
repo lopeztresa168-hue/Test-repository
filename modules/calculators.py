@@ -298,6 +298,36 @@ def _group_trades_by_month(trades):
         months[key].append(t)
     return months
 
+def _monthly_breakdown_from_trades(trades, mp):
+    """شکست واقعی به تفکیک ماه تقویمی، بر اساس تاریخ واقعی هر معامله (نه
+    اسم فایل/دوره). دقیقاً همان معاملاتی که برای محاسبه‌ی آمار خلاصه‌شده‌ی
+    ext (میانگین سود ماه‌های سودده و ...) به تفکیک ماه گروه‌بندی می‌شوند،
+    اینجا هم برای هر ماه از همان مسیر محاسباتی رکورد اصلی
+    (special_return/compound_return/max_drawdown/max_consecutive_loss_stats)
+    عبور می‌کنند — این دقیقاً همان داده‌ی «سود/ضرر هر ماه» است که از قبل
+    داخل محاسبات موجود بود و فقط بعد از تبدیل‌شدن به میانگین دور ریخته
+    می‌شد؛ اینجا خودِ ردیف‌های ماهانه نگه داشته می‌شوند، نه چیز جدیدی
+    محاسبه/ترکیب می‌شود."""
+    months = _group_trades_by_month(trades)
+    out = []
+    for ym in sorted(months.keys()):
+        mt = months[ym]
+        wins = sum(1 for t in mt if safe_percentage(t.get("profitPercent", 0)) > 0)
+        losses = sum(1 for t in mt if safe_percentage(t.get("profitPercent", 0)) < 0)
+        total = len(mt)
+        wr = (wins / total * 100) if total else 0.0
+        _, mc_loss = max_consecutive_loss_stats(mt)
+        out.append({
+            "month": ym,
+            "total_trades": total, "win_trades": wins, "loss_trades": losses,
+            "win_rate": wr,
+            "special_rounded_return": special_return(mt, mp),
+            "compound_return": compound_return(mt, mp),
+            "max_drawdown": max_drawdown(mt),
+            "max_consecutive_loss": mc_loss,
+        })
+    return out
+
 def _trades_in_months_of_sign(trades, want_positive):
     """معاملاتی که در ماه‌هایی اتفاق افتاده‌اند که مجموع سود آن ماه (بر مبنای
     profitPercent خام، هم‌راستا با compute_monthly_stats) مثبت (want_positive=True)
@@ -915,6 +945,13 @@ def _compute_stats_block(trades, mp, cache_key):
         "total": len(trades),
         "win_rate": wr,
         "ext": compute_extended_stats(cache_key, trades),
+        # شکست واقعی به تفکیک ماه تقویمی (از تاریخ واقعی معاملات) — همان
+        # چیزی که برای پوشه‌ی هر ترکیب لازم است. عمداً اینجا (نه در سطح
+        # cmd_report) محاسبه می‌شود چون trades خام اینجا در دسترس است و
+        # process_file کش می‌شود؛ چون کلید "trades" (نه "monthly_breakdown")
+        # از کش حذف می‌شود، این شکست ماهانه هم در اجرای بعدی از کش خوانده
+        # می‌شود، نه دوباره‌محاسبه.
+        "monthly_breakdown": _monthly_breakdown_from_trades(trades, mp),
     }
 
 
@@ -1158,16 +1195,14 @@ def cmd_report(args):
                   len(display_results))
         display_results = display_results[:500]
 
-    # 1. خلاصه هر پوشه (به ازای هر استراتژی پایه، همه ترکیب‌ها در یک فایل)
-    base_strategy_map = defaultdict(list)
-    for r in display_results:
-        if not r.get("is_inverse"):
-            # استراتژی پایه = period_name که همان folder اصلی است
-            base_strategy_map[r["period_name"]].append(r)
-    for base_folder, recs in base_strategy_map.items():
-        fp = os.path.join(args.output_dir, base_folder)
-        os.makedirs(fp, exist_ok=True)
-        _folder_summary(base_folder, fp, recs)
+    # 1. پوشه‌ی مستقل به‌ازای هر «ترکیب» (تک‌نماد / نماد+سشن / چندنمادی) —
+    # نه به‌ازای period_name (استراتژی مادر). واحد گروه‌بندی combo_id است که
+    # مستقل از تاریخ دوره پایدار می‌ماند (بر خلاف folder_name/period_name که
+    # به‌ازای هر دوره‌ی تاریخی جدید تغییر می‌کنند)، تا کش و تجمیع ماهانه در
+    # طول زمان کار کند. این بخش از روی all_results کامل (تجمعی، بدون برش
+    # ۵۰۰تایی) عمل می‌کند، نه display_results — چون عضویت پوشه باید تجمعی
+    # باشد نه بر اساس رتبه‌ی لحظه‌ای.
+    _build_combo_folders(all_results, args.output_dir, previous_report_path, password)
 
     # 2. گزارش کلی
     _global_report(display_results, args.output_dir)
@@ -1186,6 +1221,210 @@ def cmd_report(args):
 
 
 INTERNAL_SNAPSHOT_NAME = "_internal_all_results.json"
+
+# ══════════════════════════════════════════════════════════════
+# پوشه‌بندی سطح «ترکیب» (combo) — مستقل از period_name/تاریخ دوره،
+# با کش و عضویت تجمعی در ۵۰۰ تای برتر (هرگز پاک/بازنویسی کامل نمی‌شود)
+# ══════════════════════════════════════════════════════════════
+
+COMBO_TOP_N = 500
+COMBO_MONTHLY_FILENAME = "خلاصه_ماهانه.csv"
+
+# ترتیب و تعداد ستون‌ها عمداً بین همه‌ی پوشه‌های ترکیب یکسان نگه داشته
+# می‌شود (نه فقط اسم/تعداد فیلدها، بلکه ترتیب هم) تا gzip روی کل آرشیو
+# فشرده‌شده بتواند الگوی مشترک بین فایل‌های مختلف را هم فشرده کند.
+# نام ترکیب/گروه/نماد عمداً در این ستون‌ها تکرار نمی‌شود — از اسم پوشه
+# مشخص است. هر سطر دقیقاً یک ماه تقویمی واقعی است (بر اساس تاریخ واقعی
+# معاملات، نه اسم فایل بکتست) — همان چیزی که از قبل داخل _compute_stats_block
+# محاسبه می‌شد (پایه‌ی همان avg_profit_in_profitable_months/pct_profitable_months
+# و بقیه‌ی آمار ext) ولی تا الان فقط به‌صورت میانگین نگه داشته می‌شد و خودِ
+# ردیف‌های ماهانه دور ریخته می‌شدند.
+COMBO_MONTHLY_HEADER = [
+    "ماه", "کل_معاملات", "معاملات_برد", "معاملات_باخت",
+    "وین_ریت(%)", "بازده_ویژه(%)", "بازده_مرکب(%)",
+    "حداکثر_افت(%)", "بیشترین_باخت_متوالی(%)",
+]
+
+
+def _sanitize_path_component(name):
+    """اسم پوشه را از کاراکترهای غیرمجاز در مسیر فایل پاک می‌کند."""
+    return re.sub(r'[\\/\x00]', '_', name or "unknown")
+
+
+def _strategy_family(period_name):
+    """نام خانواده‌ی استراتژی، مستقل از تاریخ: پسوند «_شروع_پایان» (که
+    period_name/folder به‌ازای هر دوره‌ی جدید آن را متفاوت دارد) حذف می‌شود
+    تا یک شناسه‌ی پایدار در طول زمان به دست بیاید. اگر الگوی تاریخ پیدا
+    نشود (مثلاً به‌خاطر ساختار نام‌گذاری متفاوت)، خود period_name به‌عنوان
+    fallback برگردانده می‌شود — یعنی در بدترین حالت رفتار به همان قبلی
+    (یک پوشه به‌ازای هر دوره) برمی‌گردد، نه خطا."""
+    m = re.match(r'^(.*?)_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}$', period_name or "")
+    return m.group(1) if m else (period_name or "unknown")
+
+
+def _combo_id(rec):
+    """شناسه‌ی پایدار «ترکیب» (تک‌نماد، نماد+سشن ساعتی، یا ترکیب چندنمادی):
+    خانواده‌ی استراتژی + گروه (سشن) + نماد/ترکیب نمادها. همین شناسه هم برای
+    نام‌گذاری پوشه و هم برای کش/عضویت تجمعی در top500 استفاده می‌شود."""
+    family = _strategy_family(rec.get("period_name", ""))
+    group = rec.get("group") or "aggregated"
+    symbol = rec.get("symbol") or "unknown"
+    return _sanitize_path_component(f"{family}_{group}_{symbol}")
+
+
+def _read_existing_combo_months(csv_path):
+    """ماه‌هایی که از قبل در فایل خلاصه‌ی یک پوشه‌ی ترکیب نوشته شده‌اند را
+    برمی‌گرداند — معیار کش سطح ترکیب: اگر ماهی از قبل هست، دوباره نوشته
+    نمی‌شود."""
+    existing = set()
+    if not os.path.exists(csv_path):
+        return existing
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # سطر هدر
+            for row in reader:
+                if row:
+                    existing.add(row[0])
+    except Exception as e:
+        log.warning("خواندن فایل موجود %s ناموفق بود: %s", csv_path, e)
+    return existing
+
+
+def _write_combo_monthly_file(folder_path, combo_id, recs):
+    """فایل خلاصه‌ی یک ترکیب را می‌سازد یا افزایشی به‌روز می‌کند. داده‌ی هر
+    سطر مستقیماً از monthly_breakdown همان رکورد می‌آید — یعنی همان شکست
+    واقعی به تفکیک ماه تقویمی که از قبل داخل _compute_stats_block محاسبه
+    شده (نه چیزی که اینجا از نو حساب یا از چند فایل ترکیب شود). اگر دو فایل
+    بکتست متفاوت به‌طور تصادفی معامله‌ای در یک ماه تقویمی مشترک داشته باشند،
+    اولین موردی که ثبت می‌شود می‌ماند و بار بعدی به‌خاطر کش (ماه از قبل
+    موجود است) نادیده گرفته می‌شود — نه این‌که با هم جمع/بازنویسی شوند. اگر
+    فایل از قبل موجود است، فقط ماه‌هایی که هنوز در آن نیستند append
+    می‌شوند."""
+    by_month = {}
+    for r in recs:
+        for mb in r.get("monthly_breakdown") or []:
+            ym = mb.get("month")
+            if ym and ym not in by_month:
+                by_month[ym] = mb
+    if not by_month:
+        return False
+
+    csv_path = os.path.join(folder_path, COMBO_MONTHLY_FILENAME)
+    already = _read_existing_combo_months(csv_path)
+    new_months = sorted(ym for ym in by_month if ym not in already)
+    if not new_months:
+        return False  # کش: هیچ ماه جدیدی نیست، فایل دست‌نخورده می‌ماند
+
+    os.makedirs(folder_path, exist_ok=True)
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, "a" if file_exists else "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        if not file_exists:
+            w.writerow(COMBO_MONTHLY_HEADER)
+        for ym in new_months:
+            mb = by_month[ym]
+            w.writerow([
+                ym, mb["total_trades"], mb["win_trades"], mb["loss_trades"],
+                mb["win_rate"], mb["special_rounded_return"], mb["compound_return"],
+                mb["max_drawdown"], mb["max_consecutive_loss"],
+            ])
+
+    log.info("ترکیب %s: %d ماه جدید به %s اضافه شد.", combo_id, len(new_months), csv_path)
+    return True
+
+
+def _restore_previous_combo_folders(previous_report_path, password, dest_dir):
+    """درخت پوشه‌های ترکیب از اجرای قبلی را (نه فقط اسنپ‌شات داخلی JSON) در
+    dest_dir بازیابی می‌کند تا پوشه‌هایی که قبلاً ساخته شده‌اند دست‌نخورده
+    باقی بمانند — نه پاک، نه بازنویسی. فقط زیرپوشه‌ها کپی می‌شوند (نه
+    فایل‌های سطح بالا مثل گزارش کلی/جداول مقایسه که باید هر اجرا از نو و
+    تازه از روی display_results ساخته شوند).
+
+    پاک‌سازی یک‌بارمصرف از ساختار قدیمی: پوشه‌هایی که با منطق قبلی
+    (گروه‌بندی روی period_name، فایل «خلاصه_پوشه.csv») ساخته شده بودند،
+    عمداً کپی نمی‌شوند — یعنی از این به بعد در آرشیو ظاهر نمی‌شوند و جایشان
+    را پوشه‌های جدید (بر اساس combo_id، فایل «خلاصه_ماهانه.csv») می‌گیرند.
+    تشخیص «قدیمی بودن» صرفاً از روی وجود فایل خلاصه_پوشه.csv داخل آن پوشه
+    است، نه اسم پوشه، چون قابل‌اعتمادتر است.
+
+    اگر previous_report_path موجود نباشد یا استخراج شکست بخورد، بی‌اثر
+    برمی‌گردد (رفتار قبلی: ساخت کامل)."""
+    import tarfile
+    import tempfile
+    import shutil
+
+    LEGACY_MARKER_FILENAME = "خلاصه_پوشه.csv"
+
+    if not previous_report_path or not os.path.exists(previous_report_path):
+        return set()
+    try:
+        raw = decrypt_enc_bytes(previous_report_path, password)
+        with tempfile.TemporaryDirectory() as td:
+            tgz_path = os.path.join(td, "prev_reports.tar.gz")
+            with open(tgz_path, "wb") as f:
+                f.write(raw)
+            with tarfile.open(tgz_path, "r:gz") as tf:
+                tf.extractall(td)
+            prev_reports_dir = os.path.join(td, "reports")
+            if not os.path.isdir(prev_reports_dir):
+                return set()
+            os.makedirs(dest_dir, exist_ok=True)
+            restored = set()
+            skipped_legacy = 0
+            for name in os.listdir(prev_reports_dir):
+                src = os.path.join(prev_reports_dir, name)
+                if not os.path.isdir(src):
+                    continue  # فقط پوشه‌های ترکیب؛ فایل‌های نمایشی سطح بالا کپی نمی‌شوند
+                if os.path.exists(os.path.join(src, LEGACY_MARKER_FILENAME)):
+                    skipped_legacy += 1
+                    continue  # پوشه با ساختار قدیمی — عمداً بازیابی نمی‌شود
+                dst = os.path.join(dest_dir, name)
+                if not os.path.exists(dst):
+                    shutil.copytree(src, dst)
+                restored.add(name)
+            log.info("پوشه‌های ترکیب از گزارش قبلی بازیابی شدند: %d پوشه (%d پوشه‌ی قدیمی حذف/جایگزین شد).",
+                      len(restored), skipped_legacy)
+            return restored
+    except Exception as e:
+        log.error("بازیابی پوشه‌های ترکیب از گزارش قبلی ناموفق بود: %s – بدون کش پوشه ادامه می‌دهیم.",
+                   e, exc_info=True)
+        return set()
+
+
+def _build_combo_folders(all_results, output_dir, previous_report_path, password):
+    """برای هر «ترکیب» (combo_id) یک پوشه‌ی مستقل با یک فایل خلاصه‌ی ماهانه
+    می‌سازد/به‌روز می‌کند. معیار داشتن پوشه، عضویت تجمعی در top500 است: هر
+    ترکیبی که تا الان حداقل یک‌بار جزو top500 بوده (پوشه‌اش از اجرای قبلی
+    بازیابی شده) یا الان جزو top500 است. این مجموعه فقط بزرگ‌تر می‌شود،
+    هیچ‌وقت چیزی از آن پاک نمی‌شود."""
+    combo_groups = defaultdict(list)
+    for r in all_results:
+        if r.get("is_inverse"):
+            continue
+        combo_groups[_combo_id(r)].append(r)
+    if not combo_groups:
+        return
+
+    # رتبه‌بندی تجمعی: بهترین امتیاز هر ترکیب در کل تاریخچه (نه فقط این اجرا)
+    best_score = {cid: max((r.get("score", 0) or 0) for r in recs) for cid, recs in combo_groups.items()}
+    ranked = sorted(best_score.items(), key=lambda kv: kv[1], reverse=True)
+    current_top = {cid for cid, _ in ranked[:COMBO_TOP_N]}
+
+    already_has_folder = _restore_previous_combo_folders(previous_report_path, password, output_dir)
+
+    # پوشه‌هایی که باید امروز ساخته/به‌روز شوند: تازه‌واردهای top500 فعلی +
+    # ترکیب‌هایی که از قبل پوشه دارند و امروز داده‌ی جدید (ماه جدید) دارند.
+    to_process = current_top | (already_has_folder & set(combo_groups.keys()))
+
+    new_folders = to_process - already_has_folder
+    if new_folders:
+        log.info("✨ %d ترکیب برای اولین‌بار وارد top%d شدند و پوشه‌شان ساخته می‌شود.",
+                  len(new_folders), COMBO_TOP_N)
+
+    for cid in to_process:
+        folder_path = os.path.join(output_dir, cid)
+        _write_combo_monthly_file(folder_path, cid, combo_groups[cid])
 
 
 def _load_previous_results(previous_report_path, password):
@@ -1284,6 +1523,7 @@ def _compute_results(strategies, returns_cache, risk_cache, inv_cache, args, pas
                 dd, sh, pl = rd["max_drawdown"], rd["sharpe"], rd["pl_ratio"]
                 rr_o, rr_pm, rr_lm = rd["rr_overall"], rd["rr_profit_months"], rd["rr_loss_months"]
                 ext = rd.get("ext") or _empty_ext_stats()
+                monthly_breakdown = rd.get("monthly_breakdown") or []
             else:
                 rc = returns_cache.get(ck, {"special": 0, "compound": 0})
                 rk = risk_cache.get(ck, {"max_consecutive_loss": 0, "max_consecutive_count": 0})
@@ -1294,6 +1534,11 @@ def _compute_results(strategies, returns_cache, risk_cache, inv_cache, args, pas
                 mc_count = rk["max_consecutive_count"]
                 mc_loss = rk["max_consecutive_loss"]
                 ext = _empty_ext_stats()
+                # وقتی فقط کش قدیمی returns/risk در دسترس است (بدون rd کامل)،
+                # شکست ماهانه‌ی واقعی هم در دسترس نیست — به‌جای ساختن داده‌ی
+                # جعلی، خالی می‌ماند؛ پوشه‌ی ترکیب برای این رکورد صرفاً چیزی
+                # برای اضافه‌کردن نخواهد داشت (نه خطا، نه داده‌ی نادرست).
+                monthly_breakdown = []
 
             log.info("  ✓ %s | trades=%d | wr=%.1f%% | special=%.4f | compound=%.4f",
                      ck, total, wr, spec, comp)
@@ -1316,6 +1561,7 @@ def _compute_results(strategies, returns_cache, risk_cache, inv_cache, args, pas
                 "is_inverse": False,
                 "score": main_score, "rating": main_rating,
                 "_move_percents": mp, "_stop_loss": sl, "_max_move": max_move,
+                "monthly_breakdown": monthly_breakdown,
             }
             main_rec.update(ext)
             all_results.append(main_rec)
@@ -1379,6 +1625,10 @@ def _score_ext_from_records(records):
     return {f: statistics.mean([r.get(f, 0) or 0 for r in records]) for f in _SCORE_FIELDS}
 
 
+# توجه: این تابع دیگر در cmd_report صدا زده نمی‌شود (جایگزین شده با
+# _build_combo_folders / _write_combo_monthly_file که به‌ازای هر «ترکیب»
+# پوشه‌ی مستقل و فایل ماهانه می‌سازند). برای سازگاری با فراخوانی‌های احتمالی
+# دیگر نگه داشته شده است.
 def _folder_summary(folder_name, folder_path, recs):
     if not recs:
         return
