@@ -1199,7 +1199,9 @@ def run_whole_time(
         group = coin_groups.get_group(coin_composition)
         if group["strategy_id"].nunique() < 2:
             continue
-        result, raw_count = evaluate_group(coin_composition, "کل_بازه_زمانی", group, top_n)
+        group_signatures = sorted(group["signature"].dropna().unique().tolist())
+        signature_label = "|".join(group_signatures) if group_signatures else "کل_بازه_زمانی"
+        result, raw_count = evaluate_group(coin_composition, signature_label, group, top_n)
         total_raw += raw_count
         all_portfolios.extend(result)
         log.info("  coin=%s | %d سبد یافت شد (از %d کاندید خام)",
