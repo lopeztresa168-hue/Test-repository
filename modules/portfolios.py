@@ -748,6 +748,16 @@ def evaluate_group(
         index="release_date", columns="strategy_id", values="total_return", aggfunc="mean"
     )
 
+    # امضای واقعیِ هر (strategy_id, release_date): برای اینکه در خروجی هر سبد،
+    # به‌جای برچسب گروه (که در حالت کل_بازه_زمانی می‌تواند شامل چند امضای
+    # متفاوت باشد)، دقیقاً همان امضای رکورد(های) خامی که آن ترکیب مشخص از
+    # اعضا/دوره‌ها را تشکیل داده‌اند نوشته شود.
+    sig_lookup: dict[tuple, set] = (
+        group.groupby(["strategy_id", "release_date"])["signature"]
+        .apply(lambda s: set(s.dropna()))
+        .to_dict()
+    )
+
     # [فیکس ۱۳] برای هر دوره (release_date)، طول واقعی آن دوره (period_length_days)
     # را نگه می‌داریم تا بعداً بشود «تعداد_روز_فعال» یک سبد را (مجموع طول
     # دوره‌های مشترک اعضا) حساب کرد. اگر این ستون در داده موجود نباشد (نسخه‌ی
@@ -801,9 +811,15 @@ def evaluate_group(
                 # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
                 روز_فعال = len(sorted_shared)
 
+            combo_signatures: set = set()
+            for _d in sorted_shared:
+                for _m in members:
+                    combo_signatures |= sig_lookup.get((_m, _d), set())
+            combo_signature = "|".join(sorted(combo_signatures)) if combo_signatures else signature
+
             portfolios.append({
                 "coin_composition": coin_composition,
-                "signature": signature,
+                "signature": combo_signature,
                 "members": list(members),
                 "survival_rate": sr,
                 "compensation_ratio": comp,
@@ -1199,9 +1215,7 @@ def run_whole_time(
         group = coin_groups.get_group(coin_composition)
         if group["strategy_id"].nunique() < 2:
             continue
-        group_signatures = sorted(group["signature"].dropna().unique().tolist())
-        signature_label = "|".join(group_signatures) if group_signatures else "کل_بازه_زمانی"
-        result, raw_count = evaluate_group(coin_composition, signature_label, group, top_n)
+        result, raw_count = evaluate_group(coin_composition, "کل_بازه_زمانی", group, top_n)
         total_raw += raw_count
         all_portfolios.extend(result)
         log.info("  coin=%s | %d سبد یافت شد (از %d کاندید خام)",
