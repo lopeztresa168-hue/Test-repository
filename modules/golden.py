@@ -884,6 +884,7 @@ def run(
     recommendation_df.drop(columns=["all_indicators_seen"], errors="ignore", inplace=True)
 
     generate_news_pattern_recommendation(recommendation_df, output_path)
+    generate_news_pattern_no_regime_recommendation(recommendation_df, output_path)
     generate_market_regime_recommendation(recommendation_df, output_path)
 
     # ── وضعیت نهایی: completed ───────────────────────────────────────────
@@ -1201,6 +1202,38 @@ def generate_news_pattern_recommendation(df: pd.DataFrame, output_dir) -> None:
         output_path,
         "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv",
         "الگوی خبری",
+    )
+
+
+def generate_news_pattern_no_regime_recommendation(df: pd.DataFrame, output_dir) -> None:
+    """تولید خروجی پیشنهاد استراتژی بر اساس الگوی خبری، فارغ از رژیم بازار.
+
+    [افزوده] عیناً مثل generate_news_pattern_recommendation عمل می‌کند، با این
+    تفاوت که کلید گروه‌بندی به‌جای signature کامل، signature بدون پسوند رژیم
+    است (با _strip_market_regime — همان تابعی که generate_market_regime_
+    recommendation برای ساخت «نام_استراتژی» استفاده می‌کند).
+
+    نتیجه: ردیف‌هایی که فقط رژیمشان فرق دارد ولی بقیه‌ی ترکیب (کوین + اندیکاتور
+    خبری + موقعیت/فاصله + مدل + سشن) یکسان است، در _prepare_group_aggregates
+    زیر یک گروه با هم جمع می‌شوند (تعداد_تکرار/سود/ضرر جمع مستقیم می‌شوند،
+    میانگین_بازده وزن‌دار بر اساس تعداد_تکرار محاسبه می‌شود — دقیقاً همان
+    منطقی که _prepare_group_aggregates برای هر گروه همیشه انجام می‌دهد).
+
+    «نام_استراتژی» عمداً پیش‌فرض (strategy_id + coin_composition) گذاشته
+    می‌شود، نه نسخه‌ی امضادار — چون این خروجی برخلاف رژیم بازار، قرار است هر
+    گروه دقیقاً یک ترکیب خبری یکتا (بدون رژیم) باشد، پس نیازی به [فیکس ۱۱]
+    نیست و include_thr_cols=True می‌ماند (چون هر گروه هنوز یک ترکیب شاخص
+    یکتاست، فقط بدون تفکیک رژیم).
+    """
+    output_path = Path(output_dir)
+    work = df.copy()
+    work["گروه_خبری_بدون_رژیم"] = work["signature"].apply(_strip_market_regime)
+    _generate_recommendation_output(
+        work,
+        "گروه_خبری_بدون_رژیم",
+        output_path,
+        "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv",
+        "الگوی خبری بدون رژیم",
     )
 
 
