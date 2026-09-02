@@ -226,6 +226,32 @@ def build_signature(row: pd.Series) -> str:
     return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}"
 
 
+# ========== [فیکس run_whole_time]: golden.py معادل «بدون رژیم» امضا را با
+# _strip_market_regime می‌سازد (پسوند رژیم را از انتهای امضا حذف می‌کند تا
+# coin_indicator_position_distance_model_session باقی بماند). این تابع باید
+# عیناً همان لیست KNOWN_MARKET_REGIMES و همان منطق golden.py را داشته باشد،
+# چون run_whole_time («کل بازه‌ی زمانی») در واقع یعنی «بدون در نظر گرفتن
+# رژیم بازار» — نه «بدون در نظر گرفتن کل امضا». بقیه‌ی اجزای امضا (شاخص خبری،
+# position، پنجره‌ی زمانی، مدل، سشن معاملاتی) باید همچنان ترکیب را منحصر‌به‌فرد
+# نگه دارند، دقیقاً همان‌طور که در run() عادی هستند. ==========
+KNOWN_MARKET_REGIMES = ["trending_up", "trending_down", "volatile", "ranging", "unknown"]
+
+
+def strip_market_regime(signature) -> str:
+    """معکوس ساخت رژیم در build_signature: امضا را بدون پسوند رژیم برمی‌گرداند
+    (یعنی coin_indicator_position_distance_model_session). باید عیناً مطابق
+    _strip_market_regime در golden.py باشد."""
+    if not isinstance(signature, str) or not signature:
+        return ""
+    for regime in sorted(KNOWN_MARKET_REGIMES, key=len, reverse=True):
+        suffix = "_" + regime
+        if signature.endswith(suffix):
+            return signature[: -len(suffix)]
+        if signature == regime:
+            return ""
+    return signature
+
+
 def load_signatures(signatures_dir: Path, signatures_filter: Optional[Path] = None) -> pd.DataFrame:
     """تمام فایل‌های .jsonl را از دایرکتوری signatures بارگذاری و یکی می‌کند.
 
@@ -748,16 +774,6 @@ def evaluate_group(
         index="release_date", columns="strategy_id", values="total_return", aggfunc="mean"
     )
 
-    # امضای واقعیِ هر (strategy_id, release_date): برای اینکه در خروجی هر سبد،
-    # به‌جای برچسب گروه (که در حالت کل_بازه_زمانی می‌تواند شامل چند امضای
-    # متفاوت باشد)، دقیقاً همان امضای رکورد(های) خامی که آن ترکیب مشخص از
-    # اعضا/دوره‌ها را تشکیل داده‌اند نوشته شود.
-    sig_lookup: dict[tuple, set] = (
-        group.groupby(["strategy_id", "release_date"])["signature"]
-        .apply(lambda s: set(s.dropna()))
-        .to_dict()
-    )
-
     # [فیکس ۱۳] برای هر دوره (release_date)، طول واقعی آن دوره (period_length_days)
     # را نگه می‌داریم تا بعداً بشود «تعداد_روز_فعال» یک سبد را (مجموع طول
     # دوره‌های مشترک اعضا) حساب کرد. اگر این ستون در داده موجود نباشد (نسخه‌ی
@@ -811,15 +827,9 @@ def evaluate_group(
                 # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
                 روز_فعال = len(sorted_shared)
 
-            combo_signatures: set = set()
-            for _d in sorted_shared:
-                for _m in members:
-                    combo_signatures |= sig_lookup.get((_m, _d), set())
-            combo_signature = "|".join(sorted(combo_signatures)) if combo_signatures else signature
-
             portfolios.append({
                 "coin_composition": coin_composition,
-                "signature": combo_signature,
+                "signature": signature,
                 "members": list(members),
                 "survival_rate": sr,
                 "compensation_ratio": comp,
@@ -1170,12 +1180,12 @@ def run_whole_time(
     signatures_filter: Optional[Path] = None,
 ) -> Path:
     """
-    نسخه‌ی «کل بازه‌ی زمانی»: برخلاف run() که سبدها را فقط درون یک شرط خبری
-    خاص (coin_composition, signature) می‌سنجد، اینجا فرض می‌شود اعضای سبد
-    مستقل از رویداد خبری، در کل بازه‌ی معاملاتی (از اولین تا آخرین رخداد
-    موجود در داده) هم‌زمان بوده‌اند. گروه‌بندی فقط بر اساس coin_composition
-    است (بدون فیلتر signature)، یعنی همه‌ی دوره‌های ثبت‌شده‌ی آن جفت‌کوین —
-    مستقل از این‌که کدام شاخص خبری anchor آن‌ها بوده — با هم دیده می‌شوند.
+    نسخه‌ی «کل بازه‌ی زمانی»: برخلاف run() که علاوه بر امضا رژیم بازار را هم
+    جزو شرط می‌بیند، اینجا فقط رژیم بازار (market_regime) نادیده گرفته
+    می‌شود — نه کل امضا. گروه‌بندی روی (coin_composition, امضای بدون رژیم)
+    است؛ یعنی شاخص خبری، position، پنجره‌ی زمانی (distance)، model و سشن
+    معاملاتی همچنان دقیقاً مثل run() ترکیب را منحصربه‌فرد نگه می‌دارند، و فقط
+    رکوردهایی که تنها در رژیم بازار فرق دارند با هم در یک گروه دیده می‌شوند.
 
     همان evaluate_group (همان فرمول‌های survival_rate/compensation_ratio/
     avg_return/avg_correlation/score) عیناً استفاده می‌شود؛ این‌طور تضمین
@@ -1183,8 +1193,8 @@ def run_whole_time(
     خبری طراحی شده، اینجا هم برقرار است.
 
     برخلاف run()، این تابع chunk/resume/interrupt جداگانه ندارد — چون تعداد
-    coin_composition ها معمولاً خیلی کمتر از تعداد کل (coin_composition,
-    signature) است و نیازی به تقسیم نیست.
+    گروه‌های (coin_composition, امضای بدون رژیم) معمولاً خیلی کمتر از تعداد
+    کل (coin_composition, signature با رژیم) است و نیازی به تقسیم نیست.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1205,21 +1215,29 @@ def run_whole_time(
     if candidates.empty:
         log.warning("هیچ رکورد کاندیدی برای حالت کل بازه‌ی زمانی یافت نشد.")
 
+    # ========== [فیکس]: «کل بازه‌ی زمانی» یعنی نادیده گرفتن رژیم بازار، نه
+    # نادیده گرفتن کل امضا. پس گروه‌بندی باید روی (coin_composition, امضای
+    # بدون رژیم) باشد — نه فقط coin_composition — تا شاخص خبری/position/
+    # پنجره‌ی زمانی/model/سشن همچنان ترکیب را منحصربه‌فرد نگه دارند و فقط
+    # رکوردهای با رژیم‌های مختلف با هم ادغام شوند. ==========
+    candidates = candidates.copy()
+    candidates["امضا_بدون_رژیم"] = candidates["signature"].apply(strip_market_regime)
+
     all_portfolios: list[dict] = []
     total_raw = 0
-    coin_groups = candidates.groupby("coin_composition")
-    coin_list = list(coin_groups.groups.keys())
-    log.info("حالت کل بازه‌ی زمانی: %d ترکیب کوین یافت شد.", len(coin_list))
+    coin_groups = candidates.groupby(["coin_composition", "امضا_بدون_رژیم"])
+    group_keys = list(coin_groups.groups.keys())
+    log.info("حالت کل بازه‌ی زمانی: %d گروه (coin, امضای بدون رژیم) یافت شد.", len(group_keys))
 
-    for coin_composition in coin_list:
-        group = coin_groups.get_group(coin_composition)
+    for coin_composition, sig_no_regime in group_keys:
+        group = coin_groups.get_group((coin_composition, sig_no_regime))
         if group["strategy_id"].nunique() < 2:
             continue
-        result, raw_count = evaluate_group(coin_composition, "کل_بازه_زمانی", group, top_n)
+        result, raw_count = evaluate_group(coin_composition, sig_no_regime, group, top_n)
         total_raw += raw_count
         all_portfolios.extend(result)
-        log.info("  coin=%s | %d سبد یافت شد (از %d کاندید خام)",
-                  coin_composition, len(result), raw_count)
+        log.info("  coin=%s | امضا=%s | %d سبد یافت شد (از %d کاندید خام)",
+                  coin_composition, sig_no_regime, len(result), raw_count)
 
     # [فیکس] طبق درخواست کاربر، version_id و created_at از خروجی
     # portfolios_whole_time.csv هم حذف شدند.
