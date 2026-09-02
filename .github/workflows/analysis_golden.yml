@@ -467,6 +467,7 @@ jobs:
           # مسیر استاندارد (مشابه رفتار golden_scores.csv در مرحله 5.2) است.
           for FNAME in \
               "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv" \
+              "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv" \
               "پیشنهاد_استراتژی_بر_اساس_رژیم_بازار.csv"; do
             SRC=$(find /tmp/golden_chunk_cache -name "$FNAME" | head -1)
             DEST="/tmp/golden_chunk_cache/$FNAME"
@@ -496,6 +497,7 @@ jobs:
             fi
             for FNAME in \
                 "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv" \
+                "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv" \
                 "پیشنهاد_استراتژی_بر_اساس_رژیم_بازار.csv"; do
               CACHED_REC=$(find /tmp/golden_chunk_cache -name "$FNAME" 2>/dev/null | head -1)
               if [ -n "$CACHED_REC" ] && [ "$(realpath "$CACHED_REC")" != "$(realpath "/tmp/golden_chunk_cache/$FNAME" 2>/dev/null || echo "")" ]; then
@@ -568,6 +570,15 @@ jobs:
         with:
           name: golden-news-pattern-${{ matrix.chunk_index }}-${{ github.run_id }}
           path: /tmp/golden_chunk_cache/پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: 6.7.5. آپلود پیشنهاد_الگوی_خبری_بدون_رژیم این چانک به‌عنوان artifact (برای ادغام در cleanup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-news-pattern-no-regime-${{ matrix.chunk_index }}-${{ github.run_id }}
+          path: /tmp/golden_chunk_cache/پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv
           retention-days: 1
           if-no-files-found: ignore
 
@@ -721,6 +732,14 @@ jobs:
           path: /tmp/reco_news_parts
           merge-multiple: false
 
+      - name: دانلود artifact های پیشنهاد الگوی خبری بدون رژیم
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: golden-news-pattern-no-regime-*-${{ github.run_id }}
+          path: /tmp/reco_news_no_regime_parts
+          merge-multiple: false
+
       - name: دانلود artifact های پیشنهاد رژیم بازار
         continue-on-error: true
         uses: actions/download-artifact@v4
@@ -737,7 +756,7 @@ jobs:
           THIRD_REPO: ${{ secrets.THIRD_REPO }}
           RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD }}
         run: |
-          mkdir -p /tmp/reco_news_parts /tmp/reco_regime_parts
+          mkdir -p /tmp/reco_news_parts /tmp/reco_news_no_regime_parts /tmp/reco_regime_parts
           pip install pandas --quiet --break-system-packages 2>/dev/null || \
             pip install pandas --quiet 2>/dev/null || true
 
@@ -764,18 +783,34 @@ jobs:
               sys.exit(0)
 
           combined = pd.concat(dfs, ignore_index=True)
-          needed = ["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
+          base_needed = ["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
+          # [فیکس] ستون‌های بازه‌ی زمانی (فیکس ۱۳ در golden.py) قبلاً اینجا در
+          # ادغام بین‌چانکی دور ریخته می‌شدند، حتی اگر خودِ golden.py آن‌ها را
+          # تولید کرده باشد. حالا در صورت وجود، نگه داشته و درست تجمیع می‌شوند.
+          period_needed = ["بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه"]
+          has_period = all(c in combined.columns for c in ["بازه_زمانی_شروع", "بازه_زمانی_پایان"])
+          needed = base_needed + ([c for c in period_needed if c in combined.columns] if has_period else [])
           combined = combined[[c for c in needed if c in combined.columns]]
 
           # ادغام وزن‌دار بر اساس (گروه، نام_استراتژی): جمع تعداد‌ها و میانگین
           # وزنی بازده/وین‌ریت بر اساس تعداد_تکرار هر ردیف.
           combined["_return_weighted"] = combined["میانگین_بازده_(%)"] * combined["تعداد_تکرار"]
-          merged = combined.groupby(["گروه", "نام_استراتژی"], as_index=False).agg(
+          agg_spec = dict(
               تعداد_تکرار=("تعداد_تکرار", "sum"),
               تعداد_سود=("تعداد_سود", "sum"),
               تعداد_ضرر=("تعداد_ضرر", "sum"),
               _return_weighted=("_return_weighted", "sum"),
           )
+          if has_period:
+              # بازه‌ی شروع/پایان دقیقاً مثل _prepare_group_aggregates در
+              # golden.py: min شروع، max پایان (رشته‌های ISO لغوی هم‌ترازند)،
+              # تعداد_روز_فعال جمع مستقیم می‌شود.
+              agg_spec["بازه_زمانی_شروع"] = ("بازه_زمانی_شروع", "min")
+              agg_spec["بازه_زمانی_پایان"] = ("بازه_زمانی_پایان", "max")
+              if "تعداد_روز_فعال" in combined.columns:
+                  agg_spec["تعداد_روز_فعال"] = ("تعداد_روز_فعال", "sum")
+
+          merged = combined.groupby(["گروه", "نام_استراتژی"], as_index=False).agg(**agg_spec)
           merged["میانگین_بازده_(%)"] = merged.apply(
               lambda r: (r["_return_weighted"] / r["تعداد_تکرار"]) if r["تعداد_تکرار"] else 0.0, axis=1
           )
@@ -783,6 +818,15 @@ jobs:
               lambda r: (r["تعداد_سود"] / r["تعداد_تکرار"] * 100.0) if r["تعداد_تکرار"] else 0.0, axis=1
           )
           merged.drop(columns=["_return_weighted"], inplace=True)
+
+          if has_period:
+              # تعداد_روز_کل_بازه = فاصله‌ی تقویمی شروع تا پایان (بعد از min/max
+              # جدید، دقیقاً مثل golden.py دوباره از نو محاسبه می‌شود، نه جمع
+              # زده می‌شود — چون تعداد_روز_کل_بازه قبلی هر ردیف بعد از merge
+              # دیگر با بازه‌ی نهایی هم‌خوان نیست).
+              start_dt = pd.to_datetime(merged["بازه_زمانی_شروع"], errors="coerce")
+              end_dt = pd.to_datetime(merged["بازه_زمانی_پایان"], errors="coerce")
+              merged["تعداد_روز_کل_بازه"] = (end_dt - start_dt).dt.days + 1
 
           # رتبه‌بندی مجدد هر گروه و اعمال شرط نمایش (فقط رتبه ۱ یا ۵ رتبه اول)
           out_frames = []
@@ -798,6 +842,8 @@ jobs:
 
           result = pd.concat(out_frames, ignore_index=True) if out_frames else merged.iloc[0:0]
           cols = ["گروه", "رتبه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
+          if has_period:
+              cols += period_needed
           result = result[[c for c in cols if c in result.columns]]
           result.to_csv(out_file, index=False)
           print(f"merged {len(dfs)} files -> {len(result)} rows")
@@ -838,6 +884,11 @@ jobs:
             "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv" \
             "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv.enc" \
             "الگوی خبری"
+
+          upload_reco_file "/tmp/reco_news_no_regime_parts" \
+            "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv" \
+            "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv.enc" \
+            "الگوی خبری بدون رژیم"
 
           upload_reco_file "/tmp/reco_regime_parts" \
             "پیشنهاد_استراتژی_بر_اساس_رژیم_بازار.csv" \
