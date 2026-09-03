@@ -1126,3 +1126,214 @@ jobs:
             done
           fi
 
+  # ================================================================
+  # [فیکس] portfolios-timeline: اجرای واقعی حالت run_timeline() (ماژول
+  # سوم) که در portfolios.py پیاده‌سازی شده بود ولی هیچ‌جای این workflow
+  # صدا زده نمی‌شد — دقیقاً مثل باگ مشابهی که برای run_whole_time وجود
+  # داشت. طبق مستندات run_timeline: chunk/resume/interrupt جداگانه ندارد
+  # و برای پوشش کامل محور زمان باید تمام archive_path های صف (نه فقط یک
+  # chunk) دانلود و استخراج شوند — پس همان الگوی job مستقل و
+  # غیرچانک‌بندی‌شده‌ی portfolios-whole-time اینجا هم به کار می‌رود.
+  # ================================================================
+  portfolios-timeline:
+    needs: [portfolios-generate-matrix, portfolios-batch]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: 1. دانلود چانک‌های صف از آرتیفکت portfolios-generate-matrix (بدون وابستگی به تایمینگ cleanup)
+        id: download_chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-chunks-${{ github.run_id }}
+          path: /tmp/portfolios_chunks
+        continue-on-error: true
+
+      - name: بازسازی all_combinations_portfolios.json از چانک‌های تغییرناپذیر آرتیفکت
+        id: queue_full
+        run: |
+          # همان فیکس race condition پیاده‌شده در portfolios-whole-time: از
+          # آرتیفکت تغییرناپذیر portfolios-chunks استفاده می‌شود، نه دانلود
+          # مجدد از مخزن سوم که ممکن است پیش از این توسط cleanup خالی شده باشد.
+          if [ "${{ steps.download_chunks.outcome }}" != "success" ]; then
+            echo "⚠️ آرتیفکت portfolios-chunks-${{ github.run_id }} یافت نشد — رد می‌شویم."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHUNK_FILES=$(ls /tmp/portfolios_chunks/chunk_*.json 2>/dev/null | sort -t_ -k2 -n)
+          if [ -z "$CHUNK_FILES" ]; then
+            echo "⚠️ هیچ chunk_*.json در آرتیفکت یافت نشد — رد می‌شویم."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          jq -s 'add' $CHUNK_FILES > /tmp/all_combinations_portfolios.json
+          QUEUE_TOTAL=$(jq 'length' /tmp/all_combinations_portfolios.json)
+          echo "ℹ️ تعداد آیتم‌های صف (بازسازی‌شده از آرتیفکت، نه دانلود مجدد): $QUEUE_TOTAL"
+          if [ "$QUEUE_TOTAL" -eq 0 ]; then
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+          else
+            echo "queue_empty=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 2. دانلود golden_scores.csv از مخزن سوم
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/golden_scores
+          HTTP_CODE=$(curl -s -o /tmp/golden_scores.csv.enc -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/golden_scores.csv.tar.gz.enc")
+
+          if [ "$HTTP_CODE" = "404" ]; then
+            echo "ℹ️ golden_scores.csv.tar.gz.enc موجود نیست — بدون golden_scores اجرا می‌شود."
+            exit 0
+          fi
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/golden_scores.csv.enc ]; then
+            echo "❌ golden_scores.csv.tar.gz.enc دریافت نشد (HTTP $HTTP_CODE)."
+            exit 1
+          fi
+
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const data=fs.readFileSync('/tmp/golden_scores.csv.enc');
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=data.slice(0,16),enc=data.slice(16);
+            const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+            const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+            fs.writeFileSync('/tmp/golden_scores.tar.gz',dec);
+          "
+          if [ ! -s /tmp/golden_scores.tar.gz ]; then
+            echo "❌ رمزگشایی golden_scores.tar.gz ناموفق بود."; exit 1
+          fi
+          tar -xzf /tmp/golden_scores.tar.gz -C /tmp/golden_scores
+          FOUND_CSV=$(find /tmp/golden_scores -name '*.csv' | head -1)
+          if [ -z "$FOUND_CSV" ]; then
+            echo "❌ هیچ فایل .csv داخل tar.gz یافت نشد."; exit 1
+          fi
+          if [ "$FOUND_CSV" != "/tmp/golden_scores/golden_scores.csv" ]; then
+            mv "$FOUND_CSV" /tmp/golden_scores/golden_scores.csv
+          fi
+          echo "✅ golden_scores.csv دریافت، رمزگشایی و استخراج شد."
+
+      - name: 3. دانلود و استخراج تمام آرشیوهای صف (نه فقط یک chunk)
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          # run_timeline هم مثل run_whole_time روی محور کامل زمان کار
+          # می‌کند، پس همه‌ی archive_path های یکتای کل صف لازم است — نه
+          # فقط آرشیوهای یک chunk.
+          mkdir -p /tmp/archives_extracted_tl
+          jq -r '[.[] | if type == "object" then .archive_path else empty end]
+                 | map(select(. != null and . != "")) | unique | .[]' \
+            /tmp/all_combinations_portfolios.json > /tmp/archive_list_tl.txt
+
+          ARCH_TOTAL=$(wc -l < /tmp/archive_list_tl.txt | tr -d ' ')
+          echo "ℹ️ تعداد کل آرشیوهای یکتا: $ARCH_TOTAL"
+          if [ "$ARCH_TOTAL" -eq 0 ]; then
+            echo "❌ هیچ archive_path در صف یافت نشد."; exit 1
+          fi
+
+          FAIL_COUNT=0
+          while IFS= read -r ARCH_PATH; do
+            [ -z "$ARCH_PATH" ] && continue
+            DL_URL=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/$ARCH_PATH" | jq -r '.download_url // empty')
+            if [ -z "$DL_URL" ] || [ "$DL_URL" = "null" ]; then
+              echo "⚠️ آدرس دانلود برای $ARCH_PATH یافت نشد — رد می‌شود."
+              FAIL_COUNT=$((FAIL_COUNT+1)); continue
+            fi
+            ENC_FILE="/tmp/$(basename "$ARCH_PATH")"
+            curl -s -L -H "Authorization: token $GH_TOKEN" -o "$ENC_FILE" "$DL_URL"
+            if [ ! -s "$ENC_FILE" ]; then
+              echo "⚠️ دانلود $ARCH_PATH ناموفق بود — رد می‌شود."
+              FAIL_COUNT=$((FAIL_COUNT+1)); rm -f "$ENC_FILE"; continue
+            fi
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('$ENC_FILE');
+              const key=crypto.scryptSync(pass,'salt',32);
+              const iv=data.slice(0,16),enc=data.slice(16);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+              fs.writeFileSync('${ENC_FILE%.enc}',dec);
+            " 2>/dev/null && tar -xzf "${ENC_FILE%.enc}" -C /tmp/archives_extracted_tl \
+              || { echo "⚠️ رمزگشایی/استخراج $ARCH_PATH ناموفق بود."; FAIL_COUNT=$((FAIL_COUNT+1)); }
+            rm -f "$ENC_FILE" "${ENC_FILE%.enc}"
+          done < /tmp/archive_list_tl.txt
+
+          JSONL_TOTAL=$(find /tmp/archives_extracted_tl -name '*.jsonl' | wc -l)
+          echo "✅ تعداد $JSONL_TOTAL فایل JSONL استخراج‌شده از $ARCH_TOTAL آرشیو (ناموفق: $FAIL_COUNT)."
+          rm -f /tmp/archive_list_tl.txt
+
+          if [ "$JSONL_TOTAL" -eq 0 ]; then
+            echo "❌ هیچ فایل .jsonl استخراج نشد."; exit 1
+          fi
+
+      - name: 4. اجرای portfolios.py --timeline
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        run: |
+          mkdir -p /tmp/portfolios_timeline_out
+          GOLDEN_ARG=""
+          if [ -f /tmp/golden_scores/golden_scores.csv ]; then
+            GOLDEN_ARG="--golden-scores /tmp/golden_scores/golden_scores.csv"
+          else
+            echo "ℹ️ golden_scores.csv موجود نیست — بدون آن اجرا می‌شود."
+          fi
+
+          python modules/portfolios.py \
+            --signatures-dir /tmp/archives_extracted_tl \
+            $GOLDEN_ARG \
+            --output-dir /tmp/portfolios_timeline_out \
+            --top-n 15 \
+            --timeline
+          echo "✅ portfolios.py --timeline اجرا شد."
+
+      - name: 5. آپلود portfolios_timeline.csv به مخزن اصلی (portfolios_outputs/)
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        run: |
+          FOUND=$(find /tmp/portfolios_timeline_out -name 'portfolios_timeline*.csv' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "⚠️ هیچ portfolios_timeline*.csv تولید نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp "$FOUND" portfolios_outputs/portfolios_timeline.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios timeline outputs (run ${{ github.run_id }})"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/portfolios_timeline.csv موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
