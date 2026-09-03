@@ -251,7 +251,22 @@ def build_signature(row: pd.Series) -> str:
     session = row.get("session")
     if session is None or (isinstance(session, float) and pd.isna(session)) or session == "":
         session = "none"
-    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}"
+    # ========== فیکس: تصادم signature بین anchorهای خبری متفاوت ==========
+    # indicator_key (خروجی parse_interval در combo_10day.py: 'CPI','PPI',
+    # 'CorePPI','FOMC','CPI_y_y','fixed', یا None برای combo_monthly.py)
+    # نشان می‌دهد این دوره بر اساس کدام رویداد خبری anchor شده. این با
+    # dominant_indicator فرق دارد: dominant_indicator خبر غالبِ *داخل* دوره
+    # است و می‌تواند None باشد حتی وقتی anchor واقعی CPI یا PPI یا FOMC بوده
+    # (چون داخل آن دوره‌ی خاص خبر مهم دیگری رخ نداده). قبل از این فیکس،
+    # چون indicator_key اصلاً در signature نبود، دوره‌های anchor‌شده به CPI،
+    # PPI، FOMC و غیره که هرکدام دومیننت=None داشتند، همه زیر یک signature
+    # یکسان (مثلاً "..._None_post_10.0_simple_hybrid_none") قاطی می‌شدند —
+    # یعنی golden.py/portfolios.py داده‌ی سه‌بازار خبری کاملاً متفاوت را به
+    # اشتباه به‌عنوان یک استراتژی واحد امتیازدهی/ترکیب می‌کرد.
+    indicator_key = row.get("indicator_key")
+    if indicator_key is None or (isinstance(indicator_key, float) and pd.isna(indicator_key)) or indicator_key == "":
+        indicator_key = "none"
+    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}_{indicator_key}"
 
 
 # ---------------------------------------------------------------------------
