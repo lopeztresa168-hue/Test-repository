@@ -223,7 +223,14 @@ def build_signature(row: pd.Series) -> str:
     session = row.get("session")
     if session is None or (isinstance(session, float) and pd.isna(session)) or session == "":
         session = "none"
-    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}"
+    # ========== فیکس: تصادم signature بین anchorهای خبری متفاوت ==========
+    # باید کلمه‌به‌کلمه با golden.py یکی بماند (همان‌طور که بالاتر مستند شده)،
+    # وگرنه merge در prefilter_candidates دوباره بی‌صدا صفر می‌شود.
+    # توضیح کامل فیکس در build_signature معادلِ golden.py آمده است.
+    indicator_key = row.get("indicator_key")
+    if indicator_key is None or (isinstance(indicator_key, float) and pd.isna(indicator_key)) or indicator_key == "":
+        indicator_key = "none"
+    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}_{indicator_key}"
 
 
 # ========== [فیکس run_whole_time]: golden.py معادل «بدون رژیم» امضا را با
