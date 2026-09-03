@@ -32,6 +32,7 @@ import math
 import os
 import re
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -65,6 +66,27 @@ SCORE_WEIGHTS = {
 }
 DEFAULT_VERSION_ID = "v1.0.0"
 DEFAULT_CHUNK_SIZE = 20
+
+# -----------------------------------------------------------------------------
+# ثابت‌های حالت «جدول زمانی پیوسته» (Timeline) — ماژول سوم
+# -----------------------------------------------------------------------------
+# ========== طراحی: چون score خروجی evaluate_group صدکی و *فقط درون همان گروه
+# (coin_composition, signature)* است، بین گروه‌های مختلف قابل مقایسه نیست
+# (این نکته قبلاً حین بررسی حالت "بهترین روزانه" کشف شد: چند سبد با score=100
+# از گروه‌های کوچک برنده‌ی کاذب کل بازه می‌شدند). برای تصمیم‌گیری بین‌گروهی
+# (ادغام دو سبد هم‌پوشان از دو گروه متفاوت، یا انتخاب بهترین پرکننده‌ی شکاف)
+# یک quality_score جدید و سراسری تعریف می‌شود: صدک‌بندی avg_return/
+# compensation_ratio/survival_rate/avg_correlation روی *کل استخر* کاندیدها
+# (نه فقط هم‌گروهی‌ها)، دقیقاً با همان وزن‌هایی که قبلاً به تأیید کاربر رسید. ==========
+QUALITY_WEIGHTS = {
+    "return": 0.40,
+    "compensation": 0.30,
+    "survival": 0.20,
+    "correlation": 0.10,
+}
+# حداکثر فاصله (روز) بین دو دوره‌ی واقعیِ یک سبد که هنوز «یک بازه‌ی پیوسته»
+# حساب می‌شوند (برای ادغام دوره‌های چسبیده در _merge_intervals)
+TIMELINE_ADJACENCY_DAYS = 1
 
 _POSITION_RE = re.compile(r"_(pre|post)_(\d+)_")
 
@@ -728,6 +750,35 @@ def avg_return(returns: pd.DataFrame) -> float:
     return (avg_sum + avg_mean) / 2.0
 
 
+def _period_bounds_by_date(group: pd.DataFrame) -> dict:
+    """برای هر release_date در گروه، بازه‌ی زمانی واقعی [حداقل period_start،
+    حداکثر period_end] بین همه‌ی رکوردهای همان تاریخ را برمی‌گرداند — این
+    بازه (نه فقط خود release_date که یک نقطه‌ی انکر است) پنجره‌ی واقعی
+    فعال‌بودنِ آن دوره‌ی خاص روی محور تقویم است."""
+    bounds = {}
+    for date, sub in group.groupby("release_date"):
+        bounds[date] = (sub["period_start"].min(), sub["period_end"].max())
+    return bounds
+
+
+def _merge_intervals(intervals: list[tuple]) -> list[tuple]:
+    """بازه‌های زمانی هم‌پوشان یا چسبیده (فاصله <= TIMELINE_ADJACENCY_DAYS) را
+    با هم ادغام می‌کند تا لیست نهایی بازه‌های غیرهم‌پوشانِ یک سبد به‌دست بیاید."""
+    if not intervals:
+        return []
+    ivs = sorted(intervals, key=lambda x: x[0])
+    merged = [list(ivs[0])]
+    gap = pd.Timedelta(days=TIMELINE_ADJACENCY_DAYS)
+    for start, end in ivs[1:]:
+        last = merged[-1]
+        if start <= last[1] + gap:
+            if end > last[1]:
+                last[1] = end
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
+
+
 def avg_correlation(members: tuple, corr_lookup: dict) -> float:
     """میانگین همبستگی جفتی بین اعضای سبد."""
     pairs = list(itertools.combinations(sorted(members), 2))
@@ -757,12 +808,25 @@ def evaluate_group(
     signature: str,
     group: pd.DataFrame,
     top_n: int,
+    attach_periods: bool = False,
+    abs_filters: bool = True,
 ) -> tuple[list[dict], int]:
     """ارزیابی و رتبه‌بندی سبدهای ۲، ۳ و ۴ استراتژی برای یک گروه.
+
+    پارامترهای جدید (فقط برای حالت Timeline استفاده می‌شوند؛ پیش‌فرض‌ها رفتار
+    قبلی run()/run_whole_time() را کاملاً بدون تغییر نگه می‌دارند):
+        attach_periods: اگر True باشد، به هر سبد خروجی یک کلید داخلی
+            "_intervals" (لیست بازه‌های زمانی واقعیِ غیرهم‌پوشانِ فعال‌بودن،
+            بر اساس period_start/period_end خام) اضافه می‌شود.
+        abs_filters: اگر False باشد، فیلتر مطلق (ABS_MIN_*) اعمال نمی‌شود و
+            همه‌ی کاندیدها (نه فقط واجدشرایط‌ها) در خروجی نگه داشته می‌شوند؛
+            در عوض هر رکورد یک کلید داخلی "_passes_abs" می‌گیرد که نتیجه‌ی
+            همان فیلتر را (بدون حذف رکورد) نشان می‌دهد.
 
     خروجی: (لیست سبدهای برتر تا top_n، تعداد کل سبدهای کاندید بررسی‌شده پیش از فیلتر مطلق)
     """
     group = build_release_dates(group)
+    period_bounds = _period_bounds_by_date(group) if attach_periods else {}
 
     corr_df, valid_periods = compute_correlation_matrix(group)
     if corr_df.empty:
@@ -814,11 +878,12 @@ def evaluate_group(
             raw_candidate_count += 1
 
             # گام ۸: فیلتر مطلق قبل از رنکینگ
-            if sr < ABS_MIN_SURVIVAL_RATE:
-                continue
-            if comp < ABS_MIN_COMPENSATION_RATIO:
-                continue
-            if ar < ABS_MIN_AVG_RETURN:
+            passes_abs = (
+                sr >= ABS_MIN_SURVIVAL_RATE
+                and comp >= ABS_MIN_COMPENSATION_RATIO
+                and ar >= ABS_MIN_AVG_RETURN
+            )
+            if abs_filters and not passes_abs:
                 continue
 
             # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد: اولین/آخرین دوره‌ی
@@ -834,7 +899,7 @@ def evaluate_group(
                 # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
                 روز_فعال = len(sorted_shared)
 
-            portfolios.append({
+            record = {
                 "coin_composition": coin_composition,
                 "signature": signature,
                 "members": list(members),
@@ -847,7 +912,13 @@ def evaluate_group(
                 "بازه_زمانی_پایان": بازه_پایان.date().isoformat(),
                 "تعداد_روز_فعال": روز_فعال,
                 "تعداد_روز_کل_بازه": (بازه_پایان - بازه_شروع).days + 1,
-            })
+            }
+            if not abs_filters:
+                record["_passes_abs"] = passes_abs
+            if attach_periods:
+                raw_intervals = [period_bounds[d] for d in sorted_shared if d in period_bounds]
+                record["_intervals"] = _merge_intervals(raw_intervals)
+            portfolios.append(record)
 
     if not portfolios:
         return [], raw_candidate_count
@@ -1174,6 +1245,335 @@ def run(
 
 
 # -----------------------------------------------------------------------------
+# حالت «جدول زمانی پیوسته» (Timeline) — ماژول سوم
+# -----------------------------------------------------------------------------
+# هدف: از بین تمام سبدهای واجد شرایط (خروجی مشابه run_whole_time)، یک جدول
+# پیوسته از اولین تا آخرین رخداد واقعی داده می‌سازد که برای هر بازه‌ی واقعی
+# می‌گوید دقیقاً چه سبدی (یا ترکیبی از چند سبد هم‌پوشان) باید اجرا شود —
+# طوری که حداکثر ممکن از محور زمان پوشش داده شود (نه فقط میانگین ۱۵٪ فعلی).
+
+def _build_global_quality_arrays(pool: list[dict]) -> dict:
+    """آرایه‌های مرتب‌شده‌ی هر متریک روی *کل استخر* کاندیدها (همه‌ی گروه‌ها با
+    هم) — پایه‌ی صدک‌بندی سراسری quality_score که برخلاف score محلی
+    evaluate_group، بین گروه‌های مختلف هم قابل مقایسه است."""
+    return {
+        "avg_return": np.sort(np.array([p["avg_return"] for p in pool], dtype=float)),
+        "compensation_ratio": np.sort(np.array([p["compensation_ratio"] for p in pool], dtype=float)),
+        "survival_rate": np.sort(np.array([p["survival_rate"] for p in pool], dtype=float)),
+        # کمتر=بهتر برای همبستگی، پس با علامت منفی صدک‌بندی می‌کنیم تا مقیاس
+        # «بزرگ‌تر=بهتر» با بقیه‌ی متریک‌ها یکی بماند
+        "avg_correlation": np.sort(
+            np.array([-p["avg_correlation"] for p in pool if not pd.isna(p["avg_correlation"])], dtype=float)
+        ),
+    }
+
+
+def _percentile_of(value: float, sorted_arr: np.ndarray) -> float:
+    """رتبه‌ی صدکی value نسبت به آرایه‌ی از قبل مرتب‌شده (بین ۰ و ۱۰۰)."""
+    if sorted_arr.size == 0 or value is None or (isinstance(value, float) and math.isnan(value)):
+        return 50.0  # داده‌ی ناکافی — نه امتیاز مثبت نه منفی
+    idx = int(np.searchsorted(sorted_arr, value, side="right"))
+    return 100.0 * idx / sorted_arr.size
+
+
+def _quality_score(record: dict, global_arrays: dict) -> float:
+    """quality_score سراسری و قابل‌مقایسه بین گروه‌ها (همان معیاری که قبلاً
+    برای جدول ۸-ردیفی تأیید شد: بازده ۴۰٪ + جبران‌سازی ۳۰٪ + بقا ۲۰٪ +
+    همبستگی پایین ۱۰٪)، به‌جای score محلیِ صدکی-درون‌گروهی evaluate_group."""
+    corr_val = record.get("avg_correlation")
+    corr_val = -corr_val if corr_val is not None and not pd.isna(corr_val) else corr_val
+    return (
+        QUALITY_WEIGHTS["return"] * _percentile_of(record.get("avg_return"), global_arrays["avg_return"])
+        + QUALITY_WEIGHTS["compensation"] * _percentile_of(record.get("compensation_ratio"), global_arrays["compensation_ratio"])
+        + QUALITY_WEIGHTS["survival"] * _percentile_of(record.get("survival_rate"), global_arrays["survival_rate"])
+        + QUALITY_WEIGHTS["correlation"] * _percentile_of(corr_val, global_arrays["avg_correlation"])
+    )
+
+
+def _evaluate_merge(
+    active_items: list[dict],
+    seg_start: pd.Timestamp,
+    seg_end: pd.Timestamp,
+    returns_lookup: pd.Series,
+    global_arrays: dict,
+) -> Optional[dict]:
+    """اگر ۲+ سبد هم‌زمان در یک بازه‌ی اتمی فعال باشند، اعضای همه را Union
+    می‌کند و survival_rate/compensation_ratio/avg_return/avg_correlation را
+    دقیقاً با همان فرمول‌های evaluate_group، روی داده‌ی خام واقعیِ محدود به
+    این بازه، از نو محاسبه می‌کند. اگر نمونه‌ی مشترک کافی نبود None برمی‌گرداند
+    (یعنی: شواهد کافی برای توصیه‌ی ادغام نیست، به بهترین سبد تکی برمی‌گردیم)."""
+    members = sorted({m for item in active_items for m in item["members"]})
+    if len(members) < 2:
+        return None
+    try:
+        sub = returns_lookup.loc[members]
+    except KeyError:
+        return None
+
+    df = sub.reset_index()
+    df.columns = ["strategy_id", "release_date", "total_return"]
+    df = df[(df["release_date"] >= seg_start) & (df["release_date"] <= seg_end)]
+    if df.empty:
+        return None
+
+    pivot = df.pivot_table(index="release_date", columns="strategy_id", values="total_return", aggfunc="mean")
+    pivot = pivot.reindex(columns=members)
+    pivot = pivot.dropna(how="any")
+    if len(pivot) < MIN_PORTFOLIO_SAMPLES:
+        return None
+
+    sr = survival_rate(pivot)
+    comp = compensation_ratio(pivot)
+    ar = avg_return(pivot)
+
+    corr_vals = []
+    for a, b in itertools.combinations(members, 2):
+        sub_ab = pivot[[a, b]].dropna()
+        if len(sub_ab) >= MIN_PAIR_OVERLAP and sub_ab[a].nunique() > 1 and sub_ab[b].nunique() > 1:
+            c, _ = spearmanr(sub_ab[a], sub_ab[b])
+            if not np.isnan(c):
+                corr_vals.append(float(c))
+    ac = float(np.mean(corr_vals)) if corr_vals else float("nan")
+
+    coins = sorted({item["coin_composition"] for item in active_items})
+    sigs = sorted({item["signature"] for item in active_items})
+    merged = {
+        "coin_composition": "+".join(coins),
+        "signature": " ⊕ ".join(sigs),
+        "members": members,
+        "survival_rate": sr,
+        "compensation_ratio": comp,
+        "avg_return": ar,
+        "avg_correlation": ac,
+        "sample_count": len(pivot),
+    }
+    merged["quality_score"] = _quality_score(merged, global_arrays)
+    return merged
+
+
+def _resolve_segment(
+    seg_start: pd.Timestamp,
+    seg_end: pd.Timestamp,
+    active_qualified: list[dict],
+    active_any: list[dict],
+    returns_lookup: pd.Series,
+    global_arrays: dict,
+) -> dict:
+    """تصمیم برای یک بازه‌ی اتمی: تکی / ترکیبی / پرکننده‌ی شکاف / بدون‌پوشش."""
+    if active_qualified:
+        if len(active_qualified) == 1:
+            chosen = active_qualified[0]
+            mode = "تکی"
+        else:
+            merged = _evaluate_merge(active_qualified, seg_start, seg_end, returns_lookup, global_arrays)
+            best_single = max(active_qualified, key=lambda r: r["quality_score"])
+            if merged is not None and merged["quality_score"] > best_single["quality_score"]:
+                chosen = merged
+                mode = "ترکیبی"
+            else:
+                chosen = best_single
+                mode = "تکی-برتر (ادغام بهتر نبود)"
+    elif active_any:
+        chosen = max(active_any, key=lambda r: r["quality_score"])
+        mode = "پرکننده‌شکاف (زیر آستانه‌ی فیلتر مطلق)"
+    else:
+        chosen = None
+        mode = "بدون‌پوشش"
+
+    row = {
+        "شروع": seg_start.date().isoformat(),
+        "پایان": seg_end.date().isoformat(),
+        "روز": (seg_end - seg_start).days + 1,
+        "حالت": mode,
+    }
+    if chosen is not None:
+        row.update({
+            "coin_composition": chosen.get("coin_composition"),
+            "signature": chosen.get("signature"),
+            "members": chosen.get("members"),
+            "avg_return": chosen.get("avg_return"),
+            "compensation_ratio": chosen.get("compensation_ratio"),
+            "survival_rate": chosen.get("survival_rate"),
+            "avg_correlation": chosen.get("avg_correlation"),
+            "quality_score": chosen.get("quality_score"),
+        })
+    return row
+
+
+def _collapse_adjacent(segments: list[dict]) -> list[dict]:
+    """بازه‌های اتمیِ مجاور با تصمیم کاملاً یکسان (همان حالت + همان اعضا +
+    همان coin_composition) را برای فشرده‌سازی خروجی با هم ادغام می‌کند."""
+    if not segments:
+        return []
+    collapsed = [dict(segments[0])]
+    for seg in segments[1:]:
+        last = collapsed[-1]
+        same = (
+            seg["حالت"] == last["حالت"]
+            and seg.get("members") == last.get("members")
+            and seg.get("coin_composition") == last.get("coin_composition")
+        )
+        if same:
+            last["پایان"] = seg["پایان"]
+            last["روز"] = last["روز"] + seg["روز"]
+        else:
+            collapsed.append(dict(seg))
+    return collapsed
+
+
+def _build_timeline_segments(pool: list[dict], returns_lookup: pd.Series, global_arrays: dict) -> list[dict]:
+    """موتور sweep-line اصلی: از روی بازه‌های واقعی (_intervals) همه‌ی
+    کاندیدهای استخر، محور زمان را به بازه‌های اتمی (مجموعه‌ی کاندیدهای فعال
+    ثابت) می‌شکند و برای هرکدام با _resolve_segment تصمیم می‌گیرد."""
+    events: list[tuple] = []
+    for idx, item in enumerate(pool):
+        for s, e in item["_intervals"]:
+            events.append((s, 1, idx))
+            events.append((e + pd.Timedelta(days=1), -1, idx))  # نقطه‌ی پایانِ انحصاری
+
+    if not events:
+        return []
+
+    events_by_point: dict = defaultdict(list)
+    for date, delta, idx in events:
+        events_by_point[date].append((delta, idx))
+    unique_points = sorted(events_by_point.keys())
+
+    active_count: dict[int, int] = {}
+    segments: list[dict] = []
+
+    for i, point in enumerate(unique_points):
+        for delta, idx in events_by_point[point]:
+            active_count[idx] = active_count.get(idx, 0) + delta
+            if active_count[idx] <= 0:
+                active_count.pop(idx, None)
+
+        if i + 1 >= len(unique_points):
+            break
+        seg_start = point
+        seg_end = unique_points[i + 1] - pd.Timedelta(days=1)
+        if seg_start > seg_end:
+            continue
+
+        # ========== فیکس: بازه‌ی کاملاً بدون‌پوشش (نه حتی یک کاندیدِ زیرِ
+        # آستانه) قبلاً به‌طور کامل حذف می‌شد (continue بدون ساخت ردیف) —
+        # یعنی خروجی نهایی برای این بازه‌ها هیچ ردیفی نداشت و کاربر نمی‌فهمید
+        # این بخش از محور زمان اصلاً پوشش داده نشده. حالا این بازه هم با
+        # _resolve_segment (که در نبود هر دو لیست، حالت «بدون‌پوشش» تولید
+        # می‌کند) صریحاً به‌عنوان ردیف ثبت می‌شود. ==========
+        active_items = [pool[j] for j in active_count.keys()]
+        active_qualified = [it for it in active_items if it.get("_passes_abs")]
+        segments.append(_resolve_segment(seg_start, seg_end, active_qualified, active_items, returns_lookup, global_arrays))
+
+    return _collapse_adjacent(segments)
+
+
+def run_timeline(
+    signatures_dir: Path,
+    golden_scores_path: Optional[Path],
+    version_schema_path: Optional[Path],
+    output_dir: Path,
+    top_n: int,
+    signatures_filter: Optional[Path] = None,
+) -> Path:
+    """
+    ماژول سوم: یک جدول زمانی پیوسته از اولین تا آخرین رخداد واقعی می‌سازد که
+    برای هر بازه می‌گوید دقیقاً چه سبدی (یا ترکیبی) باید اجرا شود، با هدف
+    پوشش حداکثریِ محور زمان (نه فقط ~۱۵٪ فعلیِ هر سبد به‌تنهایی):
+
+      ۱) هر سبدِ واجد شرایط + بازه‌های واقعیِ دقیقِ فعال‌بودنش (نه فقط
+         شروع/پایان تجمیعی) از raw jsonl بازسازی می‌شود؛ هم‌زمان، همه‌ی
+         کاندیدهای *زیر آستانه‌ی فیلتر مطلق* هم (بدون حذف) نگه داشته می‌شوند
+         تا در نبود گزینه‌ی واجدشرایط، به‌عنوان پرکننده‌ی شکاف در دسترس باشند.
+      ۲) sweep-line روی محور زمان، بازه‌های اتمی (مجموعه‌ی فعال ثابت) را
+         مشخص می‌کند.
+      ۳) در هر بازه‌ی اتمی: ۱ سبد واجد فعال → همان؛ ۲+ سبد واجد فعال
+         (هم‌پوشانی) → اعضا Union و با فرمول evaluate_group از نو روی داده‌ی
+         خام واقعیِ همان بازه ارزیابی می‌شود، و در صورت quality_score بالاتر
+         از بهترین تکی، ترکیب انتخاب می‌شود؛ صفر سبد واجد ولی سبد زیرِ
+         آستانه موجود → آن به‌عنوان «پرکننده‌ی شکاف» با برچسب صریح انتخاب
+         می‌شود؛ صفر مطلق → «بدون‌پوشش».
+      ۴) برای مقایسه‌ی *بین‌گروهی* (که score محلی evaluate_group به‌خاطر
+         صدک‌بندی درون‌گروهی برایش نامعتبر است)، یک quality_score سراسری
+         (بازده ۴۰٪ + جبران‌سازی ۳۰٪ + بقا ۲۰٪ + همبستگی پایین ۱۰٪، صدک‌بندی
+         روی کل استخر) محاسبه و برای همه‌ی تصمیم‌ها استفاده می‌شود.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    signatures = load_signatures(signatures_dir, signatures_filter)
+    load_version_schema(version_schema_path)
+
+    if golden_scores_path is not None:
+        golden = load_golden_scores(golden_scores_path)
+        candidates = prefilter_candidates(signatures, golden)
+    else:
+        log.warning("golden_scores ارائه نشده — پیش‌فیلتر Golden رد می‌شود.")
+        candidates = signatures
+
+    if candidates.empty:
+        log.warning("هیچ رکورد کاندیدی برای ساخت جدول زمانی یافت نشد.")
+
+    candidates = candidates.copy()
+    candidates["امضا_بدون_رژیم"] = candidates["signature"].apply(strip_market_regime)
+
+    pool: list[dict] = []
+    coin_groups = candidates.groupby(["coin_composition", "امضا_بدون_رژیم"])
+    group_keys = list(coin_groups.groups.keys())
+    log.info("حالت جدول زمانی: %d گروه (coin, امضای بدون رژیم) برای بررسی.", len(group_keys))
+
+    for coin_composition, sig_no_regime in group_keys:
+        group = coin_groups.get_group((coin_composition, sig_no_regime))
+        if group["strategy_id"].nunique() < 2:
+            continue
+        # abs_filters=False: هم واجدشرایط‌ها و هم زیرآستانه‌ای‌ها نگه داشته
+        # می‌شوند (با کلید _passes_abs مشخص می‌شوند)؛ top_n بزرگ تا استخر
+        # پرکردن شکاف محدود نشود.
+        raw, _raw_count = evaluate_group(
+            coin_composition, sig_no_regime, group, top_n=max(top_n, 50),
+            attach_periods=True, abs_filters=False,
+        )
+        pool.extend(raw)
+
+    n_qualified = sum(1 for r in pool if r.get("_passes_abs"))
+    log.info("استخر کل: %d کاندید (%d واجد شرایط، %d زیر آستانه/پرکننده شکاف).",
+              len(pool), n_qualified, len(pool) - n_qualified)
+
+    columns = [
+        "شروع", "پایان", "روز", "حالت", "coin_composition", "signature",
+        "members", "avg_return", "compensation_ratio", "survival_rate",
+        "avg_correlation", "quality_score",
+    ]
+
+    if not pool:
+        log.warning("هیچ کاندیدی (حتی زیر آستانه) یافت نشد — جدول زمانی خالی خواهد بود.")
+        out_df = pd.DataFrame(columns=columns)
+        output_path = output_dir / "portfolios_timeline"
+        return _save_dataframe(out_df, output_path)
+
+    global_arrays = _build_global_quality_arrays(pool)
+    for record in pool:
+        record["quality_score"] = _quality_score(record, global_arrays)
+
+    # ---- نمایه‌ی بازده‌ی خام هر strategy_id در هر release_date، برای محاسبه‌ی دقیق سبدهای ادغام‌شده ----
+    returns_index = candidates.copy()
+    returns_index["release_date"] = returns_index.apply(compute_release_date, axis=1)
+    returns_lookup = (
+        returns_index.groupby(["strategy_id", "release_date"])["total_return"].mean()
+    )
+
+    segments = _build_timeline_segments(pool, returns_lookup, global_arrays)
+
+    out_df = pd.DataFrame(segments)
+    if not out_df.empty:
+        out_df = out_df[[c for c in columns if c in out_df.columns]]
+
+    output_path = output_dir / "portfolios_timeline"
+    final_path = _save_dataframe(out_df, output_path)
+    log.info("ذخیره شد: %s (%d بازه‌ی نهایی پس از فشرده‌سازی)", final_path, len(out_df))
+    return final_path
+
+
+# -----------------------------------------------------------------------------
 # حالت «کل بازه‌ی زمانی» (بدون قید رویداد خبری)
 # -----------------------------------------------------------------------------
 
@@ -1329,6 +1729,15 @@ def parse_args(argv=None) -> argparse.Namespace:
              "(بدون قید رویداد خبری، فقط بر اساس coin_composition) می‌سازد. "
              "خروجی در فایل جدای portfolios_whole_time.* ذخیره می‌شود.",
     )
+    parser.add_argument(
+        "--timeline", action="store_true", default=False,
+        help="ماژول سوم: به‌جای انتخاب یک سبد به‌ازای هر شرایط، یک جدول "
+             "زمانی پیوسته (از اولین تا آخرین رخداد واقعی) می‌سازد که برای "
+             "هر بازه دقیقاً می‌گوید چه سبدی (یا ترکیبی از چند سبد هم‌پوشان) "
+             "باید اجرا شود؛ شکاف‌ها را با بهترین گزینه‌ی موجود (حتی زیر "
+             "آستانه‌ی فیلتر مطلق) پر می‌کند. خروجی در portfolios_timeline.* "
+             "ذخیره می‌شود. با --whole-time قابل ترکیب نیست.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1345,7 +1754,16 @@ def main(argv=None) -> int:
     )
 
     try:
-        if args.whole_time:
+        if args.timeline:
+            run_timeline(
+                signatures_dir=args.signatures_dir,
+                golden_scores_path=args.golden_scores,
+                version_schema_path=args.version_schema,
+                output_dir=output_dir,
+                top_n=args.top_n,
+                signatures_filter=args.signatures_filter,
+            )
+        elif args.whole_time:
             run_whole_time(
                 signatures_dir=args.signatures_dir,
                 golden_scores_path=args.golden_scores,
