@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import statistics
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -299,6 +300,172 @@ def consecutive_losses(returns: list[float]) -> int:
     return max_consec
 
 
+# =============================================================================
+# [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد — پورت مستقیم از
+# calculators.py (compute_monthly_stats + profit_loss_ratio +
+# risk_reward_overall/profit_months/loss_months + max_consecutive_loss_stats).
+# فرمول‌ها عیناً همان‌ها هستند؛ تنها تفاوت: calculators.py روی لیست معاملات
+# خام تک‌تک (profitPercent + زمان) کار می‌کند، ولی اینجا روی لیست
+# (period_start, total_return) — چون در این خط لوله هر رکورد از ابتدا خودش
+# یک «دوره»ی ۱۰روزه یا ماهانه‌ی از قبل جمع‌بسته‌شده است، نه یک معامله‌ی تکی؛
+# «تعداد معاملات در ماه» در این خروجی یعنی «تعداد دوره در ماه»، و همین‌طور
+# برای بقیه.
+# =============================================================================
+
+def _period_monthly_stats(dated_values: list) -> dict:
+    """dated_values: لیستی از (date, total_return). خروجی همان ۱۶ کلید
+    (منهای «کل معاملات» که از قبل با sample_count پوشش داده شده)."""
+    months: dict = defaultdict(list)
+    for d, v in dated_values:
+        if d is None:
+            continue
+        key = f"{d.year:04d}-{d.month:02d}"
+        months[key].append(v)
+
+    empty = {
+        "بازه_بکتست_ماه": 0, "میانگین_سود_ماهانه": 0.0, "انحراف_معیار_سود_ماهانه": 0.0,
+        "بهترین_ماه_درصد": 0.0, "بدترین_ماه_درصد": 0.0, "درصد_ماه‌های_سودده": 0.0,
+        "میانگین_سود_در_ماه‌های_سودده": 0.0, "میانگین_ضرر_در_ماه‌های_ضررده": 0.0,
+        "بیشترین_ضرر_متوالی_ماهانه": 0, "میانگین_تعداد_دوره_در_ماه": 0.0,
+        "انحراف_معیار_تعداد_دوره": 0.0, "حداکثر_افت_سرمایه_درصد": 0.0,
+        "مدت_بازگشت_از_افت_ماه": 0, "ریسک_به_ریوارد_کلی": 0.0,
+        "ریسک_به_ریوارد_ماه‌های_سوده": 0.0, "ریسک_به_ریوارد_ماه‌های_ضررده": 0.0,
+        "حداکثر_ضرر_متوالی_درصد": 0.0,
+    }
+    if not months:
+        return empty
+
+    ordered_keys = sorted(months.keys())
+    monthly_returns = [sum(months[k]) for k in ordered_keys]
+    trades_per_month = [len(months[k]) for k in ordered_keys]
+    n_months = len(ordered_keys)
+
+    avg_ret = statistics.mean(monthly_returns)
+    std_ret = statistics.stdev(monthly_returns) if n_months >= 2 else 0.0
+    best = max(monthly_returns)
+    worst = min(monthly_returns)
+    profitable = [r for r in monthly_returns if r > 0]
+    losing = [r for r in monthly_returns if r < 0]
+    pct_profitable = (len(profitable) / n_months * 100) if n_months else 0.0
+    avg_profit_months = statistics.mean(profitable) if profitable else 0.0
+    avg_loss_months = statistics.mean(losing) if losing else 0.0
+
+    best_streak = cur = 0
+    for r in monthly_returns:
+        if r < 0:
+            cur += 1
+            best_streak = max(best_streak, cur)
+        else:
+            cur = 0
+
+    avg_trades = statistics.mean(trades_per_month) if trades_per_month else 0.0
+    std_trades = statistics.stdev(trades_per_month) if len(trades_per_month) >= 2 else 0.0
+
+    try:
+        first_dt = datetime.strptime(ordered_keys[0] + "-01", "%Y-%m-%d")
+        last_dt = datetime.strptime(ordered_keys[-1] + "-01", "%Y-%m-%d")
+        total_span_months = (last_dt.year - first_dt.year) * 12 + (last_dt.month - first_dt.month) + 1
+    except Exception:
+        total_span_months = n_months
+
+    cum = 0.0
+    peak = 0.0
+    mdd = 0.0
+    cum_series = []
+    for r in monthly_returns:
+        cum += r
+        cum_series.append(cum)
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > mdd:
+            mdd = dd
+
+    recovery_months = 0
+    if mdd > 0:
+        cur_peak = cum_series[0]
+        cur_peak_i = 0
+        worst_dd = 0.0
+        worst_peak_i = 0
+        worst_trough_i = 0
+        for i, v in enumerate(cum_series):
+            if v > cur_peak:
+                cur_peak = v
+                cur_peak_i = i
+            dd = cur_peak - v
+            if dd > worst_dd:
+                worst_dd = dd
+                worst_peak_i = cur_peak_i
+                worst_trough_i = i
+        target = cum_series[worst_peak_i]
+        rec = None
+        for i in range(worst_trough_i + 1, len(cum_series)):
+            if cum_series[i] >= target:
+                rec = i - worst_trough_i
+                break
+        recovery_months = rec if rec is not None else 0
+
+    def _pl_ratio(vals):
+        pos = [v for v in vals if v > 0]
+        neg = [v for v in vals if v < 0]
+        if not pos or not neg:
+            return 0.0
+        return statistics.mean(pos) / abs(statistics.mean(neg))
+
+    all_vals = [v for _, v in dated_values]
+    rr_overall = _pl_ratio(all_vals)
+    profit_month_keys = {k for k in ordered_keys if sum(months[k]) > 0}
+    loss_month_keys = {k for k in ordered_keys if sum(months[k]) < 0}
+    rr_profit_months = _pl_ratio(
+        [v for d, v in dated_values if d and f"{d.year:04d}-{d.month:02d}" in profit_month_keys]
+    )
+    rr_loss_months = _pl_ratio(
+        [v for d, v in dated_values if d and f"{d.year:04d}-{d.month:02d}" in loss_month_keys]
+    )
+
+    ordered_vals = [v for _, v in sorted(dated_values, key=lambda x: (x[0] is None, x[0]))]
+    best_count, best_sum = 0, 0.0
+    cur_count, cur_sum = 0, 0.0
+    for v in ordered_vals:
+        if v < 0:
+            cur_count += 1
+            cur_sum += v
+            if cur_sum < best_sum:
+                best_sum = cur_sum
+        else:
+            cur_count = 0
+            cur_sum = 0.0
+
+    return {
+        "بازه_بکتست_ماه": total_span_months,
+        "میانگین_سود_ماهانه": avg_ret,
+        "انحراف_معیار_سود_ماهانه": std_ret,
+        "بهترین_ماه_درصد": best,
+        "بدترین_ماه_درصد": worst,
+        "درصد_ماه‌های_سودده": pct_profitable,
+        "میانگین_سود_در_ماه‌های_سودده": avg_profit_months,
+        "میانگین_ضرر_در_ماه‌های_ضررده": avg_loss_months,
+        "بیشترین_ضرر_متوالی_ماهانه": best_streak,
+        "میانگین_تعداد_دوره_در_ماه": avg_trades,
+        "انحراف_معیار_تعداد_دوره": std_trades,
+        "حداکثر_افت_سرمایه_درصد": mdd,
+        "مدت_بازگشت_از_افت_ماه": recovery_months,
+        "ریسک_به_ریوارد_کلی": rr_overall,
+        "ریسک_به_ریوارد_ماه‌های_سوده": rr_profit_months,
+        "ریسک_به_ریوارد_ماه‌های_ضررده": rr_loss_months,
+        "حداکثر_ضرر_متوالی_درصد": best_sum,
+    }
+
+
+EXT_STATS_16_COLUMNS = [
+    "ریسک_به_ریوارد_کلی", "ریسک_به_ریوارد_ماه‌های_سوده", "ریسک_به_ریوارد_ماه‌های_ضررده",
+    "میانگین_سود_ماهانه", "انحراف_معیار_سود_ماهانه", "بهترین_ماه_درصد", "بدترین_ماه_درصد",
+    "درصد_ماه‌های_سودده", "میانگین_سود_در_ماه‌های_سودده", "میانگین_ضرر_در_ماه‌های_ضررده",
+    "بیشترین_ضرر_متوالی_ماهانه", "میانگین_تعداد_دوره_در_ماه", "انحراف_معیار_تعداد_دوره",
+    "حداکثر_افت_سرمایه_درصد", "مدت_بازگشت_از_افت_ماه", "حداکثر_ضرر_متوالی_درصد",
+]
+
+
 def compute_raw_metrics(group: pd.DataFrame) -> dict:
     """محاسبه معیارهای خام برای یک گروه (استراتژی, امضا)."""
     returns = group["total_return"].tolist()
@@ -348,6 +515,17 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
     else:
         avg_indicator_importance = None
 
+    # [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد — از روی
+    # همین (period_start, total_return) هر دوره‌ی این گروه، قبل از این‌که
+    # (مثل بقیه‌ی این تابع) به چند عدد میانگین‌شده تقلیل پیدا کند.
+    dated_values = []
+    if "period_start" in group.columns and "total_return" in group.columns:
+        starts = pd.to_datetime(group["period_start"], errors="coerce")
+        for d, v in zip(starts, group["total_return"]):
+            if pd.notna(d) and pd.notna(v):
+                dated_values.append((d.date(), float(v)))
+    ext16 = _period_monthly_stats(dated_values)
+
     # signature_path: مسیر نسبی فایل JSONL نماینده (رایج‌ترین source_file در گروه).
     # یک گروه (strategy_id, coin, signature) ممکن است از چند فایل JSONL تشکیل شده
     # باشد (چون چند فایل می‌توانند به یک امضای خبری یکسان ختم شوند)، بنابراین
@@ -391,6 +569,8 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
         "بازه_زمانی_شروع": period_start_min,
         "بازه_زمانی_پایان": period_end_max,
         "تعداد_روز_فعال": active_days_sum,
+        "_dated_values": dated_values,
+        **ext16,
     }
 
 
@@ -889,7 +1069,8 @@ def run(
     recommendation_df = norm_df[
         ["strategy_id", "coin_composition", "signature", "sample_count", "win_rate", "avg_daily_return",
          "dominant_indicator", "all_indicators_seen",
-         "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال"]
+         "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "_dated_values"]
+        + EXT_STATS_16_COLUMNS
     ].copy()
 
     # ── ادغام اختیاری آستانه/نسبت_شانس (تک‌شاخصی + دوشاخصی) از patterns_df ──
@@ -1001,6 +1182,16 @@ def _prepare_group_aggregates(df: pd.DataFrame, group_col: str, include_thr_cols
         work[wcol] = work["sample_count"] * work[tc].fillna(0)
         thr_weighted_cols.append(wcol)
 
+    # [اصلاح] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد: میانگین وزن‌دار
+    # برای ستون‌هایی مثل حداکثر افت سرمایه / مدت بازگشت / ریسک‌به‌ریوارد از
+    # نظر ریاضی غلط است (این‌ها به مسیر واقعیِ ترکیب‌شده وابسته‌اند، جمع‌پذیر
+    # نیستند). به‌جایش، دوره‌های خام هر زیرگروه (مثلاً چند رژیم بازار مختلف
+    # زیر یک شرط) را واقعاً به هم می‌چسبانیم و یک‌بار، از روی همان داده‌ی
+    # واقعیِ متحدشده، دوباره محاسبه می‌کنیم — نه از روی چند عدد از‌قبل‌
+    # خلاصه‌شده.
+    ext_present = [c for c in EXT_STATS_16_COLUMNS if c in work.columns]
+    has_dated_values = "_dated_values" in work.columns
+
     agg_spec = dict(
         تعداد_تکرار=("sample_count", "sum"),
         _win_raw_sum=("_win_raw", "sum"),
@@ -1034,6 +1225,28 @@ def _prepare_group_aggregates(df: pd.DataFrame, group_col: str, include_thr_cols
             lambda r, wcol=wcol: (r[f"{wcol}_sum"] / r["تعداد_تکرار"]) if r["تعداد_تکرار"] else None, axis=1
         )
 
+    # [اصلاح] بازسازی واقعی ۱۶ ستون: برای هر (گروه، نام_استراتژی)، همه‌ی
+    # لیست‌های (تاریخ,بازده) زیرگروه‌های تشکیل‌دهنده‌اش را واقعاً به هم
+    # می‌چسبانیم و یک‌بار _period_monthly_stats را روی داده‌ی متحدشده صدا
+    # می‌زنیم — نه میانگین‌گیری از چند عدد جدا.
+    if has_dated_values and ext_present:
+        def _merged_ext_stats(sub: pd.DataFrame) -> pd.Series:
+            combined: list = []
+            for lst in sub["_dated_values"]:
+                if isinstance(lst, list):
+                    combined.extend(lst)
+            stats = _period_monthly_stats(combined)
+            return pd.Series({ec: stats.get(ec, 0.0) for ec in ext_present})
+
+        ext_stats_df = work.groupby([group_col, "نام_استراتژی"], as_index=False).apply(_merged_ext_stats)
+        if isinstance(ext_stats_df.columns, pd.MultiIndex):
+            ext_stats_df.columns = [c[-1] if isinstance(c, tuple) else c for c in ext_stats_df.columns]
+        key_df = work[[group_col, "نام_استراتژی"]].drop_duplicates().reset_index(drop=True)
+        ext_stats_df = pd.concat([key_df.reset_index(drop=True), ext_stats_df[ext_present].reset_index(drop=True)], axis=1)
+        agg = agg.merge(ext_stats_df, on=[group_col, "نام_استراتژی"], how="left")
+        for ec in ext_present:
+            agg[ec] = agg[ec].fillna(0.0)
+
     period_cols = []
     if "بازه_زمانی_شروع" in agg.columns and "بازه_زمانی_پایان" in agg.columns:
         # [فیکس ۱۳] تعداد_روز_کل_بازه = فاصله‌ی تقویمی شروع تا پایان (شامل
@@ -1047,7 +1260,7 @@ def _prepare_group_aggregates(df: pd.DataFrame, group_col: str, include_thr_cols
     agg = agg.rename(columns={group_col: "گروه"})
     return agg[
         ["گروه", "نام_استراتژی", "تعداد_تکرار", "تعداد_سود", "تعداد_ضرر", "وین‌ریت_(%)", "میانگین_بازده_(%)"]
-        + period_cols + thr_cols
+        + period_cols + thr_cols + ext_present
     ]
 
 
@@ -1081,6 +1294,16 @@ def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) ->
 
     has_period_cols = "بازه_زمانی_شروع" in combined.columns and "بازه_زمانی_پایان" in combined.columns
 
+    # [افزوده] ۱۶ ستون آماری: عیناً همان الگوی وزن‌دهی نسبت_شانس_آستانه_* بالا
+    ext_cols = [c for c in EXT_STATS_16_COLUMNS if c in new_agg.columns]
+    ext_weighted_cols = []
+    for ec in ext_cols:
+        if ec not in combined.columns:
+            combined[ec] = None
+        wcol = f"_w_{ec}"
+        combined[wcol] = combined[ec].fillna(0) * combined["تعداد_تکرار"]
+        ext_weighted_cols.append(wcol)
+
     agg_spec = dict(
         تعداد_تکرار=("تعداد_تکرار", "sum"),
         تعداد_سود=("تعداد_سود", "sum"),
@@ -1094,6 +1317,8 @@ def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) ->
         agg_spec["تعداد_روز_فعال"] = ("تعداد_روز_فعال", "sum")
     for wcol in thr_weighted_cols:
         agg_spec[f"{wcol}_sum"] = (wcol, "sum")
+    for wcol in ext_weighted_cols:
+        agg_spec[f"{wcol}_sum"] = (wcol, "sum")
 
     merged = combined.groupby(["گروه", "نام_استراتژی"], as_index=False).agg(**agg_spec)
     merged["میانگین_بازده_(%)"] = merged.apply(
@@ -1106,6 +1331,10 @@ def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) ->
         merged[tc] = merged.apply(
             lambda r, wcol=wcol: (r[f"{wcol}_sum"] / r["تعداد_تکرار"]) if r["تعداد_تکرار"] else None, axis=1
         )
+    for ec, wcol in zip(ext_cols, ext_weighted_cols):
+        merged[ec] = merged.apply(
+            lambda r, wcol=wcol: (r[f"{wcol}_sum"] / r["تعداد_تکرار"]) if r["تعداد_تکرار"] else 0.0, axis=1
+        )
     if has_period_cols:
         start_dt = pd.to_datetime(merged["بازه_زمانی_شروع"], errors="coerce")
         end_dt = pd.to_datetime(merged["بازه_زمانی_پایان"], errors="coerce")
@@ -1114,14 +1343,22 @@ def _merge_with_previous(new_agg: pd.DataFrame, old_raw: pd.DataFrame | None) ->
     return merged
 
 
-def _rank_and_select(agg: pd.DataFrame) -> pd.DataFrame:
+def _rank_and_select(agg: pd.DataFrame, abs_filter: bool = False) -> pd.DataFrame:
     """رتبه‌بندی هر گروه (تعداد_تکرار نزولی → میانگین_بازده نزولی) و اعمال
-    شرط نمایش: فقط رتبه ۱ اگر (میانگین_بازده ≥ ۰.۵٪ و وین‌ریت > ۸۰٪)، وگرنه ۵ رتبه اول."""
+    شرط نمایش: فقط رتبه ۱ اگر (میانگین_بازده ≥ ۰.۵٪ و وین‌ریت > ۸۰٪)، وگرنه ۵ رتبه اول.
+
+    [افزوده] abs_filter: اگر True باشد، پس از انتخاب رتبه‌ها، هر ردیفی که
+    میانگین_بازده_(%) < ۰.۵ یا وین‌ریت_(%) < ۴۰ داشته باشد حذف می‌شود
+    (فیلتر مطلق سطح-ردیف، جدا از منطق «رتبه ۱ / ۵ رتبه اول» بالا) و «رتبه»
+    درون هر گروه دوباره از ۱ شماره‌گذاری می‌شود. فقط برای الگوی خبری
+    بدون‌رژیم استفاده می‌شود (generate_news_pattern_no_regime_recommendation)؛
+    خروجی الگوی خبری معمولی بدون تغییر می‌ماند."""
     thr_cols = _threshold_columns(agg)
     # [فیکس ۱۳] ستون‌های بازه‌ی زمانی هم باید در خروجی نهایی حفظ بشن — قبلاً
     # اینجا هاردکد به RECOMMENDATION_GROUP_COLUMNS بود و بی‌صدا حذف می‌شدند.
     period_cols = [c for c in ["بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه"] if c in agg.columns]
-    out_columns = RECOMMENDATION_GROUP_COLUMNS + period_cols + thr_cols
+    ext_cols = [c for c in EXT_STATS_16_COLUMNS if c in agg.columns]
+    out_columns = RECOMMENDATION_GROUP_COLUMNS + period_cols + thr_cols + ext_cols
     if agg.empty:
         return pd.DataFrame(columns=out_columns)
 
@@ -1137,6 +1374,12 @@ def _rank_and_select(agg: pd.DataFrame) -> pd.DataFrame:
         out_frames.append(selected)
 
     result = pd.concat(out_frames, ignore_index=True)
+
+    if abs_filter:
+        result = result[(result["میانگین_بازده_(%)"] >= 0.5) & (result["وین‌ریت_(%)"] >= 40)].copy()
+        if not result.empty:
+            result["رتبه"] = result.groupby("گروه").cumcount() + 1
+
     return result[out_columns]
 
 
@@ -1162,8 +1405,12 @@ def _generate_recommendation_output(
     filename: str,
     label: str,
     include_thr_cols: bool = True,
+    abs_filter: bool = False,
 ) -> None:
-    """منطق مشترک تولید یک خروجی پیشنهاد استراتژی (افزایشی) بر اساس ستون گروه‌بندی مشخص."""
+    """منطق مشترک تولید یک خروجی پیشنهاد استراتژی (افزایشی) بر اساس ستون گروه‌بندی مشخص.
+
+    [افزوده] abs_filter به _rank_and_select پاس داده می‌شود (نگاه کنید به
+    توضیح آن‌جا)."""
     if df.empty or group_col not in df.columns:
         log.warning(f"[{label}] داده‌ای برای تولید خروجی یافت نشد — رد می‌شود.")
         return
@@ -1194,10 +1441,13 @@ def _generate_recommendation_output(
         # شود، وگرنه با هر اجرای incremental، بازه‌ی محاسبه‌شده فقط شامل
         # جدیدترین داده می‌شد نه کل تاریخچه.
         old_period_cols = [c for c in ["بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال"] if c in old_final.columns]
-        old_raw = old_final[base_cols + old_period_cols + old_thr_cols].copy()
+        # [افزوده] ۱۶ ستون آماری هم مثل بازه‌ی زمانی/آستانه باید از فایل قبلی
+        # حفظ شوند تا اجرای incremental بعدی، تاریخچه‌شان را از دست ندهد.
+        old_ext_cols = [c for c in EXT_STATS_16_COLUMNS if c in old_final.columns]
+        old_raw = old_final[base_cols + old_period_cols + old_thr_cols + old_ext_cols].copy()
 
     merged_agg = _merge_with_previous(new_agg, old_raw)
-    new_final = _rank_and_select(merged_agg)
+    new_final = _rank_and_select(merged_agg, abs_filter=abs_filter)
 
     if _rank1_changed(old_final, new_final):
         saved_path = _save(new_final, output_path / Path(filename).stem)
@@ -1249,6 +1499,7 @@ def generate_news_pattern_no_regime_recommendation(df: pd.DataFrame, output_dir)
         output_path,
         "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv",
         "الگوی خبری بدون رژیم",
+        abs_filter=True,  # [افزوده] حذف ردیف‌های وین‌ریت<۴۰٪ یا میانگین_بازده<۰.۵٪
     )
 
 
