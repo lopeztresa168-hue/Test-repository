@@ -1628,6 +1628,21 @@ def _resolve_segment(
             "survival_rate": chosen.get("survival_rate"),
             "avg_correlation": chosen.get("avg_correlation"),
             "quality_score": chosen.get("quality_score"),
+            # ========== [افزوده به درخواست کاربر]: همان ستون‌های تحلیلی که در
+            # portfolios_whole_time.csv هستند (score، sample_count، بازه‌ی
+            # زمانی بک‌تست، و ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد)
+            # این‌ها از قبل روی هر رکورد pool توسط evaluate_group محاسبه
+            # شده‌اند؛ فقط اینجا هم مثل بقیه‌ی فیلدها کپی می‌شوند. برای حالت
+            # «ترکیبی» (merged از _evaluate_merge) این فیلدها موجود نیستند
+            # (چون آن سبد تازه و فقط برای همین بازه ساخته شده) و NaN/None
+            # می‌مانند — این محدودیت ذاتی حالت ادغام است، نه حذف عمدی. ==========
+            "score": chosen.get("score"),
+            "sample_count": chosen.get("sample_count"),
+            "بازه_زمانی_شروع": chosen.get("بازه_زمانی_شروع"),
+            "بازه_زمانی_پایان": chosen.get("بازه_زمانی_پایان"),
+            "تعداد_روز_فعال": chosen.get("تعداد_روز_فعال"),
+            "تعداد_روز_کل_بازه": chosen.get("تعداد_روز_کل_بازه"),
+            **{k: chosen.get(k) for k in EXT_STATS_16_COLUMNS},
         })
     return row
 
@@ -1774,7 +1789,11 @@ def run_timeline(
         "شروع", "پایان", "روز", "حالت", "coin_composition", "signature",
         "members", "avg_return", "compensation_ratio", "survival_rate",
         "avg_correlation", "quality_score",
-    ]
+        # ========== [افزوده به درخواست کاربر]: ستون‌های تحلیلی همسان با
+        # portfolios_whole_time.csv — بدون حذف هیچ‌کدام از ستون‌های بالا ==========
+        "score", "sample_count",
+        "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
+    ] + EXT_STATS_16_COLUMNS
 
     if not pool:
         log.warning("هیچ کاندیدی (حتی زیر آستانه) یافت نشد — جدول زمانی خالی خواهد بود.")
