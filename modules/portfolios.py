@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import re
+import statistics
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -792,6 +793,168 @@ def avg_correlation(members: tuple, corr_lookup: dict) -> float:
 # گام ۹: نرمال‌سازی Percentile Rank
 # -----------------------------------------------------------------------------
 
+# =============================================================================
+# [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد — پورت مستقیم از
+# calculators.py (همان تابعی که عیناً در golden.py هم پورت شده؛ کد اینجا
+# تکرار شده تا portfolios.py مستقل بماند و به golden.py وابسته نشود).
+# ورودی اینجا: (release_date, period_sum) — period_sum یعنی returns.sum(axis=1)
+# همان دوره برای اعضای این سبد، دقیقاً همان تعریفی که survival_rate/
+# compensation_ratio بالا هم برای «بازده‌ی سبد در آن دوره» استفاده می‌کنند.
+# =============================================================================
+
+def _period_monthly_stats(dated_values: list) -> dict:
+    """dated_values: لیستی از (date, period_sum)."""
+    months: dict = defaultdict(list)
+    for d, v in dated_values:
+        if d is None:
+            continue
+        key = f"{d.year:04d}-{d.month:02d}"
+        months[key].append(v)
+
+    empty = {
+        "بازه_بکتست_ماه": 0, "میانگین_سود_ماهانه": 0.0, "انحراف_معیار_سود_ماهانه": 0.0,
+        "بهترین_ماه_درصد": 0.0, "بدترین_ماه_درصد": 0.0, "درصد_ماه‌های_سودده": 0.0,
+        "میانگین_سود_در_ماه‌های_سودده": 0.0, "میانگین_ضرر_در_ماه‌های_ضررده": 0.0,
+        "بیشترین_ضرر_متوالی_ماهانه": 0, "میانگین_تعداد_دوره_در_ماه": 0.0,
+        "انحراف_معیار_تعداد_دوره": 0.0, "حداکثر_افت_سرمایه_درصد": 0.0,
+        "مدت_بازگشت_از_افت_ماه": 0, "ریسک_به_ریوارد_کلی": 0.0,
+        "ریسک_به_ریوارد_ماه‌های_سوده": 0.0, "ریسک_به_ریوارد_ماه‌های_ضررده": 0.0,
+        "حداکثر_ضرر_متوالی_درصد": 0.0,
+    }
+    if not months:
+        return empty
+
+    ordered_keys = sorted(months.keys())
+    monthly_returns = [sum(months[k]) for k in ordered_keys]
+    trades_per_month = [len(months[k]) for k in ordered_keys]
+    n_months = len(ordered_keys)
+
+    avg_ret = statistics.mean(monthly_returns)
+    std_ret = statistics.stdev(monthly_returns) if n_months >= 2 else 0.0
+    best = max(monthly_returns)
+    worst = min(monthly_returns)
+    profitable = [r for r in monthly_returns if r > 0]
+    losing = [r for r in monthly_returns if r < 0]
+    pct_profitable = (len(profitable) / n_months * 100) if n_months else 0.0
+    avg_profit_months = statistics.mean(profitable) if profitable else 0.0
+    avg_loss_months = statistics.mean(losing) if losing else 0.0
+
+    best_streak = cur = 0
+    for r in monthly_returns:
+        if r < 0:
+            cur += 1
+            best_streak = max(best_streak, cur)
+        else:
+            cur = 0
+
+    avg_trades = statistics.mean(trades_per_month) if trades_per_month else 0.0
+    std_trades = statistics.stdev(trades_per_month) if len(trades_per_month) >= 2 else 0.0
+
+    try:
+        first_dt = datetime.strptime(ordered_keys[0] + "-01", "%Y-%m-%d")
+        last_dt = datetime.strptime(ordered_keys[-1] + "-01", "%Y-%m-%d")
+        total_span_months = (last_dt.year - first_dt.year) * 12 + (last_dt.month - first_dt.month) + 1
+    except Exception:
+        total_span_months = n_months
+
+    cum = 0.0
+    peak = 0.0
+    mdd = 0.0
+    cum_series = []
+    for r in monthly_returns:
+        cum += r
+        cum_series.append(cum)
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > mdd:
+            mdd = dd
+
+    recovery_months = 0
+    if mdd > 0:
+        cur_peak = cum_series[0]
+        cur_peak_i = 0
+        worst_dd = 0.0
+        worst_peak_i = 0
+        worst_trough_i = 0
+        for i, v in enumerate(cum_series):
+            if v > cur_peak:
+                cur_peak = v
+                cur_peak_i = i
+            dd = cur_peak - v
+            if dd > worst_dd:
+                worst_dd = dd
+                worst_peak_i = cur_peak_i
+                worst_trough_i = i
+        target = cum_series[worst_peak_i]
+        rec = None
+        for i in range(worst_trough_i + 1, len(cum_series)):
+            if cum_series[i] >= target:
+                rec = i - worst_trough_i
+                break
+        recovery_months = rec if rec is not None else 0
+
+    def _pl_ratio(vals):
+        pos = [v for v in vals if v > 0]
+        neg = [v for v in vals if v < 0]
+        if not pos or not neg:
+            return 0.0
+        return statistics.mean(pos) / abs(statistics.mean(neg))
+
+    all_vals = [v for _, v in dated_values]
+    rr_overall = _pl_ratio(all_vals)
+    profit_month_keys = {k for k in ordered_keys if sum(months[k]) > 0}
+    loss_month_keys = {k for k in ordered_keys if sum(months[k]) < 0}
+    rr_profit_months = _pl_ratio(
+        [v for d, v in dated_values if d and f"{d.year:04d}-{d.month:02d}" in profit_month_keys]
+    )
+    rr_loss_months = _pl_ratio(
+        [v for d, v in dated_values if d and f"{d.year:04d}-{d.month:02d}" in loss_month_keys]
+    )
+
+    ordered_vals = [v for _, v in sorted(dated_values, key=lambda x: (x[0] is None, x[0]))]
+    best_count, best_sum = 0, 0.0
+    cur_count, cur_sum = 0, 0.0
+    for v in ordered_vals:
+        if v < 0:
+            cur_count += 1
+            cur_sum += v
+            if cur_sum < best_sum:
+                best_sum = cur_sum
+        else:
+            cur_count = 0
+            cur_sum = 0.0
+
+    return {
+        "بازه_بکتست_ماه": total_span_months,
+        "میانگین_سود_ماهانه": avg_ret,
+        "انحراف_معیار_سود_ماهانه": std_ret,
+        "بهترین_ماه_درصد": best,
+        "بدترین_ماه_درصد": worst,
+        "درصد_ماه‌های_سودده": pct_profitable,
+        "میانگین_سود_در_ماه‌های_سودده": avg_profit_months,
+        "میانگین_ضرر_در_ماه‌های_ضررده": avg_loss_months,
+        "بیشترین_ضرر_متوالی_ماهانه": best_streak,
+        "میانگین_تعداد_دوره_در_ماه": avg_trades,
+        "انحراف_معیار_تعداد_دوره": std_trades,
+        "حداکثر_افت_سرمایه_درصد": mdd,
+        "مدت_بازگشت_از_افت_ماه": recovery_months,
+        "ریسک_به_ریوارد_کلی": rr_overall,
+        "ریسک_به_ریوارد_ماه‌های_سوده": rr_profit_months,
+        "ریسک_به_ریوارد_ماه‌های_ضررده": rr_loss_months,
+        "حداکثر_ضرر_متوالی_درصد": best_sum,
+    }
+
+
+EXT_STATS_16_COLUMNS = [
+    "ریسک_به_ریوارد_کلی", "ریسک_به_ریوارد_ماه‌های_سوده", "ریسک_به_ریوارد_ماه‌های_ضررده",
+    "میانگین_سود_ماهانه", "انحراف_معیار_سود_ماهانه", "بهترین_ماه_درصد", "بدترین_ماه_درصد",
+    "درصد_ماه‌های_سودده", "میانگین_سود_در_ماه‌های_سودده", "میانگین_ضرر_در_ماه‌های_ضررده",
+    "بیشترین_ضرر_متوالی_ماهانه", "میانگین_تعداد_دوره_در_ماه", "انحراف_معیار_تعداد_دوره",
+    "حداکثر_افت_سرمایه_درصد", "مدت_بازگشت_از_افت_ماه", "حداکثر_ضرر_متوالی_درصد",
+]
+
+
 def percentile_rank(series: pd.Series) -> pd.Series:
     """رتبه‌بندی صدکی بین ۰ تا ۱۰۰ (مقدار بزرگ‌تر => رتبه بالاتر)."""
     if len(series) <= 1:
@@ -899,6 +1062,17 @@ def evaluate_group(
                 # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
                 روز_فعال = len(sorted_shared)
 
+            # [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد: از روی
+            # بازده‌ی سبد (مجموع اعضا) در هر دوره‌ی مشترک — همان period_sums
+            # که survival_rate/compensation_ratio بالا هم به‌عنوان «بازده‌ی
+            # سبد آن دوره» استفاده می‌کنند.
+            period_sums = returns.sum(axis=1)
+            dated_values = [
+                (idx.date() if hasattr(idx, "date") else idx, float(v))
+                for idx, v in period_sums.items()
+            ]
+            ext16 = _period_monthly_stats(dated_values)
+
             record = {
                 "coin_composition": coin_composition,
                 "signature": signature,
@@ -912,6 +1086,7 @@ def evaluate_group(
                 "بازه_زمانی_پایان": بازه_پایان.date().isoformat(),
                 "تعداد_روز_فعال": روز_فعال,
                 "تعداد_روز_کل_بازه": (بازه_پایان - بازه_شروع).days + 1,
+                **ext16,
             }
             if not abs_filters:
                 record["_passes_abs"] = passes_abs
@@ -1290,6 +1465,63 @@ def _quality_score(record: dict, global_arrays: dict) -> float:
     )
 
 
+# =============================================================================
+# [افزوده] سبد ثابت به‌ازای هر شرط خبری X
+# -----------------------------------------------------------------------------
+# مشکلی که این بخش حل می‌کند: در run_timeline/_resolve_segment، برای هر
+# رخداد واقعیِ یک شرط خبری X (نوع خبر+آستانه+مدل+سشن، فارغ از رژیم بازار)
+# برنده‌ی همان رخداد به‌تنهایی انتخاب می‌شد — که باعث می‌شد وقتی شرط X دوباره
+# (در تاریخ دیگری) رخ می‌دهد، سبد انتخابی عوض شود (چون کاندیدهای فعال هر
+# رخداد ممکن است متفاوت باشند). اینجا برعکس: برای هر شرط X، از میان تمام
+# کاندیدهایی که در *کل تاریخچه* برایش دیده شده‌اند (فارغ از کوین)، یک‌بار
+# برای همیشه یک سبد ثابت J (شامل کوین) بر اساس quality_score سراسری انتخاب
+# می‌شود.
+# =============================================================================
+
+def _condition_key(record: dict) -> str:
+    """شرط خبری X = signature رکورد (که در pool این ماژول از قبل بدون
+    پسوند رژیم بازار است، چون از امضا_بدون_رژیم ساخته شده) منهای پیشوند
+    coin_composition. کوین بخشی از خودِ سبد انتخابی J است، نه بخشی از شرط."""
+    prefix = record["coin_composition"] + "_"
+    sig = record["signature"]
+    return sig[len(prefix):] if sig.startswith(prefix) else sig
+
+
+def build_fixed_portfolio_per_condition(pool: list[dict]) -> list[dict]:
+    """برای هر شرط خبری X، دقیقاً یک سبد ثابت J (شامل کوین) از میان همه‌ی
+    کاندیدهای واجدشرایط (_passes_abs) کل تاریخچه، بر اساس quality_score
+    سراسری (که باید از قبل روی هر رکورد pool محاسبه شده باشد) انتخاب
+    می‌کند. خروجی: یک ردیف به‌ازای هر شرط X، به همراه فاصله‌ی امتیاز تا
+    نفر دوم (margin) و تعداد کاندیدهای رقیب، برای سنجش قاطعیت انتخاب."""
+    qualified = [r for r in pool if r.get("_passes_abs", True)]
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for r in qualified:
+        groups[_condition_key(r)].append(r)
+
+    rows = []
+    for condition, candidates in groups.items():
+        ranked = sorted(candidates, key=lambda r: r["quality_score"], reverse=True)
+        winner = ranked[0]
+        n_candidates = len(ranked)
+        margin = float(winner["quality_score"] - ranked[1]["quality_score"]) if n_candidates > 1 else float("inf")
+        rows.append({
+            "شرط_خبری_X": condition,
+            "coin_composition_ثابت": winner["coin_composition"],
+            "signature_کامل": winner["signature"],
+            "members": winner["members"],
+            "survival_rate": winner["survival_rate"],
+            "compensation_ratio": winner["compensation_ratio"],
+            "avg_return": winner["avg_return"],
+            "avg_correlation": winner["avg_correlation"],
+            "sample_count": winner["sample_count"],
+            "quality_score": winner["quality_score"],
+            "تعداد_کاندید_رقیب": n_candidates,
+            "فاصله_تا_نفر_دوم": margin,
+            **{k: winner.get(k, 0.0) for k in EXT_STATS_16_COLUMNS},
+        })
+    return rows
+
+
 def _evaluate_merge(
     active_items: list[dict],
     seg_start: pd.Timestamp,
@@ -1554,6 +1786,21 @@ def run_timeline(
     for record in pool:
         record["quality_score"] = _quality_score(record, global_arrays)
 
+    # [افزوده] سبد ثابت به‌ازای هر شرط خبری X (فارغ از رخداد/تاریخِ خاص) —
+    # خروجی مستقل از portfolios_timeline، چون منطقش متفاوت است: اینجا هر
+    # شرط دقیقاً یک ردیف/یک سبد ثابت دارد، نه یک ردیف به‌ازای هر بازه‌ی
+    # زمانیِ واقعی.
+    fixed_rows = build_fixed_portfolio_per_condition(pool)
+    fixed_df = pd.DataFrame(fixed_rows).sort_values("quality_score", ascending=False)
+    fixed_path = _save_dataframe(fixed_df, output_dir / "portfolios_fixed_per_condition")
+    n_ambiguous = 0
+    if not fixed_df.empty:
+        n_ambiguous = int(((fixed_df["تعداد_کاندید_رقیب"] > 1) & (fixed_df["فاصله_تا_نفر_دوم"] < 5.0)).sum())
+    log.info(
+        "سبد ثابت به‌ازای هر شرط: %s (%d شرط خبری X، %d مورد با فاصله‌ی امتیاز کمتر از ۵ تا نفر دوم — انتخاب مشکوک/شکننده).",
+        fixed_path, len(fixed_df), n_ambiguous,
+    )
+
     # ---- نمایه‌ی بازده‌ی خام هر strategy_id در هر release_date، برای محاسبه‌ی دقیق سبدهای ادغام‌شده ----
     returns_index = candidates.copy()
     returns_index["release_date"] = returns_index.apply(compute_release_date, axis=1)
@@ -1654,7 +1901,7 @@ def run_whole_time(
         "sample_count",
         # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد
         "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
-    ]
+    ] + EXT_STATS_16_COLUMNS
 
     if not all_portfolios:
         log.warning("هیچ سبدی در حالت کل بازه‌ی زمانی شرایط لازم را احراز نکرد.")
