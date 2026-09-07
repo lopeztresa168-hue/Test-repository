@@ -77,6 +77,36 @@ def load_signatures(signatures_dir: str) -> pd.DataFrame:
 
     data = pd.concat(frames, ignore_index=True)
     log.info(f"تعداد کل رکوردها: {len(data):,}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # [فیکس زمان واقعی — باگ کشف‌شده در combo_10day.py] ⚠️
+    # period_start/period_end/period_length_days خام فقط عدد نامزیِ برچسب
+    # هستند (مثلاً «۵ روز قبل از FOMC»)؛ در عمل combo_10day.py هر معامله را
+    # به نزدیک‌ترین رویدادِ خبریِ آینده/گذشته می‌چسباند بدون اینکه چک کند
+    # تاریخ خودِ معامله واقعاً داخل آن ۵ روز است یا نه — پس بازه‌ی واقعیِ
+    # جمع‌آوریِ معاملات می‌تواند ۳۰، ۸۰، یا حتی چند صد روز باشد، نه ۵ روز.
+    # نسخه‌ی اصلاح‌شده‌ی combo_10day.py حالا real_period_start /
+    # real_period_end / real_period_length_days را هم در JSONL ثبت می‌کند؛
+    # اگر این ستون‌ها موجود باشند، اینجا جایگزین نسخه‌ی نامزی می‌شوند تا هر
+    # معیاری که از این‌ها ساخته می‌شود (بازه‌ی بک‌تست گزارش‌شده در
+    # compute_raw_metrics، quality_score و غیره) روی بازه‌ی واقعی حساب
+    # شود. برای JSONLهای قدیمی (بدون این فیکس) رفتار قبلی حفظ می‌شود.
+    # ═══════════════════════════════════════════════════════════════════
+    if "real_period_start" in data.columns:
+        n_fixed = int(data["real_period_start"].notna().sum())
+        data["period_start"] = data["real_period_start"].where(
+            data["real_period_start"].notna(), data["period_start"]
+        )
+        log.info(f"[فیکس زمان واقعی] period_start برای {n_fixed:,} رکورد با بازه‌ی واقعی جایگزین شد.")
+    if "real_period_end" in data.columns:
+        data["period_end"] = data["real_period_end"].where(
+            data["real_period_end"].notna(), data["period_end"]
+        )
+    if "real_period_length_days" in data.columns and "period_length_days" in data.columns:
+        data["period_length_days"] = data["real_period_length_days"].where(
+            data["real_period_length_days"].notna(), data["period_length_days"]
+        )
+
     return data
 
 

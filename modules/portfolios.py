@@ -400,6 +400,34 @@ def load_signatures(signatures_dir: Path, signatures_filter: Optional[Path] = No
     data["strategy_id"] = data["strategy_folder"].astype(str)
     data["period_start"] = pd.to_datetime(data["period_start"])
     data["period_end"] = pd.to_datetime(data["period_end"])
+
+    # ═══════════════════════════════════════════════════════════════════
+    # [فیکس زمان واقعی — باگ کشف‌شده در combo_10day.py] ⚠️
+    # period_start/period_end/period_length_days خام فقط عدد نامزیِ برچسب
+    # هستند (مثلاً «۵ روز قبل از FOMC»)؛ combo_10day.py هر معامله را به
+    # نزدیک‌ترین رویدادِ خبری می‌چسباند بدون چک‌کردنِ اینکه تاریخ خودِ
+    # معامله واقعاً داخل آن ۵ روز است یا نه — پس این ستون‌ها مستقیماً وارد
+    # sweep-line و ساخت segmentهای portfolios_timeline.csv می‌شوند و
+    # ستون‌های «شروع»/«پایان»/«روز» را هم غلط نشان می‌دهند. نسخه‌ی
+    # اصلاح‌شده‌ی combo_10day.py حالا real_period_start/real_period_end/
+    # real_period_length_days را هم ثبت می‌کند؛ اگر موجود باشند، همین‌جا
+    # (یک‌بار، در نقطه‌ی بارگذاری) جایگزین نسخه‌ی نامزی می‌شوند تا تمام
+    # منطق پایین‌دستی (evaluate_group، run_timeline، sweep-line) خودکار
+    # روی بازه‌ی واقعی کار کند. برای JSONLهای قدیمی بدون این فیکس، رفتار
+    # قبلی حفظ می‌شود.
+    # ═══════════════════════════════════════════════════════════════════
+    if "real_period_start" in data.columns:
+        n_fixed = int(pd.to_datetime(data["real_period_start"], errors="coerce").notna().sum())
+        real_start = pd.to_datetime(data["real_period_start"], errors="coerce")
+        data["period_start"] = real_start.where(real_start.notna(), data["period_start"])
+        log.info("[فیکس زمان واقعی] period_start برای %d رکورد با بازه‌ی واقعی جایگزین شد.", n_fixed)
+    if "real_period_end" in data.columns:
+        real_end = pd.to_datetime(data["real_period_end"], errors="coerce")
+        data["period_end"] = real_end.where(real_end.notna(), data["period_end"])
+    if "real_period_length_days" in data.columns and "period_length_days" in data.columns:
+        real_len = pd.to_numeric(data["real_period_length_days"], errors="coerce")
+        data["period_length_days"] = real_len.where(real_len.notna(), data["period_length_days"])
+
     data["total_return"] = pd.to_numeric(data["total_return"], errors="coerce")
     data = data.dropna(subset=["total_return"])
 
@@ -1522,57 +1550,6 @@ def build_fixed_portfolio_per_condition(pool: list[dict]) -> list[dict]:
     return rows
 
 
-def build_fixed_condition_timeline(pool: list[dict]) -> pd.DataFrame:
-    """[جایگزین منطق قبلیِ run_timeline] «هر شرط خبری X فقط سبد ثابت J»:
-    به‌جای مقایسه‌ی رقبای فعال در هر تکه‌ی اتمی از زمان (که باعث می‌شد
-    انتخاب بین رخدادهای مختلف یک شرط ثابت عوض شود)، برای هر شرط X یک سبد
-    ثابت J از قبل با build_fixed_portfolio_per_condition مشخص شده؛ بازه‌های
-    واقعی‌ای که خودِ همان کاندیدِ برنده در طول تاریخ برایشان فعال بوده
-    (_intervals خودش) مستقیماً به‌عنوان ردیف‌های تایم‌لاین برگردانده می‌شوند
-    — همراه با ۱۶ ستون آماری.
-
-    نکته‌ی مهم: چون تصمیم هر شرط X حالا کاملاً مستقل از شرط‌های دیگر است
-    (نه وابسته به این‌که هم‌زمان چه کاندیدهای دیگری هم فعال بوده‌اند)، اگر
-    دو شرط خبری متفاوت (مثلاً CPI و PPI) در یک بازه‌ی تقویمی هم‌زمان رخ
-    داده باشند، هر دو به‌عنوان دو ردیف جدا (احتمالاً هم‌پوشان در تاریخ) در
-    خروجی می‌آیند — منطق «ادغام دو رقیب هم‌زمان» و «پرکننده‌شکاف» قبلی که
-    مخصوص مقایسه‌ی رقبا بود، در این حالت اصلاً موضوعیت ندارد و حذف شده."""
-    qualified = [r for r in pool if r.get("_passes_abs", True)]
-    groups: dict[str, list[dict]] = defaultdict(list)
-    for r in qualified:
-        groups[_condition_key(r)].append(r)
-
-    rows = []
-    for condition, candidates in groups.items():
-        ranked = sorted(candidates, key=lambda r: r["quality_score"], reverse=True)
-        winner = ranked[0]
-        n_candidates = len(ranked)
-        margin = float(winner["quality_score"] - ranked[1]["quality_score"]) if n_candidates > 1 else float("inf")
-        for start, end in winner.get("_intervals", []):
-            rows.append({
-                "شروع": pd.Timestamp(start).date().isoformat(),
-                "پایان": pd.Timestamp(end).date().isoformat(),
-                "روز": (pd.Timestamp(end) - pd.Timestamp(start)).days + 1,
-                "شرط_خبری_X": condition,
-                "coin_composition": winner["coin_composition"],
-                "signature": winner["signature"],
-                "members": winner["members"],
-                "quality_score": winner["quality_score"],
-                "survival_rate": winner["survival_rate"],
-                "compensation_ratio": winner["compensation_ratio"],
-                "avg_return": winner["avg_return"],
-                "avg_correlation": winner["avg_correlation"],
-                "sample_count": winner["sample_count"],
-                "تعداد_کاندید_رقیب": n_candidates,
-                "فاصله_تا_نفر_دوم": margin,
-                **{k: winner.get(k, 0.0) for k in EXT_STATS_16_COLUMNS},
-            })
-
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["شروع", "شرط_خبری_X"]).reset_index(drop=True)
-
-
 def _evaluate_merge(
     active_items: list[dict],
     seg_start: pd.Timestamp,
@@ -1822,11 +1799,10 @@ def run_timeline(
               len(pool), n_qualified, len(pool) - n_qualified)
 
     columns = [
-        "شروع", "پایان", "روز", "شرط_خبری_X", "coin_composition", "signature",
+        "شروع", "پایان", "روز", "حالت", "coin_composition", "signature",
         "members", "avg_return", "compensation_ratio", "survival_rate",
-        "avg_correlation", "quality_score", "sample_count",
-        "تعداد_کاندید_رقیب", "فاصله_تا_نفر_دوم",
-    ] + EXT_STATS_16_COLUMNS
+        "avg_correlation", "quality_score",
+    ]
 
     if not pool:
         log.warning("هیچ کاندیدی (حتی زیر آستانه) یافت نشد — جدول زمانی خالی خواهد بود.")
@@ -1839,9 +1815,9 @@ def run_timeline(
         record["quality_score"] = _quality_score(record, global_arrays)
 
     # [افزوده] سبد ثابت به‌ازای هر شرط خبری X (فارغ از رخداد/تاریخِ خاص) —
-    # جدول جداگانه: اینجا هر شرط دقیقاً یک ردیف/یک سبد ثابت دارد، نه یک
-    # ردیف به‌ازای هر بازه‌ی زمانیِ واقعی (که در پایین با
-    # build_fixed_condition_timeline ساخته می‌شود).
+    # خروجی مستقل از portfolios_timeline، چون منطقش متفاوت است: اینجا هر
+    # شرط دقیقاً یک ردیف/یک سبد ثابت دارد، نه یک ردیف به‌ازای هر بازه‌ی
+    # زمانیِ واقعی.
     fixed_rows = build_fixed_portfolio_per_condition(pool)
     fixed_df = pd.DataFrame(fixed_rows).sort_values("quality_score", ascending=False)
     fixed_path = _save_dataframe(fixed_df, output_dir / "portfolios_fixed_per_condition")
@@ -1853,26 +1829,22 @@ def run_timeline(
         fixed_path, len(fixed_df), n_ambiguous,
     )
 
-    # [اصلاح اساسی] portfolios_timeline دیگر با sweep-line/مقایسه‌ی رقبای
-    # فعال در هر تکه‌ی اتمی ساخته نمی‌شود (آن منطق باعث می‌شد سبد انتخابی
-    # برای یک شرط ثابت بین رخدادهای مختلف عوض شود). حالا مستقیماً از روی
-    # همان «سبد ثابت به‌ازای هر شرط» بالا: بازه‌های واقعیِ خودِ سبد ثابتِ هر
-    # شرط، به‌عنوان ردیف‌های تایم‌لاین برگردانده می‌شوند.
-    out_df = build_fixed_condition_timeline(pool)
+    # ---- نمایه‌ی بازده‌ی خام هر strategy_id در هر release_date، برای محاسبه‌ی دقیق سبدهای ادغام‌شده ----
+    returns_index = candidates.copy()
+    returns_index["release_date"] = returns_index.apply(compute_release_date, axis=1)
+    returns_lookup = (
+        returns_index.groupby(["strategy_id", "release_date"])["total_return"].mean()
+    )
+
+    segments = _build_timeline_segments(pool, returns_lookup, global_arrays)
+
+    out_df = pd.DataFrame(segments)
     if not out_df.empty:
         out_df = out_df[[c for c in columns if c in out_df.columns]]
-        total_days_covered = int(pd.to_datetime(out_df["پایان"]).sub(pd.to_datetime(out_df["شروع"])).dt.days.add(1).sum())
-        log.info(
-            "پوشش زمانی (ممکن است هم‌پوشان باشد چون شرط‌های مختلف مستقل‌اند): "
-            "%d ردیف برای %d شرط خبری X، مجموع %d روز-پوشش.",
-            len(out_df), out_df["شرط_خبری_X"].nunique(), total_days_covered,
-        )
-    else:
-        out_df = pd.DataFrame(columns=columns)
 
     output_path = output_dir / "portfolios_timeline"
     final_path = _save_dataframe(out_df, output_path)
-    log.info("ذخیره شد: %s (%d ردیف)", final_path, len(out_df))
+    log.info("ذخیره شد: %s (%d بازه‌ی نهایی پس از فشرده‌سازی)", final_path, len(out_df))
     return final_path
 
 

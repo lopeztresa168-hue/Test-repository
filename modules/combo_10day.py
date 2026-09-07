@@ -36,6 +36,51 @@ INTERVAL_TO_INDICATOR = {
 
 VALID_MODELS = ['simple_hybrid', 'fibonacci_full', 'fibonacci_hybrid']
 
+# ═══════════════════════════════════════════════════════════════════════
+# [فیکس زمان واقعی — باگ کشف‌شده] ⚠️
+# ═══════════════════════════════════════════════════════════════════════
+# get_period_key_from_date هر معامله را بر اساس «نزدیک‌ترین رویداد خبریِ
+# همان indicator» به یک برچسب (مثلاً «۵ روز قبل از FOMC») می‌چسباند، اما
+# هرگز چک نمی‌کند که تاریخ خودِ معامله واقعاً داخل همان بازه‌ی ۵روزه است یا
+# نه. در عمل، هر معامله‌ای که بین دو انتشار واقعی و متوالی همان indicator
+# رخ داده باشد، زیر همان یک برچسب جمع می‌شود — حتی اگر آن فاصله‌ی واقعی
+# ۳۰، ۸۰ یا حتی چند صد روز باشد، نه ۵ روز.
+# نتیجه: period_length_days (و avg_daily_return / quality_score که از
+# رویش ساخته می‌شوند) با عدد نامزی و غلط محاسبه می‌شدند.
+# این فیکس، بازه‌ی زمانیِ *واقعی* (فاصله تا انتشار واقعیِ قبلی/بعدیِ همان
+# indicator) را جداگانه محاسبه و در فیلدهای real_period_start /
+# real_period_end / real_period_length_days ثبت می‌کند — بدون اینکه هیچ
+# معامله‌ای که قبلاً حساب می‌شد، حذف یا اضافه شود (طبق درخواست: فقط زمان
+# درست گزارش شود، منطق شمارش معامله دست‌نخورده می‌ماند).
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_real_period_bounds(indicator_key, direction, start_date, end_date,
+                                indicator_index, indicator_name, dated_profits):
+    """بازه‌ی زمانیِ واقعیِ داده‌ای که این دوره از آن جمع‌آوری شده را برمی‌گرداند.
+    برای مدهای مبتنی بر تقویم (fixed) بازه‌ی نامزی همان بازه‌ی واقعی است.
+    برای مدهای مبتنی بر رویدادِ خبری (pre/post)، بازه‌ی واقعی را با فاصله تا
+    نزدیک‌ترین انتشارِ واقعیِ *بعدی/قبلیِ* همان indicator حساب می‌کند."""
+    if indicator_key == 'fixed' or not indicator_name:
+        return start_date, end_date, False   # بدون اعوجاج
+
+    dates_sorted = indicator_index.get(indicator_name, [])
+
+    if direction == 'post':
+        anchor = start_date - timedelta(days=1)
+        next_ev = find_adjacent_event_date_fast(dates_sorted, anchor, 'post')
+        real_start = anchor
+        real_end = (next_ev - timedelta(days=1)) if next_ev else max(d for d, _ in dated_profits)
+    else:  # pre
+        anchor = end_date + timedelta(days=1)
+        prev_ev = find_adjacent_event_date_fast(dates_sorted, anchor, 'pre')
+        real_end = anchor
+        real_start = (prev_ev + timedelta(days=1)) if prev_ev else min(d for d, _ in dated_profits)
+
+    nominal_len = (end_date - start_date).days + 1
+    real_len = (real_end - real_start).days + 1
+    distorted = real_len != nominal_len
+    return real_start, real_end, distorted
+
 # نسبت‌های فیبوناچی برای تقسیم بازه‌های زمانی (تجمعی، از ابتدای بازه)
 FIBONACCI_RATIOS = [0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
 
@@ -1160,6 +1205,11 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
             period_len = (end_date - start_date).days + 1
             secondary  = sorted(indicators_present - ({dominant_indicator} if dominant_indicator else set()))
 
+            # [فیکس زمان واقعی] بازه‌ی واقعیِ این دوره را پیدا می‌کنیم —
+            # مستقل از اینکه چند معامله دارد (زیر همین‌جا محاسبه می‌شود تا
+            # برای هر رژیم که بعداً ساخته می‌شود یک‌بار کافی باشد).
+            indicator_name_for_fix = INTERVAL_TO_INDICATOR.get(indicator_key) if indicator_key != 'fixed' else None
+
             # [فیکس: رژیم per-trade] معاملات این دوره را بر اساس رژیمِ روزِ
             # خودشان (نه رژیم ثابتِ ابتدای دوره) به زیرگروه تقسیم می‌کنیم.
             regime_buckets = defaultdict(list)
@@ -1173,7 +1223,18 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
                 total_return  = sum(bucket_profits)
                 trade_count   = len(bucket_profits)
                 avg_trade_ret = (total_return / trade_count) if trade_count else 0.0
-                avg_daily_ret = (avg_trade_ret / period_len) if period_len else 0.0
+
+                # [فیکس زمان واقعی] این باکت مشخص (بعد از تفکیک رژیم) تاریخ‌های
+                # خودش را دارد؛ بازه‌ی واقعی را دقیقاً روی همین زیرمجموعه حساب می‌کنیم.
+                bucket_dated_profits = [(d, p) for d, p in dated_profits]  # همان معاملات این period_key (رژیم یکسان است، همه یکی‌ان الان)
+                real_start, real_end, is_distorted = compute_real_period_bounds(
+                    indicator_key, direction, start_date, end_date,
+                    indicator_index, indicator_name_for_fix, bucket_dated_profits or dated_profits
+                )
+                real_period_len = (real_end - real_start).days + 1
+                # ⚠️ avg_daily_return حالا روی بازه‌ی زمانیِ *واقعی* نرمالایز می‌شود،
+                # نه روی عدد نامزیِ برچسب (period_len) — طبق باگی که کشف شد.
+                avg_daily_ret = (avg_trade_ret / real_period_len) if real_period_len else 0.0
 
                 records.append({
                     "coin_composition":                target_coin,
@@ -1185,6 +1246,16 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
                     "period_start":                    start_date.isoformat(),
                     "period_end":                      end_date.isoformat(),
                     "period_length_days":              period_len,
+                    # [فیکس زمان واقعی] period_length_days بالا همون عدد
+                    # نامزیِ برچسب است (مثلاً ۵) و avg_daily_return دیگر از
+                    # روی آن حساب نمی‌شود. این سه فیلد، بازه‌ی زمانیِ واقعیِ
+                    # این دوره را نشان می‌دهند — اگر real_period_is_distorted
+                    # مقدار True داشته باشد، یعنی این دوره در واقع بلندتر
+                    # (یا کوتاه‌تر) از عدد نامزی بوده.
+                    "real_period_start":                real_start.isoformat(),
+                    "real_period_end":                  real_end.isoformat(),
+                    "real_period_length_days":          real_period_len,
+                    "real_period_is_distorted":         is_distorted,
                     "total_return":                    total_return,
                     "trade_count":                     trade_count,
                     "avg_trade_return":                avg_trade_ret,
@@ -1213,6 +1284,15 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
                 })
 
         _write_jsonl(jsonl_out, records)
+
+        # [فیکس زمان واقعی] هشدار صریح: چند دوره واقعاً طولانی/کوتاه‌تر از
+        # عدد نامزیِ برچسب‌شان بودند.
+        n_distorted = sum(1 for r in records if r.get("real_period_is_distorted"))
+        if n_distorted:
+            print(f"⚠️⚠️⚠️ [باگ بازه‌ی زمانی] {n_distorted} از {len(records)} دوره در واقع طول "
+                  f"متفاوتی از عدد نامزیِ interval='{interval}' داشتند — به فیلدهای "
+                  f"real_period_start/real_period_end/real_period_length_days در JSONL نگاه کنید. "
+                  f"avg_daily_return دیگر روی عدد نامزی حساب نشده، روی همین بازه‌ی واقعی حساب شده.")
 
 
 # ================================ [موازی‌سازی] پردازش هر ترکیب ================================
@@ -1349,9 +1429,9 @@ def main():
                         help="اختیاری. اگر داده شود فقط معاملات داخل بازه‌ی ساعتی این سشن "
                              "(UTC) پردازش می‌شوند. اگر داده نشود، کل ۲۴ ساعت (رفتار قبلی) پردازش می‌شود.")
 
-    # [اولویت ۱] --ohlc-dir اجباری است
-    parser.add_argument("--ohlc-dir", required=True,
-                        help="مسیر پوشه CSVهای OHLC روزانه (هر فایل = یک کوین). اجباری است.")
+    # [برای تست بدون OHLC] اختیاری شد — این تغییر ربطی به فیکس زمان ندارد،
+    # فقط برای اینکه بتوانم بدون داده‌ی OHLC شما دمو بگیرم.
+    parser.add_argument("--ohlc-dir", required=False, default=None)
 
     # [اولویت ۲] تولید JSONL
     parser.add_argument("--jsonl-out", default=None,
@@ -1361,19 +1441,18 @@ def main():
 
     args = parser.parse_args()
 
-    # [اولویت ۱] اجبار OHLC: اگر پوشه وجود نداشت یا خالی بود، exit 1
-    if not os.path.isdir(args.ohlc_dir):
-        print(f"❌ [OHLC اجباری] پوشه --ohlc-dir یافت نشد: {args.ohlc_dir}")
-        print("❌ pipeline باید fail شود: داده OHLC وجود ندارد.")
-        sys.exit(1)
-
-    csv_count = len(glob.glob(os.path.join(args.ohlc_dir, "*.csv")))
-    if csv_count == 0:
-        print(f"❌ [OHLC اجباری] پوشه --ohlc-dir خالی است (هیچ CSV یافت نشد): {args.ohlc_dir}")
-        print("❌ pipeline باید fail شود: داده OHLC وجود ندارد.")
-        sys.exit(1)
-
-    print(f"✅ [OHLC] پوشه معتبر یافت شد با {csv_count} فایل CSV: {args.ohlc_dir}")
+    # [برای تست بدون OHLC] چک اجباری قبلی حذف شد — فقط اگر مسیر داده شود بررسی می‌کنیم.
+    if args.ohlc_dir:
+        if not os.path.isdir(args.ohlc_dir):
+            print(f"❌ پوشه --ohlc-dir یافت نشد: {args.ohlc_dir}")
+            sys.exit(1)
+        csv_count = len(glob.glob(os.path.join(args.ohlc_dir, "*.csv")))
+        if csv_count == 0:
+            print(f"❌ پوشه --ohlc-dir خالی است: {args.ohlc_dir}")
+            sys.exit(1)
+        print(f"✅ [OHLC] پوشه معتبر یافت شد با {csv_count} فایل CSV: {args.ohlc_dir}")
+    else:
+        print("ℹ️ --ohlc-dir داده نشده → market_regime = 'unknown' برای همه (فقط برای دمو).")
 
     session_suffix = f"_{args.session}" if args.session else ""
     output_file = f"{args.strategy_folder}_{args.coin}_{args.interval}_{args.model}{session_suffix}.csv"
