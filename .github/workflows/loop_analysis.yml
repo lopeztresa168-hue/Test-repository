@@ -1708,6 +1708,7 @@ jobs:
           fi
 
       - name: فراخوانی analysis_golden.yml
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1824,6 +1825,7 @@ jobs:
           fi
 
       - name: فراخوانی analysis_portfolios.yml
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
