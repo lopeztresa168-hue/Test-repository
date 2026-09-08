@@ -1,0 +1,81 @@
+name: Export Market Regime History
+
+# ورک‌فلوی جدید و مستقل — هیچ فایل موجودی را تغییر نمی‌دهد.
+# منبع دانلود داده خام OHLC دقیقاً همان چیزی است که loop_analysis.yml
+# استفاده می‌کند: مخزن OHLC_REPO (secret)، مسیر data/All_Coins_Combined،
+# با sparse-checkout (فقط همان پوشه، بدون دانلود کل مخزن).
+#
+# خروجی: یک CSV با تاریخچه کامل روزانه‌ی market_regime (unknown/volatile/
+# trending_up/trending_down/ranging) برای هر کوین درخواستی، به‌عنوان
+# artifact قابل دانلود از صفحه‌ی run در تب Actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      coins:
+        description: >-
+          لیست کوین‌ها با فاصله جدا شده (مثل "XRPUSDT BTCUSDT").
+          خالی بگذارید تا رژیم همه کوین‌های موجود در OHLC_REPO محاسبه شود.
+        required: false
+        default: "XRPUSDT"
+
+permissions:
+  contents: read
+
+jobs:
+  export-regime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout این مخزن (برای دسترسی به scripts/export_regime.py)
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: راه‌اندازی پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: نصب وابستگی‌ها
+        run: |
+          pip install pandas numpy --quiet --break-system-packages 2>&1 || \
+          pip install pandas numpy --quiet
+
+      - name: پاکسازی فضای موقت
+        run: |
+          rm -rf /tmp/ohlc_repo 2>/dev/null || true
+
+      - name: Clone مخزن OHLC (sparse — فقط data/All_Coins_Combined)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          OHLC_REPO: ${{ secrets.OHLC_REPO }}
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${OHLC_REPO}.git" /tmp/ohlc_repo
+          cd /tmp/ohlc_repo
+          git sparse-checkout set data/All_Coins_Combined
+          COUNT=$(find data/All_Coins_Combined -maxdepth 1 -name "*.csv" | wc -l)
+          echo "📊 تعداد فایل OHLC دانلود شده: $COUNT"
+
+      - name: اجرای export_regime.py
+        run: |
+          {
+            if [ -n "${{ github.event.inputs.coins }}" ]; then
+              python scripts/export_regime.py \
+                --ohlc-dir /tmp/ohlc_repo/data/All_Coins_Combined \
+                --coins ${{ github.event.inputs.coins }} \
+                --output market_regime_history.csv
+            else
+              python scripts/export_regime.py \
+                --ohlc-dir /tmp/ohlc_repo/data/All_Coins_Combined \
+                --output market_regime_history.csv
+            fi
+          }
+
+      - name: آپلود artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-regime-history
+          path: market_regime_history.csv
+          retention-days: 14
