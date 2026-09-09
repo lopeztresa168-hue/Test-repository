@@ -570,6 +570,17 @@ def _build_indicator_date_index(news_events):
     return {ind: sorted(dates) for ind, dates in by_indicator.items()}
 
 
+def _build_event_by_indicator_date(news_events):
+    """یک‌بار برای کل اجرا: (indicator, date) → رویداد. برای پیدا کردن مقدار
+    actual/forecast «همان» خبری که یک دوره‌ی pre/post به آن لنگر شده - بدون
+    نیاز به اسکن یا مقایسه با رویدادهای شاخص‌های دیگر."""
+    result = {}
+    for ev in news_events:
+        if ev["date"] is not None:
+            result[(ev["indicator"], ev["date"])] = ev
+    return result
+
+
 def _build_sorted_event_index(news_events):
     """یک‌بار برای کل اجرا: رویدادها را بر اساس تاریخ مرتب می‌کند تا بازه‌جویی
     با bisect ممکن شود (برای compute_indicator_status_for_period و events_in_range)."""
@@ -752,7 +763,20 @@ def get_period_key_from_date(date, interval, news_events, model='simple_hybrid',
 
 
 def compute_indicator_status_for_period(start_date, end_date, news_events,
-                                         sorted_index=None):
+                                         sorted_index=None, allow_actual=True):
+    """وضعیت Good/Bad/Neutral هر شاخص را برای یک دوره حساب می‌کند.
+
+    [پاک‌سازی آینده‌نگری - مسیر CSV] این تابع قبلاً بدون توجه به جهت دوره
+    (pre/post) از actual تمام رویدادهای داخل بازه استفاده می‌کرد. برای
+    دوره‌های «pre» (مثل FOMC_pre_5d)، actual خبرها در لحظه‌ی شروع معامله
+    هنوز در دسترس نیست، پس فراخواننده باید allow_actual=False پاس بدهد؛
+    در این حالت هیچ actual ای خوانده نمی‌شود و status هر شاخص None
+    برمی‌گردد (یعنی معادل نبود خبر) — به‌جای ساختن الگوی Good/Bad/Neutral
+    ساختگی از داده‌ای که هنوز رخ نداده. برای «post» و «fixed»، actual در
+    لحظه‌ی شروع دوره از قبل منتشر شده و allow_actual=True مجاز است."""
+    if not allow_actual:
+        return {ind: None for ind in INDICATORS}
+
     if sorted_index is not None:
         sorted_dates, sorted_events = sorted_index
         events_in_range = _events_in_range_fast(sorted_dates, sorted_events, start_date, end_date)
@@ -887,22 +911,32 @@ def normalize_symbol(sym):
     return re.sub(r'-\d+[mhdwM]$', '', str(sym).strip()).upper()
 
 
-def _importance(actual, forecast, distance_days):
-    if actual is None or forecast is None:
-        return None
-    d = distance_days if distance_days is not None else 0
-    return abs(actual - forecast) * (1.0 / (d + 1))
-
-
 def process_analysis(trades_json_path, news_dir, interval, target_coin,
                      chunk_start, chunk_end, output_path, model,
                      ohlc_dir=None, jsonl_out=None, min_sample_count=1,
-                     session=None, strategy_folder=""):
+                     session=None, strategy_folder="",
+                     min_importance=None, min_forecast=None):
     """
     تحلیل اصلی.
     [اولویت ۱] ohlc_dir اجباری است — بدون آن، پردازش ادامه می‌یابد اما
     market_regime همه "unknown" خواهد بود (چون enforce در main() است).
     [اولویت ۲] اگر jsonl_out داده شده باشد، فایل JSONL نیز تولید می‌شود.
+
+    [پاک‌سازی آینده‌نگری - فیلتر مبتنی‌بر خودِ خبر لنگر]
+    min_importance: فقط برای دوره‌های «_post_» به‌کار می‌رود. در لحظه‌ی شروع
+        معامله (بعد از انتشار خبر)، عدد actual همان خبرِ لنگرِ دوره در دسترس
+        است، پس مجاز است برای فیلتر کردن دوره‌ها استفاده شود. دوره‌ای که
+        |actual| خبر لنگرش کمتر از این مقدار باشد (یا اصلاً actual نداشته
+        باشد) از خروجی حذف می‌شود. اگر None باشد، هیچ فیلتری اعمال نمی‌شود.
+    min_forecast: فقط برای دوره‌های «_pre_» به‌کار می‌رود. در لحظه‌ی شروع
+        معامله (قبل از انتشار خبر)، actual در دسترس نیست و هرگز برای فیلتر
+        دوره‌های pre استفاده نمی‌شود؛ تنها forecast خبر لنگر (که پیشاپیش
+        منتشر شده) مجاز است. دوره‌ای که |forecast| خبر لنگرش کمتر از این
+        مقدار باشد (یا اصلاً forecast نداشته باشد) از خروجی حذف می‌شود.
+        اگر None باشد (پیش‌فرض)، همه‌ی دوره‌های pre بدون فیلتر نگه داشته
+        می‌شوند.
+    هر دو پارامتر فقط روی خودِ خبرِ لنگرِ آن دوره (تک‌شاخصی) اعمال می‌شوند؛
+    هیچ مقایسه‌ای بین شاخص‌های مختلف (مثل PPI در برابر CPI) صورت نمی‌گیرد.
     """
 
     # ---------- بارگذاری OHLC ----------
@@ -1045,6 +1079,9 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
     # - sorted_event_index: برای بازه‌جویی events_in_range با bisect
     indicator_index    = _build_indicator_date_index(news_events)
     sorted_event_index = _build_sorted_event_index(news_events)
+    # [پاک‌سازی آینده‌نگری] ایندکس (indicator, date) → رویداد، صرفاً برای
+    # پیدا کردن *همان* خبرِ لنگرِ هر دوره (نه مقایسه بین شاخص‌های مختلف).
+    event_by_indicator_date = _build_event_by_indicator_date(news_events)
 
     # ---------- مرحله ۴: گروه‌بندی معاملات بر اساس بازه زمانی ----------
     # [بهینه‌سازی سرعت] get_period_key_from_date فقط به تاریخ معامله وابسته است،
@@ -1083,6 +1120,16 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
     # period_returns (فقط برای CSV الگوی خبری، بی‌ربط به رژیم) مثل قبل مجموع کل دوره است.
     period_returns = {period: sum(p for _, p in profits) for period, profits in period_groups.items()}
 
+    # [پاک‌سازی آینده‌نگری - مسیر CSV] جهت این اجرا (pre/post/fixed) یک‌بار
+    # از interval پارس می‌شود. برای دوره‌های «pre»، actual هیچ رویدادی —
+    # نه فقط خبر لنگر — نباید وارد محاسبه‌ی status شود، چون در لحظه‌ی شروع
+    # معامله (قبل از انتشار خبر) هنوز رخ نداده است.
+    _parsed_iv_for_status = parse_interval(interval)
+    _run_direction = _parsed_iv_for_status[1] if _parsed_iv_for_status else None
+    allow_actual_in_status = (_run_direction != 'pre')
+    if not allow_actual_in_status:
+        print("ℹ️ interval از نوع pre است → actual در محاسبه‌ی وضعیت خبری CSV استفاده نمی‌شود (آینده‌نگری حذف شد).")
+
     # ---------- مرحله ۵: محاسبه وضعیت خبری هر دوره ----------
     period_status = {}
     for period_key, ret in period_returns.items():
@@ -1096,7 +1143,8 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
         except ValueError:
             continue
         status = compute_indicator_status_for_period(
-            start_date, end_date, news_events, sorted_index=sorted_event_index
+            start_date, end_date, news_events, sorted_index=sorted_event_index,
+            allow_actual=allow_actual_in_status
         )
         period_status[period_key] = (status, ret, start_date, end_date)
 
@@ -1185,30 +1233,51 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
             sorted_dates, sorted_events = sorted_event_index
             events_in_range = _events_in_range_fast(sorted_dates, sorted_events, start_date, end_date)
 
-            # ویژگی‌های خبری در سطح کل دوره محاسبه می‌شوند — بی‌ربط به رژیم، بدون تغییر.
-            dominant_indicator = None
-            dominant_score = -1.0
-            diffs_all = []
-            indicators_present = set()
-            for ev in events_in_range:
-                indicators_present.add(ev["indicator"])
-                if ev["actual"] is None or ev["forecast"] is None:
-                    continue
-                diff = ev["actual"] - ev["forecast"]
-                diffs_all.append(diff)
-                d_days = abs((ev["date"] - start_date).days)
-                score = _importance(ev["actual"], ev["forecast"], d_days)
-                if score is not None and score > dominant_score:
-                    dominant_score = score
-                    dominant_indicator = ev["indicator"]
-
-            period_len = (end_date - start_date).days + 1
-            secondary  = sorted(indicators_present - ({dominant_indicator} if dominant_indicator else set()))
-
             # [فیکس زمان واقعی] بازه‌ی واقعیِ این دوره را پیدا می‌کنیم —
             # مستقل از اینکه چند معامله دارد (زیر همین‌جا محاسبه می‌شود تا
             # برای هر رژیم که بعداً ساخته می‌شود یک‌بار کافی باشد).
             indicator_name_for_fix = INTERVAL_TO_INDICATOR.get(indicator_key) if indicator_key != 'fixed' else None
+
+            # ═══════════════════════════════════════════════════════════
+            # [پاک‌سازی آینده‌نگری] فیلتر مبتنی‌بر خودِ خبرِ لنگرِ این دوره
+            # (تک‌شاخصی، بدون مقایسه با شاخص‌های دیگر) — dominant_indicator
+            # قبلی که بین شاخص‌ها مقایسه می‌کرد کاملاً حذف شده است.
+            # ═══════════════════════════════════════════════════════════
+            if indicator_name_for_fix and direction in ('post', 'pre'):
+                if direction == 'post':
+                    # خبر لنگر post دقیقاً یک روز قبل از start_date منتشر شده
+                    # (نگاه کنید به get_period_key_from_date). در لحظه‌ی شروع
+                    # معامله (start_date به بعد)، actual همین خبر در دسترس
+                    # است، پس فیلتر کردن بر مبنای آن آینده‌نگری نیست.
+                    anchor_date = start_date - timedelta(days=1)
+                    anchor_event = event_by_indicator_date.get((indicator_name_for_fix, anchor_date))
+                    if min_importance is not None:
+                        anchor_actual = anchor_event["actual"] if anchor_event else None
+                        if anchor_actual is None or abs(anchor_actual) < min_importance:
+                            continue
+                else:  # pre
+                    # خبر لنگر pre دقیقاً یک روز بعد از end_date منتشر می‌شود
+                    # و در لحظه‌ی شروع معامله هنوز actual آن وجود ندارد؛ actual
+                    # این خبر هرگز برای فیلتر دوره‌های pre استفاده نمی‌شود —
+                    # فقط forecast (که پیشاپیش منتشر شده) مجاز است.
+                    anchor_date = end_date + timedelta(days=1)
+                    anchor_event = event_by_indicator_date.get((indicator_name_for_fix, anchor_date))
+                    if min_forecast is not None:
+                        anchor_forecast = anchor_event["forecast"] if anchor_event else None
+                        if anchor_forecast is None or abs(anchor_forecast) < min_forecast:
+                            continue
+
+            # ویژگی‌های خبری توصیفیِ این دوره (indicators_present/diff_avg/
+            # diff_std) — صرفاً آمار، در انتخاب/حذف دوره‌ای نقشی ندارند و
+            # هیچ شاخصی را در برابر شاخص دیگر «برنده» اعلام نمی‌کنند.
+            diffs_all = []
+            indicators_present = set()
+            for ev in events_in_range:
+                indicators_present.add(ev["indicator"])
+                if ev["actual"] is not None and ev["forecast"] is not None:
+                    diffs_all.append(ev["actual"] - ev["forecast"])
+
+            period_len = (end_date - start_date).days + 1
 
             # [فیکس: رژیم per-trade] معاملات این دوره را بر اساس رژیمِ روزِ
             # خودشان (نه رژیم ثابتِ ابتدای دوره) به زیرگروه تقسیم می‌کنیم.
@@ -1260,9 +1329,7 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
                     "trade_count":                     trade_count,
                     "avg_trade_return":                avg_trade_ret,
                     "avg_daily_return":                avg_daily_ret,
-                    "dominant_indicator":              dominant_indicator,
-                    "dominant_indicator_importance":   (dominant_score if dominant_score >= 0 else None),
-                    "secondary_indicators":            secondary,
+                    "indicators_present":              sorted(indicators_present),
                     "diff_avg":    (statistics.mean(diffs_all) if diffs_all else None),
                     "diff_std":    (statistics.pstdev(diffs_all) if len(diffs_all) > 1 else (0.0 if diffs_all else None)),
                     "event_count":         len(events_in_range),
@@ -1439,6 +1506,17 @@ def main():
     parser.add_argument("--min-sample-count", type=int, default=1,
                         help="حداقل تعداد معامله در هر دوره برای ثبت در JSONL.")
 
+    # [پاک‌سازی آینده‌نگری] فیلترهای صریح و تک‌شاخصی، جایگزین dominant_indicator
+    parser.add_argument("--min-importance", type=float, default=None,
+                        help="فقط برای دوره‌های _post_. حداقل |actual| مجاز خبر "
+                             "لنگرِ هر دوره (actual در لحظه‌ی post در دسترس است). "
+                             "اگر داده نشود، فیلتری اعمال نمی‌شود.")
+    parser.add_argument("--min-forecast", type=float, default=None,
+                        help="فقط برای دوره‌های _pre_. حداقل |forecast| مجاز خبر "
+                             "لنگرِ هر دوره (actual در لحظه‌ی pre هنوز در دسترس "
+                             "نیست و هرگز استفاده نمی‌شود). اگر داده نشود، همه‌ی "
+                             "دوره‌های pre بدون فیلتر نگه داشته می‌شوند.")
+
     args = parser.parse_args()
 
     # [برای تست بدون OHLC] چک اجباری قبلی حذف شد — فقط اگر مسیر داده شود بررسی می‌کنیم.
@@ -1472,6 +1550,8 @@ def main():
         min_sample_count=args.min_sample_count,
         session=args.session,
         strategy_folder=args.strategy_folder,
+        min_importance=args.min_importance,
+        min_forecast=args.min_forecast,
     )
 
 

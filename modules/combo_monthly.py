@@ -622,13 +622,6 @@ def normalize_symbol(sym):
     return re.sub(r'-\d+[mhdwM]$', '', str(sym).strip()).upper()
 
 
-def _importance(actual, forecast, distance_days):
-    if actual is None or forecast is None:
-        return None
-    d = distance_days if distance_days is not None else 0
-    return abs(actual - forecast) * (1.0 / (d + 1))
-
-
 def process_analysis(trades_json_path, news_dir, target_coin,
                      chunk_start, chunk_end, output_path, model,
                      ohlc_dir=None, jsonl_out=None, min_sample_count=1,
@@ -884,26 +877,17 @@ def process_analysis(trades_json_path, news_dir, target_coin,
             sorted_dates, sorted_events = sorted_event_index
             events_in_range = _events_in_range_fast(sorted_dates, sorted_events, start_date, end_date)
 
-            # ویژگی‌های خبری (dominant_indicator و غیره) در سطح کل ماه محاسبه
-            # می‌شوند — این بخش به رژیم ربطی ندارد و تغییری نکرده است.
-            dominant_indicator = None
-            dominant_score = -1.0
+            # ویژگی‌های خبری توصیفیِ این ماه — صرفاً آمار (dominant_indicator
+            # قبلی که بر اساس مقایسه‌ی |actual-forecast| بین شاخص‌های مختلف
+            # یکی را «غالب» اعلام می‌کرد، کاملاً حذف شده است).
             diffs_all = []
             indicators_present = set()
             for ev in events_in_range:
                 indicators_present.add(ev["indicator"])
-                if ev["actual"] is None or ev["forecast"] is None:
-                    continue
-                diff = ev["actual"] - ev["forecast"]
-                diffs_all.append(diff)
-                d_days = abs((ev["date"] - start_date).days)
-                score = _importance(ev["actual"], ev["forecast"], d_days)
-                if score is not None and score > dominant_score:
-                    dominant_score = score
-                    dominant_indicator = ev["indicator"]
+                if ev["actual"] is not None and ev["forecast"] is not None:
+                    diffs_all.append(ev["actual"] - ev["forecast"])
 
             period_len = (end_date - start_date).days + 1
-            secondary  = sorted(indicators_present - ({dominant_indicator} if dominant_indicator else set()))
 
             # [فیکس: رژیم per-trade] معاملات این ماه را بر اساس رژیمِ روزِ
             # خودشان (نه رژیم ثابتِ ابتدای ماه) به زیرگروه تقسیم می‌کنیم.
@@ -920,6 +904,14 @@ def process_analysis(trades_json_path, news_dir, target_coin,
                 avg_trade_ret = (total_return / trade_count) if trade_count else 0.0
                 avg_daily_ret = (avg_trade_ret / period_len) if period_len else 0.0
 
+                # [فیکس زمان واقعی] در combo_10day.py period_length_days نامزی
+                # بود چون دوره بر اساس «نزدیک‌ترین رویداد خبری» لنگر می‌شد و
+                # می‌توانست با فاصله‌ی واقعی تا رویداد بعدی/قبلی فرق کند. اینجا
+                # (combo_monthly.py) چنین ابهامی اصلاً وجود ندارد: start_date/
+                # end_date همان اول و آخر تقویمیِ همین ماه‌اند — یعنی از قبل
+                # خودشان بازه‌ی واقعی‌اند، نه یک برچسبِ نزدیک به رویداد خبری.
+                # این فیلدها فقط برای یکسان بودن ساختار خروجی با combo_10day.py
+                # اضافه شده‌اند و همیشه real_period_is_distorted=False خواهند بود.
                 records.append({
                     "coin_composition":                target_coin,
                     "model":                           model,
@@ -930,13 +922,15 @@ def process_analysis(trades_json_path, news_dir, target_coin,
                     "period_start":                    start_date.isoformat(),
                     "period_end":                      end_date.isoformat(),
                     "period_length_days":              period_len,
+                    "real_period_start":               start_date.isoformat(),
+                    "real_period_end":                 end_date.isoformat(),
+                    "real_period_length_days":         period_len,
+                    "real_period_is_distorted":        False,
                     "total_return":                    total_return,
                     "trade_count":                     trade_count,
                     "avg_trade_return":                avg_trade_ret,
                     "avg_daily_return":                avg_daily_ret,
-                    "dominant_indicator":              dominant_indicator,
-                    "dominant_indicator_importance":   (dominant_score if dominant_score >= 0 else None),
-                    "secondary_indicators":            secondary,
+                    "indicators_present":              sorted(indicators_present),
                     "diff_avg":    (statistics.mean(diffs_all) if diffs_all else None),
                     "diff_std":    (statistics.pstdev(diffs_all) if len(diffs_all) > 1 else (0.0 if diffs_all else None)),
                     "event_count":         len(events_in_range),
