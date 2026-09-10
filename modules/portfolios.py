@@ -229,7 +229,6 @@ def build_signature(row: pd.Series) -> str:
     if regime is None or (isinstance(regime, float) and pd.isna(regime)) or regime == "":
         regime = "unknown"
     coin = row.get("coin_composition", "")
-    indicator = row.get("dominant_indicator", "")
     position = row.get("position")
     if position is None or (isinstance(position, float) and pd.isna(position)):
         position = "none"
@@ -250,10 +249,15 @@ def build_signature(row: pd.Series) -> str:
     # باید کلمه‌به‌کلمه با golden.py یکی بماند (همان‌طور که بالاتر مستند شده)،
     # وگرنه merge در prefilter_candidates دوباره بی‌صدا صفر می‌شود.
     # توضیح کامل فیکس در build_signature معادلِ golden.py آمده است.
+    # ========== [پاک‌سازی آینده‌نگری] حذف dominant_indicator از امضا ==========
+    # قبلاً یک قطعه‌ی جدا («indicator» از dominant_indicator) هم داخل امضا بود
+    # — این فیلد از combo_10day.py/combo_monthly.py کاملاً حذف شده (مقایسه‌ی
+    # آینده‌نگر بین شاخص‌ها بود)، پس این قطعه هم از امضا حذف شده — باید عیناً
+    # مطابق golden.py بماند.
     indicator_key = row.get("indicator_key")
     if indicator_key is None or (isinstance(indicator_key, float) and pd.isna(indicator_key)) or indicator_key == "":
         indicator_key = "none"
-    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}_{indicator_key}"
+    return f"{coin}_{position}_{distance}_{model}_{session}_{regime}_{indicator_key}"
 
 
 # ========== [فیکس run_whole_time]: golden.py معادل «بدون رژیم» امضا را با
@@ -336,8 +340,11 @@ def load_signatures(signatures_dir: Path, signatures_filter: Optional[Path] = No
     # ========== رفع باگ: ستون "signature" هیچ‌وقت در JSONL خام وجود ندارد ==========
     # درست مثل golden.py، اینجا هم باید signature از روی فیلدهای خام ساخته شود؛
     # قبلاً این مرحله جا افتاده بود و کد فقط انتظار داشت ستون از قبل موجود باشد.
+    # [پاک‌سازی آینده‌نگری] "dominant_indicator" از این لیست حذف شد — دیگر در
+    # JSONL خام وجود ندارد (combo_10day.py/combo_monthly.py آن را کاملاً حذف
+    # کرده‌اند)؛ build_signature هم دیگر از آن استفاده نمی‌کند.
     base_signature_cols = {
-        "coin_composition", "dominant_indicator", "position",
+        "coin_composition", "position",
         "distance_days", "model", "market_regime",
     }
     missing_base = base_signature_cols - set(data.columns)
@@ -1339,9 +1346,13 @@ def run(
             result, raw_count = evaluate_group(coin_composition, signature, group, top_n)
             # استخراج مستقیم شاخص خبری از خود داده (نه parse رشته‌ی signature) —
             # همه‌ی رکوردهای یک گروه (coin_composition, signature) طبق ساخت
-            # build_signature همیشه یک dominant_indicator یکسان دارند.
+            # build_signature همیشه یک anchor_indicator یکسان دارند.
+            # [پاک‌سازی آینده‌نگری] قبلاً از dominant_indicator (مقایسه‌ی
+            # آینده‌نگرِ بین شاخص‌ها) استفاده می‌شد؛ حالا از anchor_indicator
+            # (شاخصی که خودِ دوره بر اساس آن anchor شده — combo_10day.py) که
+            # کاملاً بدون آینده‌نگری است.
             if result:
-                ind_val = group["dominant_indicator"].iloc[0] if "dominant_indicator" in group.columns else ""
+                ind_val = group["anchor_indicator"].iloc[0] if "anchor_indicator" in group.columns else ""
                 ind_val = "" if pd.isna(ind_val) else str(ind_val)
                 for rec in result:
                     rec["شاخص_خبری"] = ind_val

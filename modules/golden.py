@@ -268,7 +268,6 @@ def build_signature(row: pd.Series) -> str:
     if regime is None or (isinstance(regime, float) and pd.isna(regime)) or regime == "":
         regime = "unknown"
     coin = row.get("coin_composition", "")
-    indicator = row.get("dominant_indicator", "")
     position = row.get("position")
     if position is None or (isinstance(position, float) and pd.isna(position)):
         position = "none"
@@ -285,19 +284,19 @@ def build_signature(row: pd.Series) -> str:
     # ========== فیکس: تصادم signature بین anchorهای خبری متفاوت ==========
     # indicator_key (خروجی parse_interval در combo_10day.py: 'CPI','PPI',
     # 'CorePPI','FOMC','CPI_y_y','fixed', یا None برای combo_monthly.py)
-    # نشان می‌دهد این دوره بر اساس کدام رویداد خبری anchor شده. این با
-    # dominant_indicator فرق دارد: dominant_indicator خبر غالبِ *داخل* دوره
-    # است و می‌تواند None باشد حتی وقتی anchor واقعی CPI یا PPI یا FOMC بوده
-    # (چون داخل آن دوره‌ی خاص خبر مهم دیگری رخ نداده). قبل از این فیکس،
-    # چون indicator_key اصلاً در signature نبود، دوره‌های anchor‌شده به CPI،
-    # PPI، FOMC و غیره که هرکدام دومیننت=None داشتند، همه زیر یک signature
-    # یکسان (مثلاً "..._None_post_10.0_simple_hybrid_none") قاطی می‌شدند —
-    # یعنی golden.py/portfolios.py داده‌ی سه‌بازار خبری کاملاً متفاوت را به
-    # اشتباه به‌عنوان یک استراتژی واحد امتیازدهی/ترکیب می‌کرد.
+    # نشان می‌دهد این دوره بر اساس کدام رویداد خبری anchor شده — این تنها
+    # هویت شاخصیِ معتبر یک دوره است.
+    # ========== [پاک‌سازی آینده‌نگری] حذف dominant_indicator از امضا ==========
+    # قبلاً یک قطعه‌ی جدا («indicator» از dominant_indicator) هم داخل امضا
+    # بود: خبرِ غالبِ *داخل* دوره، بر اساس مقایسه‌ی |actual-forecast| بین
+    # شاخص‌های مختلف. آن منطق کاملاً از combo_10day.py/combo_monthly.py حذف
+    # شد (چون هم آینده‌نگر بود، هم بین شاخص‌ها مقایسه می‌کرد)، پس دیگر چنین
+    # فیلدی در JSONL خام وجود ندارد و این قطعه از امضا هم حذف شده — indicator_key
+    # به‌تنهایی هویت شاخصیِ دوره را کامل و بدون آینده‌نگری مشخص می‌کند.
     indicator_key = row.get("indicator_key")
     if indicator_key is None or (isinstance(indicator_key, float) and pd.isna(indicator_key)) or indicator_key == "":
         indicator_key = "none"
-    return f"{coin}_{indicator}_{position}_{distance}_{model}_{session}_{regime}_{indicator_key}"
+    return f"{coin}_{position}_{distance}_{model}_{session}_{regime}_{indicator_key}"
 
 
 # ---------------------------------------------------------------------------
@@ -534,13 +533,17 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
     if "period_length_days" in group.columns:
         active_days_sum = int(pd.to_numeric(group["period_length_days"], errors="coerce").fillna(0).sum())
 
-    # میانگین شدت «تعجب خبری» (|actual-forecast|) شاخص غالب این گروه — از
-    # dominant_indicator_importance که در JSONL خام موجود است ولی قبلاً اینجا
-    # هیچ‌وقت استفاده نمی‌شد. مقادیر None (رویدادهای هنوز-منتشرنشده، مثلاً
-    # دوره‌های pre-release) نادیده گرفته می‌شوند؛ اگر هیچ مقدار معتبری نبود،
-    # NaN می‌ماند (بعداً در normalize_metrics خنثی/neutral پر می‌شود).
-    if "dominant_indicator_importance" in group.columns:
-        imp_vals = pd.to_numeric(group["dominant_indicator_importance"], errors="coerce").dropna()
+    # میانگین شدت «تعجب خبری» (|anchor_actual-anchor_forecast|) خبرِ لنگرِ
+    # این گروه — از anchor_importance که در JSONL خام موجود است. برخلاف
+    # dominant_indicator_importance قبلی (که بین شاخص‌های مختلف مقایسه
+    # می‌کرد و برای دوره‌های pre هم از actual استفاده می‌کرد)، anchor_importance
+    # همیشه تک‌شاخصی و غیر-آینده‌نگر است: برای دوره‌های pre همیشه None است
+    # (چون به actual نیاز دارد که در آن لحظه در دسترس نیست) و به‌طور خودکار
+    # نادیده گرفته می‌شود؛ برای post، مقدار واقعی |actual-forecast| خبر لنگر
+    # است. مقادیر None نادیده گرفته می‌شوند؛ اگر هیچ مقدار معتبری نبود، NaN
+    # می‌ماند (بعداً در normalize_metrics خنثی/neutral پر می‌شود).
+    if "anchor_importance" in group.columns:
+        imp_vals = pd.to_numeric(group["anchor_importance"], errors="coerce").dropna()
         avg_indicator_importance = float(imp_vals.mean()) if len(imp_vals) > 0 else None
     else:
         avg_indicator_importance = None
@@ -567,21 +570,20 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
     # برای تطبیق بعدی با CSV آستانه/نسبت_شانس (load_patterns) — بدون این،
     # تنها راه به‌دست‌آوردن شاخص، parse کردن رشته‌ی signature بود که چون
     # coin/model هم می‌توانند '_' داشته باشند، غیرقابل‌اطمینان است.
-    dominant_indicator = (
-        _representative_value(group["dominant_indicator"]) if "dominant_indicator" in group.columns else None
+    anchor_indicator = (
+        _representative_value(group["anchor_indicator"]) if "anchor_indicator" in group.columns else None
     )
 
     # [فیکس: پشتیبانی ترکیب دوشاخصی] برای اینکه بعداً بشود CSVهای الگوی
     # دوشاخصی (patterns_df با تعداد_شاخص‌ها==2) را هم به این گروه مچ کرد،
-    # اتحاد تمام شاخص‌هایی که در طول همه‌ی دوره‌های این گروه به‌عنوان
-    # dominant_indicator یا در secondary_indicators دیده شده‌اند نگه داشته
-    # می‌شود. صرفاً dominant_indicator (تک‌شاخصی) برای تشخیص یک *جفت* شاخص
-    # کافی نیست.
+    # اتحاد تمام شاخص‌هایی که در طول همه‌ی دوره‌های این گروه حضور داشته‌اند
+    # (ستون indicators_present خامِ هر دوره) نگه داشته می‌شود.
+    # قبلاً این از اتحاد dominant_indicator + secondary_indicators ساخته
+    # می‌شد — که خودش نتیجه‌ی مقایسه‌ی آینده‌نگرِ بین شاخص‌ها بود؛ حالا
+    # indicators_present مستقیماً همان اتحاد را بدون هیچ مقایسه‌ای می‌دهد.
     all_indicators_seen = set()
-    if "dominant_indicator" in group.columns:
-        all_indicators_seen.update(x for x in group["dominant_indicator"].dropna().tolist() if x)
-    if "secondary_indicators" in group.columns:
-        for lst in group["secondary_indicators"].dropna():
+    if "indicators_present" in group.columns:
+        for lst in group["indicators_present"].dropna():
             if isinstance(lst, (list, tuple, set)):
                 all_indicators_seen.update(lst)
 
@@ -591,7 +593,7 @@ def compute_raw_metrics(group: pd.DataFrame) -> dict:
         "max_loss_ratio": max_loss_ratio,
         "avg_daily_return": avg_daily_return,
         "avg_indicator_importance": avg_indicator_importance,
-        "dominant_indicator": dominant_indicator,
+        "anchor_indicator": anchor_indicator,
         "all_indicators_seen": sorted(all_indicators_seen),
         "sample_count": n,
         "total_return_sum": sum(returns),
@@ -805,16 +807,18 @@ def merge_pattern_thresholds(recommendation_df: pd.DataFrame, patterns_df: pd.Da
     [فیکس ۱] قبلاً pivot_table با aggfunc="first" روی (indicator, آستانه)
     بدون "الگوی_وضعیت" در index، ۲ از هر ۳ مقدار (Good/Bad/Neutral) را
     بی‌صدا دور می‌ریخت. راه‌حل درست ادغام بر اساس وضعیت واقعیِ آن سیگنال نیست،
-    چون آن وضعیت اصلاً در سطح norm_df/recommendation_df ثبت نشده (فقط
-    dominant_indicator نگه داشته می‌شود، نه اینکه در آن دوره وضعیتش Good بوده
-    یا Bad). پس به‌جای حدس زدن یک وضعیت، هر سه وضعیت به‌صورت ستون‌های جدا
-    نگه داشته می‌شوند: نسبت_شانس_آستانه_{thr}_{Good|Bad|Neutral}
+    چون آن وضعیت اصلاً در سطح norm_df/recommendation_df ثبت نشده. پس به‌جای
+    حدس زدن یک وضعیت، هر سه وضعیت به‌صورت ستون‌های جدا نگه داشته می‌شوند:
+    نسبت_شانس_آستانه_{thr}_{Good|Bad|Neutral}
 
-    [فیکس ۲] برای ردیف‌های دوشاخصی (indicator = "A|B")، مچ‌کردن مستقیم با
-    dominant_indicator (که همیشه تک‌شاخصی است) امکان‌پذیر نیست. به‌جایش، چک
-    می‌شود که آیا هر دو شاخص A و B در all_indicators_seen آن گروه (اتحاد
-    dominant_indicator + secondary_indicators در تمام دوره‌های آن گروه)
-    حضور داشته‌اند یا نه.
+    [فیکس ۲ / پاک‌سازی آینده‌نگری] برای مچ‌کردن یک ردیف پترن (تک‌شاخصی یا
+    دوشاخصی) با این گروه، چک می‌شود که آیا همه‌ی شاخص‌های آن ردیف در
+    all_indicators_seen این گروه (اتحاد indicators_present در تمام دوره‌های
+    آن گروه) حضور داشته‌اند یا نه — چه پترن تک‌شاخصی باشد چه دوشاخصی، دقیقاً
+    همین یک قانون subset کافی است. قبلاً حالت تک‌شاخصی جدا و بر اساس تساوی
+    دقیق با dominant_indicator («خبر غالب») چک می‌شد؛ چون آن مفهوم (مقایسه‌ی
+    آینده‌نگر بین شاخص‌ها) کاملاً حذف شده، دیگر «غالب»ی برای تساوی وجود ندارد
+    و صرفِ حضور در all_indicators_seen ملاک است.
     """
     recommendation_df = recommendation_df.copy()
     if patterns_df.empty:
@@ -842,17 +846,12 @@ def merge_pattern_thresholds(recommendation_df: pd.DataFrame, patterns_df: pd.Da
         candidates = pattern_lookup.get(key)
         if not candidates:
             return {}
-        dom = row["dominant_indicator"]
         seen = set(row["all_indicators_seen"]) if isinstance(row["all_indicators_seen"], (list, tuple, set)) else set()
         out = {}
         for cand in candidates:
             inds = cand["indicators"]
-            if len(inds) == 1:
-                if inds[0] != dom:
-                    continue
-            else:
-                if not set(inds).issubset(seen):
-                    continue
+            if not set(inds).issubset(seen):
+                continue
             col = f"نسبت_شانس_آستانه_{cand['threshold']}_{cand['status']}"
             # اگر چند رکورد پترن (مثلاً از فایل‌های تکه‌ای مختلف) به یک ستون
             # برسند، اولین مقدار نگه داشته می‌شود (به‌ندرت رخ می‌دهد).
@@ -1098,7 +1097,7 @@ def run(
     # که در بخش‌های دیگر pipeline استفاده می‌شود، دست‌نخورده بماند).
     recommendation_df = norm_df[
         ["strategy_id", "coin_composition", "signature", "sample_count", "win_rate", "avg_daily_return",
-         "dominant_indicator", "all_indicators_seen",
+         "anchor_indicator", "all_indicators_seen",
          "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "_dated_values"]
         + EXT_STATS_16_COLUMNS
     ].copy()
