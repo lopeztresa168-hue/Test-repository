@@ -3,10 +3,34 @@
 portfolios.py - ماژول دوم: سبدهای مکمل (Complementary Portfolios)
 
 این ماژول با استفاده از خروجی ماژول Golden (golden_scores.parquet) و داده‌های
-خام per-period (signatures/*.jsonl)، ترکیب‌های بهینه ۲، ۳ و ۴ استراتژیِ هم‌گروه
-(coin_composition, signature) را پیدا می‌کند: ترکیب‌هایی که بیشترین نرخ بقا
-(Survival Rate) و جبران‌سازی متقابل (Compensation) و کمترین همبستگی شرطی را
-دارند. خروجی نهایی در portfolios.csv ذخیره می‌شود.
+خام per-period (signatures/*.jsonl)، ترکیب‌های بهینه ۲، ۳ و ۴ استراتژی را پیدا
+می‌کند: ترکیب‌هایی که بیشترین نرخ بقا (Survival Rate) و جبران‌سازی متقابل
+(Compensation) و کمترین همبستگی را دارند. خروجی نهایی در portfolios.csv
+ذخیره می‌شود.
+
+========== رفع دو باگ طراحی اساسی (run() پیش‌فرض) ==========
+باگ ۱ - قید نادرست «هم‌کوین و هم‌امضا»: قبلاً فقط استراتژی‌هایی که هم
+    coin_composition و هم signature یکسان داشتند کنار هم در یک سبد قرار
+    می‌گرفتند. این قید هیچ توجیه تجاری نداشت (فقط برای ساده‌سازی محاسبه‌ی
+    همبستگیِ درون‌گروهی گذاشته شده بود) و دقیقاً برعکسِ هدف واقعیِ
+    diversification عمل می‌کرد: دو استراتژی با کوین/شاخص خبری متفاوت اما
+    همبستگیِ بازدهی پایین، بهترین کاندیدهای مکمل هم هستند. حالا run()
+    استخر کاندیدهای Golden-qualified را یک‌جا (فارغ از کوین/امضا) بررسی
+    می‌کند و فقط بر اساس همبستگیِ واقعی بازدهی ترکیب می‌سازد.
+باگ ۲ - آینده‌نگری در تقاطع دوره‌ها (intersection): قبلاً همبستگی/
+    جبران‌سازی/بقا فقط روی دوره‌هایی حساب می‌شد که *همه‌ی* اعضای سبد هم‌زمان
+    در آن‌ها داده داشتند (تقاطع release_date دقیق). این هم آینده‌نگرانه بود
+    (باید از قبل می‌دانستیم اعضا در چه تاریخ‌هایی هم‌زمان فعال خواهند بود)
+    و هم عملاً هر ترکیبی از استراتژی‌های با بازه‌ی فعالیت غیرهم‌پوشان را رد
+    می‌کرد. حالا معیار درست جایگزین شده: بازده‌ی هر استراتژی روی محور
+    تقویمیِ ماهانه تجمیع می‌شود؛ همبستگی/جبران‌سازی/بقا روی همین سری زمانی
+    ماهانه (نه تقاطع دوره‌ها) حساب می‌شوند و سبد در ماه‌هایی که یک عضو
+    معامله نداشته، سهم آن عضو را صفر در نظر می‌گیرد (نه اینکه کل ماه را
+    حذف کند). sample_count هم به «تعداد ماه‌هایی که حداقل یک عضو فعال بوده»
+    تغییر کرد (نه تعداد دوره‌های مشترک).
+توجه: بازه‌ی روزانه‌ی واقعیِ فعال‌بودن هر سبد (برای زمان‌بندی اجرای واقعی در
+    حالت --timeline) همچنان از روی تاریخ‌های دقیق ساخته می‌شود؛ فقط این کار
+    هم اکنون بر اساس Union اعضا انجام می‌شود، نه Intersection.
 
 نیازمندی‌ها:
     pip install pandas numpy scipy pyarrow
@@ -67,6 +91,16 @@ SCORE_WEIGHTS = {
 }
 DEFAULT_VERSION_ID = "v1.0.0"
 DEFAULT_CHUNK_SIZE = 20
+
+# ========== محافظ کارایی برای حذف قید هم‌گروهی (باگ طراحی ۱) ==========
+# پس از حذف قید «فقط هم‌کوین و هم‌امضا»، تعداد کاندیدهایی که ممکن است هم‌زمان
+# قابل‌ترکیب باشند می‌تواند خیلی بزرگ شود. برشمردن سبدهای ۳ و ۴عضوی حتی با
+# پیمایش گراف (به‌جای itertools.combinations خام) روی چند هزار کاندید کند
+# می‌شود. وقتی تعداد کاندیدهای پس از فیلتر همبستگی از این سقف بیشتر شود، فقط
+# بهترین MAX_GLOBAL_CANDIDATES کاندید (بر اساس میانگین بازده‌ی ماهانه‌ی
+# خودشان) نگه داشته می‌شوند. این صرفاً یک محافظ کارایی است و منطق همبستگی/
+# جبران‌سازی را تغییر نمی‌دهد. برای غیرفعال‌کردن، None بگذارید.
+MAX_GLOBAL_CANDIDATES: Optional[int] = 200
 
 # -----------------------------------------------------------------------------
 # ثابت‌های حالت «جدول زمانی پیوسته» (Timeline) — ماژول سوم
@@ -671,41 +705,118 @@ def build_release_dates(group: pd.DataFrame) -> pd.DataFrame:
     return group
 
 
-def compute_correlation_matrix(group: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def build_monthly_returns(group: pd.DataFrame) -> pd.DataFrame:
+    """تجمیع بازده هر strategy_id بر اساس ماه تقویمیِ release_date (نه دوره‌ی
+    خام). این محور زمانیِ مشترک است که بازده‌ی استراتژی‌های با شاخص خبری/
+    کوین متفاوت (که release_date دقیقشان هیچ‌وقت برابر نیست) را قابل‌مقایسه
+    می‌کند — پایه‌ی رفع باگ ۲ (آینده‌نگری در تقاطع دوره‌ها)."""
+    g = group.copy()
+    g["__month"] = g["release_date"].dt.to_period("M")
+    monthly = (
+        g.groupby(["__month", "strategy_id"])["total_return"]
+        .sum()
+        .unstack("strategy_id")
+        .sort_index()
+    )
+    return monthly
+
+
+def compute_monthly_correlation_matrix(group: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    محاسبه ماتریس همبستگی شرطی Spearman برای یک گروه (coin_composition, signature).
+    محاسبه ماتریس همبستگی Spearman روی بازده‌ی ماهانه‌ی تجمیعی هر strategy_id.
+
+    ========== رفع باگ ۲ (آینده‌نگری در تقاطع دوره‌ها) ==========
+    قبلاً همبستگی فقط روی release_dateهایی حساب می‌شد که هر دو عضو *هم‌زمان*
+    داده داشتند (تقاطع دقیق). این هم برای مقایسه‌ی بین شاخص‌های خبری متفاوت
+    بی‌معنی بود (release_date دقیق آن‌ها اصلاً یکی نیست) و هم برای رسیدن به
+    آن باید از قبل می‌دانستیم اعضا هم‌زمان کِی فعال خواهند بود. حالا بازده‌ی
+    هر استراتژی روی محور تقویمیِ ماهانه تجمیع می‌شود و همبستگی روی این سری
+    زمانیِ ماهانه (با حذف زوجیِ ماه‌های بدون داده‌ی هر دو طرف) حساب می‌شود —
+    دقیقاً معیاری که برای «آیا این دو استراتژی در ماه‌های مختلف سود می‌دهند؟»
+    باید استفاده شود.
 
     خروجی:
-        corr_df: ستون‌های [a, b, correlation, n]
-        valid_periods: دیکشنری {strategy_id: set(release_date های معتبر)}
+        corr_df: ستون‌های [a, b, correlation, n] — n = تعداد ماه‌هایی که هر دو
+            عضو در آن‌ها فعال بوده‌اند (نه تعداد دوره‌ی خام مشترک).
+        monthly: pivot ماهانه [ماه × strategy_id] از بازده‌ی تجمیعی هر ماه —
+            برای استفاده‌ی مجدد در ساخت و ارزیابی سبد.
+        exact_valid_periods: دیکشنری {strategy_id: set(release_date دقیق)} —
+            فقط برای بازسازیِ بازه‌ی واقعیِ روزانه‌ی فعال‌بودن (زمان‌بندی اجرا)،
+            نه برای محاسبه‌ی همبستگی/جبران‌سازی/بقا.
     """
-    pivot = group.pivot_table(
-        index="release_date",
-        columns="strategy_id",
-        values="total_return",
-        aggfunc="mean",
-    )
+    exact_valid_periods = {
+        strat: set(sub["release_date"]) for strat, sub in group.groupby("strategy_id")
+    }
 
-    valid_periods = {strat: set(pivot[strat].dropna().index) for strat in pivot.columns}
+    monthly = build_monthly_returns(group)
+    strategies = list(monthly.columns)
+    if len(strategies) < 2:
+        return pd.DataFrame(columns=["a", "b", "correlation", "n"]), monthly, exact_valid_periods
 
-    strategies = list(pivot.columns)
+    notna = monthly.notna()
+    corr_matrix = monthly.corr(method="spearman")
+
     rows = []
     for a, b in itertools.combinations(strategies, 2):
-        shared = valid_periods[a] & valid_periods[b]
-        if len(shared) < MIN_PAIR_OVERLAP:
+        n = int((notna[a] & notna[b]).sum())
+        if n < MIN_PAIR_OVERLAP:
             continue
-        shared_sorted = sorted(shared)
-        series_a = pivot.loc[shared_sorted, a]
-        series_b = pivot.loc[shared_sorted, b]
-        if series_a.nunique() < 2 or series_b.nunique() < 2:
+        corr = corr_matrix.loc[a, b]
+        if pd.isna(corr):
             continue
-        corr, _ = spearmanr(series_a, series_b)
-        if np.isnan(corr):
-            continue
-        rows.append({"a": a, "b": b, "correlation": float(corr), "n": len(shared)})
+        rows.append({"a": a, "b": b, "correlation": float(corr), "n": n})
 
     corr_df = pd.DataFrame(rows, columns=["a", "b", "correlation", "n"])
-    return corr_df, valid_periods
+    return corr_df, monthly, exact_valid_periods
+
+
+def _build_adjacency(strategies: list[str], kept_pairs: pd.DataFrame) -> dict[str, set[str]]:
+    """گراف مجاورت از جفت‌هایی که از فیلتر همبستگی رد شده‌اند (kept_pairs)."""
+    adj: dict[str, set[str]] = {s: set() for s in strategies}
+    for r in kept_pairs.itertuples():
+        if r.a in adj and r.b in adj:
+            adj[r.a].add(r.b)
+            adj[r.b].add(r.a)
+    return adj
+
+
+def _enumerate_clique_members(
+    strategies: list[str], adj: dict[str, set[str]], sizes: tuple[int, ...]
+) -> dict[int, list[tuple]]:
+    """تولید تمام clique های کاملاً متصلِ اندازه‌ی موردنیاز از گراف
+    مجاورتِ همبستگی — دقیقاً همان شرط قبلی («همه‌ی جفت‌های داخل سبد باید از
+    فیلتر همبستگی رد شده باشند») را نتیجه می‌دهد، اما با پیمایشِ اشتراک
+    همسایه‌ها به‌جای شمارشِ کورِ itertools.combinations.
+
+    ========== محافظ کارایی لازم برای رفع باگ ۱ (حذف قید هم‌گروهی) ==========
+    وقتی کاندیدها دیگر به یک (coin_composition, signature) محدود نیستند،
+    itertools.combinations(candidates, 4) روی چند صد کاندید عملاً
+    غیرقابل‌اجراست. این تابع فقط زیرمجموعه‌هایی را تولید می‌کند که از قبل
+    می‌دانیم همه‌ی جفت‌های داخلی‌شان معتبرند — نتیجه‌ی ریاضی یکسان، اجرای
+    عملی امکان‌پذیر.
+    """
+    order = sorted(strategies)
+    pos = {s: i for i, s in enumerate(order)}
+    out: dict[int, list[tuple]] = {n: [] for n in sizes}
+    need3 = 3 in sizes
+    need4 = 4 in sizes
+    for a in order:
+        neigh_a = {n for n in adj.get(a, ()) if pos[n] > pos[a]}
+        for b in sorted(neigh_a, key=lambda x: pos[x]):
+            if 2 in sizes:
+                out[2].append((a, b))
+            if not (need3 or need4):
+                continue
+            common_ab = {n for n in neigh_a if n in adj.get(b, ()) and pos[n] > pos[b]}
+            for c in sorted(common_ab, key=lambda x: pos[x]):
+                if need3:
+                    out[3].append((a, b, c))
+                if not need4:
+                    continue
+                common_abc = {n for n in common_ab if n in adj.get(c, ()) and pos[n] > pos[c]}
+                for d in sorted(common_abc, key=lambda x: pos[x]):
+                    out[4].append((a, b, c, d))
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -1009,10 +1120,21 @@ def evaluate_group(
     attach_periods: bool = False,
     abs_filters: bool = True,
 ) -> tuple[list[dict], int]:
-    """ارزیابی و رتبه‌بندی سبدهای ۲، ۳ و ۴ استراتژی برای یک گروه.
+    """ارزیابی و رتبه‌بندی سبدهای ۲، ۳ و ۴ استراتژی روی کاندیدهای موجود در
+    `group` — `group` دیگر لزوماً یک (coin_composition, signature) واحد
+    نیست؛ می‌تواند کل استخر Golden-qualified باشد (بنگرید run()) و
+    strategy_idهای با کوین/امضای متفاوت هم می‌توانند در یک سبد کنار هم
+    قرار بگیرند، به شرطی که همبستگیِ بازدهی‌شان (روی سری زمانیِ ماهانه)
+    پایین باشد.
 
-    پارامترهای جدید (فقط برای حالت Timeline استفاده می‌شوند؛ پیش‌فرض‌ها رفتار
-    قبلی run()/run_whole_time() را کاملاً بدون تغییر نگه می‌دارند):
+    coin_composition/signature: فقط وقتی معنادارند که `group` واقعاً به یک
+    گروه همگن محدود شده باشد (مثل run_whole_time/run_timeline)؛ در غیر این
+    صورت به‌عنوان برچسب سطح‌بالا خالی/عمومی می‌مانند و اطلاعات واقعیِ هر عضو
+    در "member_coin_compositions"/"member_signatures" (به‌ازای هر عضو) برگردانده
+    می‌شود.
+
+    پارامترهای اضافه (فقط برای حالت Timeline استفاده می‌شوند؛ پیش‌فرض‌ها رفتار
+    run()/run_whole_time() را تغییر نمی‌دهند):
         attach_periods: اگر True باشد، به هر سبد خروجی یک کلید داخلی
             "_intervals" (لیست بازه‌های زمانی واقعیِ غیرهم‌پوشانِ فعال‌بودن،
             بر اساس period_start/period_end خام) اضافه می‌شود.
@@ -1026,7 +1148,7 @@ def evaluate_group(
     group = build_release_dates(group)
     period_bounds = _period_bounds_by_date(group) if attach_periods else {}
 
-    corr_df, valid_periods = compute_correlation_matrix(group)
+    corr_df, monthly, exact_valid_periods = compute_monthly_correlation_matrix(group)
     if corr_df.empty:
         return [], 0
 
@@ -1039,15 +1161,32 @@ def evaluate_group(
     if len(candidate_strategies) < 2:
         return [], 0
 
-    pivot = group.pivot_table(
-        index="release_date", columns="strategy_id", values="total_return", aggfunc="mean"
+    # ========== محافظ کارایی برای رفع باگ ۱ (حذف قید هم‌گروهی) ==========
+    if MAX_GLOBAL_CANDIDATES and len(candidate_strategies) > MAX_GLOBAL_CANDIDATES:
+        indiv_quality = monthly[candidate_strategies].mean(skipna=True)
+        candidate_strategies = sorted(
+            indiv_quality.sort_values(ascending=False).head(MAX_GLOBAL_CANDIDATES).index.tolist()
+        )
+        cs_set = set(candidate_strategies)
+        kept_pairs = kept_pairs[kept_pairs["a"].isin(cs_set) & kept_pairs["b"].isin(cs_set)]
+        corr_lookup = {(r.a, r.b): r.correlation for r in kept_pairs.itertuples()}
+        if len(candidate_strategies) < 2 or kept_pairs.empty:
+            return [], 0
+
+    adj = _build_adjacency(candidate_strategies, kept_pairs)
+    clique_members = _enumerate_clique_members(candidate_strategies, adj, PORTFOLIO_SIZES)
+
+    # اطلاعات هر strategy_id (کوین/امضا) — چون اعضای یک سبد دیگر لزوماً
+    # هم‌کوین/هم‌امضا نیستند، این‌ها را به‌ازای هر عضو (نه هر سبد) نگه می‌داریم.
+    strategy_meta = group.groupby("strategy_id").agg(
+        __coin=("coin_composition", "first"),
+        __sig=("signature", lambda s: sorted(set(s))),
     )
 
     # [فیکس ۱۳] برای هر دوره (release_date)، طول واقعی آن دوره (period_length_days)
     # را نگه می‌داریم تا بعداً بشود «تعداد_روز_فعال» یک سبد را (مجموع طول
-    # دوره‌های مشترک اعضا) حساب کرد. اگر این ستون در داده موجود نباشد (نسخه‌ی
-    # قدیمی JSONL)، به تعداد دوره‌ها (نه روز) بازمی‌گردیم و این محدودیت را
-    # صریحاً مستند می‌کنیم.
+    # روزهای واقعیِ فعال‌بودن اعضا) حساب کرد. اگر این ستون در داده موجود
+    # نباشد (نسخه‌ی قدیمی JSONL)، به تعداد دوره‌ها (نه روز) بازمی‌گردیم.
     period_length_by_date = {}
     if "period_length_days" in group.columns:
         period_length_by_date = (
@@ -1057,16 +1196,23 @@ def evaluate_group(
     portfolios = []
     raw_candidate_count = 0  # ========== باگ ۷ رفع شد: شمارش کاندیدها پیش از فیلتر مطلق ==========
     for size in PORTFOLIO_SIZES:
-        for members in itertools.combinations(candidate_strategies, size):
+        for members in clique_members.get(size, []):
             pairs = list(itertools.combinations(sorted(members), 2))
             if not all(p in corr_lookup for p in pairs):
+                continue  # عملاً هیچ‌وقت نباید اجرا شود (ساخت clique تضمینش می‌کند)؛ فقط برای اطمینان
+
+            # ========== رفع باگ ۲: Union ماه‌های فعال (نه Intersection) ==========
+            # ماهی که یک عضو معامله نداشته، از سبد حذف نمی‌شود — سهم آن عضو
+            # در آن ماه صفر در نظر گرفته می‌شود («این ماه معامله‌ای نداشت»،
+            # نه «این ترکیب رد است»).
+            active_months: set = set()
+            for m in members:
+                active_months |= set(monthly[m].dropna().index)
+            if len(active_months) < MIN_PORTFOLIO_SAMPLES:
                 continue
 
-            shared_periods = set.intersection(*(valid_periods[m] for m in members))
-            if len(shared_periods) < MIN_PORTFOLIO_SAMPLES:
-                continue
-
-            returns = pivot.loc[sorted(shared_periods), list(members)]
+            sorted_months = sorted(active_months)
+            returns = monthly.loc[sorted_months, list(members)].fillna(0.0)
 
             sr = survival_rate(returns)
             comp = compensation_ratio(returns)
@@ -1084,49 +1230,63 @@ def evaluate_group(
             if abs_filters and not passes_abs:
                 continue
 
-            # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد: اولین/آخرین دوره‌ی
-            # مشترک اعضا، و مجموع طول واقعی دوره‌های مشترک (نه کل فاصله‌ی
-            # تقویمی — چون بین دوره‌ها ممکن است شکاف باشد).
-            sorted_shared = sorted(shared_periods)
-            بازه_شروع = sorted_shared[0]
-            بازه_پایان = sorted_shared[-1]
-            if period_length_by_date:
-                روز_فعال = int(sum(period_length_by_date.get(d, 0) for d in sorted_shared))
+            # بازه‌ی روزانه‌ی واقعیِ فعال‌بودن سبد: از Union دقیق release_date
+            # همه‌ی اعضا (نه از ماه‌ها) — برای اینکه ستون‌های روزی و بازسازی
+            # _intervals (زمان‌بندی اجرای واقعی) دقیق بمانند.
+            exact_union: set = set()
+            for m in members:
+                exact_union |= exact_valid_periods.get(m, set())
+            sorted_exact = sorted(exact_union)
+            if sorted_exact:
+                بازه_شروع = sorted_exact[0]
+                بازه_پایان = sorted_exact[-1]
+            else:
+                بازه_شروع = sorted_months[0].to_timestamp()
+                بازه_پایان = sorted_months[-1].to_timestamp()
+            if period_length_by_date and sorted_exact:
+                روز_فعال = int(sum(period_length_by_date.get(d, 0) for d in sorted_exact))
             else:
                 # داده‌ی قدیمی بدون period_length_days: به تعداد دوره (نه
                 # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
-                روز_فعال = len(sorted_shared)
+                روز_فعال = len(sorted_exact) if sorted_exact else len(sorted_months)
 
             # [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد: از روی
-            # بازده‌ی سبد (مجموع اعضا) در هر دوره‌ی مشترک — همان period_sums
-            # که survival_rate/compensation_ratio بالا هم به‌عنوان «بازده‌ی
-            # سبد آن دوره» استفاده می‌کنند.
+            # بازده‌ی سبد (مجموع اعضا) در هر ماه فعال — همان period_sums که
+            # survival_rate/compensation_ratio بالا هم استفاده می‌کنند.
             period_sums = returns.sum(axis=1)
-            dated_values = [
-                (idx.date() if hasattr(idx, "date") else idx, float(v))
-                for idx, v in period_sums.items()
-            ]
+            dated_values = [(idx, float(v)) for idx, v in period_sums.items()]
             ext16 = _period_monthly_stats(dated_values)
+
+            member_coins = [
+                strategy_meta.loc[m, "__coin"] if m in strategy_meta.index else "" for m in members
+            ]
+            member_sigs = [
+                strategy_meta.loc[m, "__sig"] if m in strategy_meta.index else [] for m in members
+            ]
 
             record = {
                 "coin_composition": coin_composition,
                 "signature": signature,
+                "member_coin_compositions": member_coins,
+                "member_signatures": member_sigs,
                 "members": list(members),
                 "survival_rate": sr,
                 "compensation_ratio": comp,
                 "avg_return": ar,
                 "avg_correlation": ac,
-                "sample_count": len(shared_periods),
-                "بازه_زمانی_شروع": بازه_شروع.date().isoformat(),
-                "بازه_زمانی_پایان": بازه_پایان.date().isoformat(),
+                # ========== رفع باگ ۴: تعداد ماه‌هایی که حداقل یک عضو فعال
+                # بوده (Union) — نه تعداد دوره‌های مشترک (Intersection) ==========
+                "sample_count": len(active_months),
+                "بازه_زمانی_شروع": pd.Timestamp(بازه_شروع).date().isoformat(),
+                "بازه_زمانی_پایان": pd.Timestamp(بازه_پایان).date().isoformat(),
                 "تعداد_روز_فعال": روز_فعال,
-                "تعداد_روز_کل_بازه": (بازه_پایان - بازه_شروع).days + 1,
+                "تعداد_روز_کل_بازه": (pd.Timestamp(بازه_پایان) - pd.Timestamp(بازه_شروع)).days + 1,
                 **ext16,
             }
             if not abs_filters:
                 record["_passes_abs"] = passes_abs
             if attach_periods:
-                raw_intervals = [period_bounds[d] for d in sorted_shared if d in period_bounds]
+                raw_intervals = [period_bounds[d] for d in sorted_exact if d in period_bounds]
                 record["_intervals"] = _merge_intervals(raw_intervals)
             portfolios.append(record)
 
@@ -1267,136 +1427,77 @@ def run(
         .to_dict()
     )
 
-    # حذف امضاهای قبلاً پردازش‌شده در حالت resume
-    pending_keys = [k for k in all_sig_keys if k not in processed_set]
-    log.info("تعداد گروه‌های باقی‌مانده برای پردازش: %d", len(pending_keys))
+    # ========== رفع باگ ۱ (حذف قید هم‌گروهی) — تغییر معماری گام‌های ۴-۶ ==========
+    # قبلاً هر (coin_composition, signature) به‌طور مستقل و محدود به اعضای
+    # خودش evaluate_group می‌شد (تا بشود پردازش را chunk/resume کرد). این
+    # دقیقاً همان قید نادرستی بود که سبدها را به «هم‌کوین و هم‌امضا» محدود
+    # می‌کرد. حالا correlation/ساخت سبد باید روی *کل* استخر Golden-qualified
+    # یک‌جا انجام شود (فقط این‌طور می‌شود استراتژی‌های با کوین/شاخص خبری
+    # متفاوت ولی همبستگی پایین را کنار هم گذاشت) — پس دیگر معنایی ندارد که
+    # این محاسبه را به‌ازای هر گروه جداگانه chunk کنیم. علاوه بر این، محاسبه‌ی
+    # همبستگی حالا برداری (pandas.DataFrame.corr) و برشمردنِ ترکیب‌ها graph/
+    # clique-based است (نه itertools.combinations خام)، پس حتی روی کل استخر
+    # هم به‌مراتب سریع‌تر از حلقه‌ی قبلیِ پایتونیِ per-group است.
+    #
+    # chunk_size/--resume برای این بخش دیگر به‌معنای «ادامه از گروه بعدی»
+    # نیستند: چون محاسبه اکنون یک عملیات سراسری و اتمی است، --resume فقط به
+    # این معناست که اگر اجرای قبلی با موفقیت کامل شده، دوباره محاسبه نشود.
+    # (فایل‌های صف/وضعیت processed_signature_* که سیستم‌های بیرونی/CI برای
+    # پاک‌سازی صف می‌خوانند، دقیقاً مثل قبل نوشته می‌شوند — فقط اکنون همه‌ی
+    # all_sig_keys یک‌جا، در پایانِ یک اجرای موفق، processed علامت می‌خورند،
+    # چون صحت سبدهای سراسری ذاتاً به دیدن کل استخر با هم نیاز دارد و پردازش
+    # جزئی/ناقص یک زیرمجموعه دیگر معنای درستی ندارد.)
+    if resume and status.get("status") == "completed":
+        existing = output_dir / "portfolios.csv"
+        if not existing.exists():
+            existing = output_dir / "portfolios.parquet"
+        if existing.exists():
+            log.info("اجرای قبلی کامل بود — از --resume صرف‌نظر و فایل موجود بازگردانده شد: %s", existing)
+            return existing
 
-    # ---- گام ۴: تقسیم به chunk ----
-    chunks = [
-        pending_keys[i: i + chunk_size]
-        for i in range(0, len(pending_keys), chunk_size)
-    ]
-    total_chunks = len(chunks)  # تعداد chunk‌های باقی‌مانده در همین اجرا (برای پیشرفت لاگ)
-
-    # ========== باگ ۶ رفع شد ==========
-    # total_chunks کل (برای گزارش در status) باید مستقل از تعداد chunk‌های باقی‌مانده
-    # محاسبه شود: از روی تعداد کل گروه‌های (coin_composition, signature) و chunk_size.
-    total_chunks_overall = (
-        math.ceil(len(all_sig_keys) / chunk_size) if chunk_size > 0 else 0
-    )
-
-    # start_chunk_index: اگر resume فعال باشد و قبلاً chunk‌هایی پردازش شده باشند
-    start_chunk_index = 0
-    if resume and status.get("last_chunk_index", -1) >= 0:
-        # چون pending_keys قبلاً پردازش‌شده‌ها را حذف کرده، از ۰ شروع می‌کنیم
-        start_chunk_index = 0
-
-    status["total_chunks"] = total_chunks_overall
-    status["chunk_size"] = chunk_size
-    status["status"] = "running"
-    save_status(status_file, status)
-
-    # بارگذاری نتایج قبلی از فایل موقت اگر resume فعال است
-    # ========== باگ ۸ رفع شد: هم .parquet و هم .csv بررسی می‌شوند ==========
-    all_portfolios: list[dict] = []
-    if resume and (temp_parquet_path.exists() or temp_csv_path.exists()):
-        try:
-            prev_df = _read_parquet_or_csv(temp_results_base)
-            all_portfolios = prev_df.to_dict("records")
-            log.info("نتایج قبلی بارگذاری شد: %d سبد", len(all_portfolios))
-        except Exception as exc:
-            log.warning("خطا در بارگذاری نتایج موقت قبلی: %s — از صفر شروع می‌شود.", exc)
-
-    interrupted = False
-
-    # ---- گام ۵: پردازش chunk به chunk ----
-    groups_df = candidates.groupby(["coin_composition", "signature"])
-
-    for chunk_idx, chunk in enumerate(chunks[start_chunk_index:], start=start_chunk_index):
-
-        # بررسی interrupt.flag قبل از هر chunk
-        if check_interrupt_flag(output_dir, interrupt_flag):
-            log.warning("interrupt.flag شناسایی شد — ذخیره وضعیت و توقف.")
-            status["status"] = "interrupted"
-            interrupted = True
-            # ذخیره نتایج موقت
-            if all_portfolios:
-                temp_df = pd.DataFrame(all_portfolios)
-                _save_dataframe(temp_df, temp_results_base)
-            save_status(status_file, status)
-            break
-
-        log.info("پردازش chunk %d/%d (%d امضا)", chunk_idx + 1, total_chunks, len(chunk))
-
-        chunk_results: list[dict] = []
-
-        for coin_composition, signature in chunk:
-            key = (coin_composition, signature)
-            try:
-                group = groups_df.get_group(key)
-            except KeyError:
-                log.warning("گروه %s یافت نشد — رد شدن.", key)
-                processed_set.add(key)
-                continue
-
-            if group["strategy_id"].nunique() < 2:
-                processed_set.add(key)
-                continue
-
-            result, raw_count = evaluate_group(coin_composition, signature, group, top_n)
-            # استخراج مستقیم شاخص خبری از خود داده (نه parse رشته‌ی signature) —
-            # همه‌ی رکوردهای یک گروه (coin_composition, signature) طبق ساخت
-            # build_signature همیشه یک anchor_indicator یکسان دارند.
-            # [پاک‌سازی آینده‌نگری] قبلاً از dominant_indicator (مقایسه‌ی
-            # آینده‌نگرِ بین شاخص‌ها) استفاده می‌شد؛ حالا از anchor_indicator
-            # (شاخصی که خودِ دوره بر اساس آن anchor شده — combo_10day.py) که
-            # کاملاً بدون آینده‌نگری است.
-            if result:
-                ind_val = group["anchor_indicator"].iloc[0] if "anchor_indicator" in group.columns else ""
-                ind_val = "" if pd.isna(ind_val) else str(ind_val)
-                for rec in result:
-                    rec["شاخص_خبری"] = ind_val
-            chunk_results.extend(result)
-            total_raw_portfolios += raw_count
-            processed_set.add(key)
-
-        all_portfolios.extend(chunk_results)
-
-        # ---- به‌روزرسانی وضعیت پس از هر chunk ----
-        status["last_chunk_index"] = chunk_idx
-        status["processed_signatures"] = [list(k) for k in processed_set]
-        # ========== رفع باگ: نسخه‌ی هم‌سطح صف (رشته‌ی تخت signature) برای done_items.json ==========
-        status["processed_signature_strings"] = sorted({k[1] for k in processed_set})
-        # ========== رفع باگ ناسازگاری فضای شناسه‌ها: این فیلد را ورک‌فلو برای
-        # ساخت done_items.json/cleanup صف استفاده می‌کند چون دقیقاً با فرمت
-        # signature_path آیتم‌های صف یکی است (برخلاف processed_signature_strings). ==========
-        status["processed_signature_paths"] = _expand_processed_paths(processed_set, group_queue_keys)
-        status["total_raw_portfolios"] = total_raw_portfolios
-        status["status"] = "running"
-
-        # ذخیره نتایج موقت
-        if all_portfolios:
-            temp_df = pd.DataFrame(all_portfolios)
-            _save_dataframe(temp_df, temp_results_base)
-
+    if check_interrupt_flag(output_dir, interrupt_flag):
+        log.warning("interrupt.flag شناسایی شد — بدون شروع محاسبه‌ی سراسری متوقف شد.")
+        status["status"] = "interrupted"
         save_status(status_file, status)
-        log.info(
-            "chunk %d/%d کامل شد — %d سبد جدید / مجموع %d سبد / %d امضا پردازش‌شده",
-            chunk_idx + 1, total_chunks, len(chunk_results),
-            len(all_portfolios), len(processed_set),
-        )
-
-    if interrupted:
-        log.info("اجرا به‌صورت graceful متوقف شد. برای ادامه از --resume استفاده کنید.")
         return output_dir / "portfolios.csv"
 
-    # ---- گام ۶: پس از اتمام همه chunk‌ها ----
+    status["status"] = "running"
+    status["chunk_size"] = chunk_size
+    save_status(status_file, status)
+
+    all_portfolios: list[dict] = []
+    total_raw_portfolios = 0
+
+    if candidates.empty or candidates["strategy_id"].nunique() < 2:
+        log.warning("کمتر از ۲ strategy_id واجد شرایط Golden یافت شد — سبدی ساخته نمی‌شود.")
+    else:
+        log.info(
+            "ساخت سبد به‌صورت سراسری روی %d strategy_id واجد شرایط Golden (فارغ از کوین/امضا)...",
+            candidates["strategy_id"].nunique(),
+        )
+        all_portfolios, total_raw_portfolios = evaluate_group(
+            coin_composition="", signature="", group=candidates, top_n=top_n,
+        )
+
+    # همه‌ی گروه‌های بارگذاری‌شده در این اجرا در محاسبه‌ی سراسری بالا لحاظ
+    # شدند (چه Golden ردشان کرده باشد چه نه — prefilter_candidates پیش‌تر
+    # این تفکیک را انجام داده)، پس همه به‌عنوان processed علامت می‌خورند.
+    processed_set.update(all_sig_keys)
+
+    if all_portfolios:
+        temp_df = pd.DataFrame(all_portfolios)
+        _save_dataframe(temp_df, temp_results_base)
+
+    # ---- گام ۶: پس از اتمام محاسبه‌ی سراسری ----
     # [فیکس] طبق درخواست کاربر، version_id و created_at از خروجی
     # portfolios.csv حذف شدند — این دو ستون صرفاً متادیتای اجرا بودن، نه
     # چیزی که برای تصمیم معاملاتی لازم باشه.
+    # ========== رفع باگ ۱: ستون‌های coin_composition/signature سطح‌بالا با
+    # member_coin_compositions/member_signatures جایگزین شدند چون اعضای یک
+    # سبد دیگر لزوماً هم‌کوین/هم‌امضا نیستند. ==========
     columns = [
-        "coin_composition", "signature", "شاخص_خبری", "members", "survival_rate",
-        "compensation_ratio", "avg_return", "avg_correlation", "score",
+        "members", "member_coin_compositions", "member_signatures",
+        "survival_rate", "compensation_ratio", "avg_return", "avg_correlation", "score",
         "sample_count",
         # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد
         "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
@@ -1873,21 +1974,24 @@ def run_whole_time(
     signatures_filter: Optional[Path] = None,
 ) -> Path:
     """
-    نسخه‌ی «کل بازه‌ی زمانی»: برخلاف run() که علاوه بر امضا رژیم بازار را هم
-    جزو شرط می‌بیند، اینجا فقط رژیم بازار (market_regime) نادیده گرفته
-    می‌شود — نه کل امضا. گروه‌بندی روی (coin_composition, امضای بدون رژیم)
-    است؛ یعنی شاخص خبری، position، پنجره‌ی زمانی (distance)، model و سشن
-    معاملاتی همچنان دقیقاً مثل run() ترکیب را منحصربه‌فرد نگه می‌دارند، و فقط
-    رکوردهایی که تنها در رژیم بازار فرق دارند با هم در یک گروه دیده می‌شوند.
+    نسخه‌ی «کل بازه‌ی زمانی»: مثل run()، دیگر قید «هم‌کوین/هم‌امضا» روی
+    عضویت در سبد وجود ندارد — این قید فقط برای ساده‌سازی محاسبه‌ی همبستگیِ
+    شرطی در کد قدیمی آمده بود، نه یک الزام تجاری واقعی (نگاه کنید به توضیح
+    رفع باگ ۱ در run()). حالا مثل run()، evaluate_group یک‌بار روی *کل*
+    استخر Golden-qualified صدا زده می‌شود؛ هر استراتژی (با هر کوین/شاخص
+    خبری) اگر همبستگی بازدهی‌اش با بقیه‌ی اعضا پایین باشد می‌تواند در یک
+    سبد قرار بگیرد. تفاوتش با run() فقط در این است که run() به‌ازای هر
+    اجرا محدود به رکوردهای همان اجرا (chunk) است، در حالی که این تابع طبق
+    طراحی همیشه روی کل تاریخچه (بدون قید رویداد خبری) کار می‌کند.
 
     همان evaluate_group (همان فرمول‌های survival_rate/compensation_ratio/
     avg_return/avg_correlation/score) عیناً استفاده می‌شود؛ این‌طور تضمین
     می‌شود که همان محافظت در برابر «سود و ضرر خنثی‌کننده‌ی هم» که برای حالت
     خبری طراحی شده، اینجا هم برقرار است.
 
-    برخلاف run()، این تابع chunk/resume/interrupt جداگانه ندارد — چون تعداد
-    گروه‌های (coin_composition, امضای بدون رژیم) معمولاً خیلی کمتر از تعداد
-    کل (coin_composition, signature با رژیم) است و نیازی به تقسیم نیست.
+    این تابع chunk/resume/interrupt جداگانه ندارد — چون محاسبه (دقیقاً مثل
+    run() پس از رفع باگ ۱) یک عملیات سراسری و اتمی روی کل استخر است، نه
+    چیزی که با معنای درستی بشود به‌ازای هر گروه chunk کرد.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1908,35 +2012,35 @@ def run_whole_time(
     if candidates.empty:
         log.warning("هیچ رکورد کاندیدی برای حالت کل بازه‌ی زمانی یافت نشد.")
 
-    # ========== [فیکس]: «کل بازه‌ی زمانی» یعنی نادیده گرفتن رژیم بازار، نه
-    # نادیده گرفتن کل امضا. پس گروه‌بندی باید روی (coin_composition, امضای
-    # بدون رژیم) باشد — نه فقط coin_composition — تا شاخص خبری/position/
-    # پنجره‌ی زمانی/model/سشن همچنان ترکیب را منحصربه‌فرد نگه دارند و فقط
-    # رکوردهای با رژیم‌های مختلف با هم ادغام شوند. ==========
-    candidates = candidates.copy()
-    candidates["امضا_بدون_رژیم"] = candidates["signature"].apply(strip_market_regime)
-
-    all_portfolios: list[dict] = []
-    total_raw = 0
-    coin_groups = candidates.groupby(["coin_composition", "امضا_بدون_رژیم"])
-    group_keys = list(coin_groups.groups.keys())
-    log.info("حالت کل بازه‌ی زمانی: %d گروه (coin, امضای بدون رژیم) یافت شد.", len(group_keys))
-
-    for coin_composition, sig_no_regime in group_keys:
-        group = coin_groups.get_group((coin_composition, sig_no_regime))
-        if group["strategy_id"].nunique() < 2:
-            continue
-        result, raw_count = evaluate_group(coin_composition, sig_no_regime, group, top_n)
-        total_raw += raw_count
-        all_portfolios.extend(result)
-        log.info("  coin=%s | امضا=%s | %d سبد یافت شد (از %d کاندید خام)",
-                  coin_composition, sig_no_regime, len(result), raw_count)
+    # ========== رفع باگ ۱ (همان فیکس run()، اینجا هم اعمال شد) ==========
+    # نسخه‌ی قبلی همچنان روی (coin_composition, امضای بدون رژیم) گروه‌بندی
+    # می‌کرد — یعنی دقیقاً همان قید نادرست «هم‌کوین و هم‌امضا»یی که در run()
+    # حذف شد، اینجا فقط با نام «امضای بدون رژیم» باقی مانده بود. این قید،
+    # درست مثل قبل، صرفاً برای ساده‌سازی محاسبه‌ی همبستگیِ شرطی آمده بود؛
+    # منطق تجاری «سبد چند استراتژی با همبستگی پایین» به کوین یا شاخص خبری
+    # هیچ‌کدام کاری ندارد. حالا evaluate_group یک‌بار روی کل استخر
+    # Golden-qualified صدا زده می‌شود، بدون هیچ گروه‌بندی‌ای.
+    if candidates.empty or candidates["strategy_id"].nunique() < 2:
+        log.warning("کمتر از ۲ strategy_id واجد شرایط Golden یافت شد — سبدی ساخته نمی‌شود.")
+        all_portfolios, total_raw = [], 0
+    else:
+        log.info(
+            "حالت کل بازه‌ی زمانی: ساخت سبد به‌صورت سراسری روی %d strategy_id واجد شرایط Golden (فارغ از کوین/امضا)...",
+            candidates["strategy_id"].nunique(),
+        )
+        all_portfolios, total_raw = evaluate_group(
+            coin_composition="", signature="", group=candidates, top_n=top_n,
+        )
+    log.info("حالت کل بازه‌ی زمانی: %d سبد یافت شد (از %d کاندید خام).", len(all_portfolios), total_raw)
 
     # [فیکس] طبق درخواست کاربر، version_id و created_at از خروجی
     # portfolios_whole_time.csv هم حذف شدند.
+    # ========== رفع باگ ۱: ستون‌های coin_composition/signature سطح‌بالا با
+    # member_coin_compositions/member_signatures جایگزین شدند — عیناً مثل
+    # run()، چون اعضای یک سبد دیگر لزوماً هم‌کوین/هم‌امضا نیستند. ==========
     columns = [
-        "coin_composition", "signature", "members", "survival_rate",
-        "compensation_ratio", "avg_return", "avg_correlation", "score",
+        "members", "member_coin_compositions", "member_signatures",
+        "survival_rate", "compensation_ratio", "avg_return", "avg_correlation", "score",
         "sample_count",
         # [فیکس ۱۳] بازه‌ی زمانی بک‌تست این سبد
         "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
@@ -2012,8 +2116,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--whole-time", action="store_true", default=False,
         help="به‌جای حالت مبتنی‌بر شرط خبری، سبدها را روی کل بازه‌ی زمانی "
-             "(بدون قید رویداد خبری، فقط بر اساس coin_composition) می‌سازد. "
-             "خروجی در فایل جدای portfolios_whole_time.* ذخیره می‌شود.",
+             "(بدون قید رویداد خبری، و بدون قید هم‌کوین/هم‌امضا — فقط بر اساس "
+             "همبستگی پایین بازدهی) می‌سازد. خروجی در فایل جدای "
+             "portfolios_whole_time.* ذخیره می‌شود.",
     )
     parser.add_argument(
         "--timeline", action="store_true", default=False,
