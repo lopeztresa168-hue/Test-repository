@@ -80,9 +80,8 @@ MIN_PAIR_OVERLAP = 10
 MIN_PORTFOLIO_SAMPLES = 10
 CORR_PERCENTILE_THRESHOLD = 25
 PORTFOLIO_SIZES = (2, 3, 4)
-ABS_MIN_SURVIVAL_RATE = 50.0
-ABS_MIN_COMPENSATION_RATIO = 0.6
-ABS_MIN_AVG_RETURN = 0.0
+ABS_MIN_SURVIVAL_RATE = 70.0
+ABS_MIN_AVG_RETURN = 0.5
 SCORE_WEIGHTS = {
     "survival": 0.35,
     "compensation": 0.25,
@@ -1222,9 +1221,13 @@ def evaluate_group(
             raw_candidate_count += 1
 
             # گام ۸: فیلتر مطلق قبل از رنکینگ
+            # [فیکس درخواستی کاربر] compensation_ratio از فیلتر مطلق حذف شد:
+            # نرخ بقای بالا (survival_rate) به‌تنهایی یعنی اکثر دوره‌ها سودده
+            # بوده‌اند و همین کافی است. compensation_ratio هنوز محاسبه و در
+            # خروجی گزارش می‌شود و هنوز در SCORE_WEIGHTS برای رتبه‌بندی نقش
+            # دارد — فقط دیگر شرط رد/قبول (pass/fail) مطلق نیست.
             passes_abs = (
                 sr >= ABS_MIN_SURVIVAL_RATE
-                and comp >= ABS_MIN_COMPENSATION_RATIO
                 and ar >= ABS_MIN_AVG_RETURN
             )
             if abs_filters and not passes_abs:
@@ -1898,10 +1901,11 @@ def run_timeline(
         if group["strategy_id"].nunique() < 2:
             continue
         # abs_filters=False: هم واجدشرایط‌ها و هم زیرآستانه‌ای‌ها نگه داشته
-        # می‌شوند (با کلید _passes_abs مشخص می‌شوند)؛ top_n بزرگ تا استخر
-        # پرکردن شکاف محدود نشود.
+        # می‌شوند (با کلید _passes_abs مشخص می‌شوند)؛ top_n بزرگ (یا None
+        # برای بدون‌سقف) تا استخر پرکردن شکاف محدود نشود.
+        pool_top_n = None if top_n is None else max(top_n, 50)
         raw, _raw_count = evaluate_group(
-            coin_composition, sig_no_regime, group, top_n=max(top_n, 50),
+            coin_composition, sig_no_regime, group, top_n=pool_top_n,
             attach_periods=True, abs_filters=False,
         )
         pool.extend(raw)
@@ -2090,8 +2094,9 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="مسیر پوشه‌ی خروجی برای ذخیره‌ی portfolios.parquet",
     )
     parser.add_argument(
-        "--top-n", required=False, type=int, default=15,
-        help="تعداد سبدهای برتر برای هر امضا (پیش‌فرض ۱۵)",
+        "--top-n", required=False, type=int, default=None,
+        help="سقف تعداد سبدهای برتر روی کل استخر (سراسری، نه به‌ازای هر کوین/امضا). "
+             "پیش‌فرض: بدون سقف — همه‌ی سبدهای واجدشرایط برگردانده می‌شوند.",
     )
     parser.add_argument(
         "--status-file", required=False, type=Path, default=None,
