@@ -82,6 +82,15 @@ CORR_PERCENTILE_THRESHOLD = 25
 PORTFOLIO_SIZES = (2, 3, 4)
 ABS_MIN_SURVIVAL_RATE = 70.0
 ABS_MIN_AVG_RETURN = 0.5
+# [فیکس درخواستی کاربر] فیلترهای بالا دیگر هیچ سبدی را رد نمی‌کنند؛ فقط برای
+# تصمیم‌گیری بین دو حالت خروجی استفاده می‌شوند: اگر تعداد سبدهایی که همین
+# آستانه‌ها را رعایت می‌کنند حداقل MIN_QUALIFIED_ROWS باشد، همان‌ها (با
+# رتبه‌بندی score) برگردانده می‌شوند؛ در غیر این صورت (مثل حالتی که این
+# آستانه‌ها اصلاً قابل‌دسترس نیستند)، به‌جای خروجی خالی، بهترین سبدهای
+# *موجود* بر اساس نرخ بقا (survival_rate) تا سقف FALLBACK_TOP_N برگردانده
+# می‌شوند.
+MIN_QUALIFIED_ROWS = 100
+FALLBACK_TOP_N = 300
 SCORE_WEIGHTS = {
     "survival": 0.35,
     "compensation": 0.25,
@@ -1220,18 +1229,14 @@ def evaluate_group(
 
             raw_candidate_count += 1
 
-            # گام ۸: فیلتر مطلق قبل از رنکینگ
-            # [فیکس درخواستی کاربر] compensation_ratio از فیلتر مطلق حذف شد:
-            # نرخ بقای بالا (survival_rate) به‌تنهایی یعنی اکثر دوره‌ها سودده
-            # بوده‌اند و همین کافی است. compensation_ratio هنوز محاسبه و در
-            # خروجی گزارش می‌شود و هنوز در SCORE_WEIGHTS برای رتبه‌بندی نقش
-            # دارد — فقط دیگر شرط رد/قبول (pass/fail) مطلق نیست.
+            # گام ۸: فیلتر مطلق دیگر چیزی را رد نمی‌کند — فقط برچسب می‌زند.
+            # [فیکس درخواستی کاربر] به‌جای continue/حذف، همیشه نگه داشته
+            # می‌شود؛ تصمیم «رد شدن یا نه» بعداً و به‌صورت سراسری (بر اساس
+            # تعداد کل واجدشرایط‌ها) گرفته می‌شود — نگاه کنید MIN_QUALIFIED_ROWS.
             passes_abs = (
                 sr >= ABS_MIN_SURVIVAL_RATE
                 and ar >= ABS_MIN_AVG_RETURN
             )
-            if abs_filters and not passes_abs:
-                continue
 
             # بازه‌ی روزانه‌ی واقعیِ فعال‌بودن سبد: از Union دقیق release_date
             # همه‌ی اعضا (نه از ماه‌ها) — برای اینکه ستون‌های روزی و بازسازی
@@ -1286,8 +1291,7 @@ def evaluate_group(
                 "تعداد_روز_کل_بازه": (pd.Timestamp(بازه_پایان) - pd.Timestamp(بازه_شروع)).days + 1,
                 **ext16,
             }
-            if not abs_filters:
-                record["_passes_abs"] = passes_abs
+            record["_passes_abs"] = passes_abs
             if attach_periods:
                 raw_intervals = [period_bounds[d] for d in sorted_exact if d in period_bounds]
                 record["_intervals"] = _merge_intervals(raw_intervals)
@@ -1313,10 +1317,33 @@ def evaluate_group(
         + SCORE_WEIGHTS["return"] * pf_df["return_norm"]
     )
 
-    # ========== باگ ۱ رفع شد: محدودیت top_n روی بهترین سبدها (بر اساس score) اعمال می‌شود ==========
-    pf_df = pf_df.sort_values("score", ascending=False)
-    if top_n is not None and top_n > 0:
-        pf_df = pf_df.head(top_n)
+    # ========== باگ ۱ رفع شد + فیکس درخواستی کاربر: به‌جای رد کردن سخت‌گیرانه،
+    # این‌جا تصمیم می‌گیریم. اگر تعداد کاندیدهای واجدشرایط (survival_rate/
+    # avg_return) به MIN_QUALIFIED_ROWS برسد، همان‌ها را (بر اساس score)
+    # برمی‌گردانیم؛ در غیر این صورت (خروجی خیلی کم یا خالی می‌شد)، به‌جای
+    # خالی ماندن، بهترین‌های *موجود* را بر اساس survival_rate (نه score) تا
+    # سقف FALLBACK_TOP_N برمی‌گردانیم — این‌طور فیلترها دیگر چیزی را واقعاً
+    # حذف نمی‌کنند، فقط بین دو حالت انتخاب می‌کنند. ==========
+    if abs_filters:
+        qualified_df = pf_df[pf_df["_passes_abs"]]
+        if len(qualified_df) >= MIN_QUALIFIED_ROWS:
+            pf_df = qualified_df.sort_values("score", ascending=False)
+            if top_n is not None and top_n > 0:
+                pf_df = pf_df.head(top_n)
+        else:
+            log.warning(
+                "فقط %d سبد آستانه‌های survival_rate>=%.1f/avg_return>=%.2f را رعایت کردند "
+                "(کمتر از حداقل %d) — به‌جای خروجی تقریباً خالی، بهترین %d سبد موجود بر اساس "
+                "نرخ بقا (بدون فیلتر مطلق) برگردانده می‌شود.",
+                len(qualified_df), ABS_MIN_SURVIVAL_RATE, ABS_MIN_AVG_RETURN,
+                MIN_QUALIFIED_ROWS, FALLBACK_TOP_N,
+            )
+            pf_df = pf_df.sort_values("survival_rate", ascending=False).head(FALLBACK_TOP_N)
+        pf_df = pf_df.drop(columns=["_passes_abs"])
+    else:
+        pf_df = pf_df.sort_values("score", ascending=False)
+        if top_n is not None and top_n > 0:
+            pf_df = pf_df.head(top_n)
     pf_df = pf_df.drop(columns=["survival_norm", "comp_norm", "corr_norm", "return_norm"])
 
     return pf_df.to_dict("records"), raw_candidate_count
@@ -2190,4 +2217,4 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+  
