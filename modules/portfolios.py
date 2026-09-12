@@ -1057,14 +1057,19 @@ def _period_monthly_stats(dated_values: list) -> dict:
 
     all_vals = [v for _, v in dated_values]
     rr_overall = _pl_ratio(all_vals)
-    profit_month_keys = {k for k in ordered_keys if sum(months[k]) > 0}
-    loss_month_keys = {k for k in ordered_keys if sum(months[k]) < 0}
-    rr_profit_months = _pl_ratio(
-        [v for d, v in dated_values if d and f"{d.year:04d}-{d.month:02d}" in profit_month_keys]
-    )
-    rr_loss_months = _pl_ratio(
-        [v for d, v in dated_values if d and f"{d.year:04d}-{d.month:02d}" in loss_month_keys]
-    )
+
+    # ========== باگ ۶ رفع شد ==========
+    # قبلاً این‌جا مقادیر روزانه/دوره‌ای داخل یک «ماه سودده» فیلتر می‌شدند و
+    # دوباره به مثبت/منفی تقسیم می‌شدند (_pl_ratio). چون داده‌ها تُنُک‌اند
+    # (بیشتر دوره‌ها بازده صفر دارند)، داخل یک ماهِ از قبل برچسب‌خورده به
+    # «سودده» عملاً هیچ مقدار منفی‌ای پیدا نمی‌شد (یا برعکس در ماه‌های
+    # ضررده هیچ مقدار مثبتی) و در نتیجه این دو ستون همیشه دقیقاً 0.0
+    # برمی‌گشتند — بدون استثنا، در کل خروجی. رفع آن با محاسبه‌ی این نسبت در
+    # سطح «بازده‌ی تجمیعیِ هر ماه» (همان profitable/losing که برای
+    # avg_profit_months/avg_loss_months بالا هم استفاده شده)، نه در سطح
+    # دوره‌ی خام داخل هر ماه.
+    rr_profit_months = (avg_profit_months / abs(avg_loss_months)) if (profitable and losing) else 0.0
+    rr_loss_months = rr_profit_months
 
     ordered_vals = [v for _, v in sorted(dated_values, key=lambda x: (x[0] is None, x[0]))]
     best_count, best_sum = 0, 0.0
@@ -1259,10 +1264,23 @@ def evaluate_group(
                 روز_فعال = len(sorted_exact) if sorted_exact else len(sorted_months)
 
             # [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد: از روی
-            # بازده‌ی سبد (مجموع اعضا) در هر ماه فعال — همان period_sums که
-            # survival_rate/compensation_ratio بالا هم استفاده می‌کنند.
+            # بازده‌ی سبد در هر ماه فعال.
+            #
+            # ========== باگ ۵ رفع شد ==========
+            # قبلاً این‌جا از period_sums خام (مجموع اعضا، returns.sum(axis=1))
+            # استفاده می‌شد که همان سوگیریِ به‌نفع سبدهای چندعضوی را دارد که
+            # در بالای survival_rate/avg_return توضیح داده شده (کامنت «باگ ۲
+            # رفع شد»). آن‌جا برای رفعش avg_return و survival_rate را با
+            # میانگین (sum+mean)/2 متعادل کردند، اما همین تصحیح برای این ۱۶
+            # ستون ماهانه اعمال نشده بود؛ در نتیجه اعدادی مثل
+            # میانگین_سود_ماهانه/بهترین_ماه_درصد نسبت به avg_return واقعیِ
+            # همان سبد ~۱.۳ تا ۱.۶ برابر تورم داشتند (برای سبدهای ۲ و ۳
+            # عضوی). این‌جا هم از همان معیار متعادل‌شده استفاده می‌کنیم تا با
+            # avg_return/survival_rate سازگار بماند.
             period_sums = returns.sum(axis=1)
-            dated_values = [(idx, float(v)) for idx, v in period_sums.items()]
+            period_means = returns.mean(axis=1)
+            balanced_returns = (period_sums + period_means) / 2.0
+            dated_values = [(idx, float(v)) for idx, v in balanced_returns.items()]
             ext16 = _period_monthly_stats(dated_values)
 
             member_coins = [
