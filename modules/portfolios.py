@@ -832,12 +832,25 @@ def _enumerate_clique_members(
 # -----------------------------------------------------------------------------
 
 def filter_pairs_by_correlation(corr_df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
-    """جفت‌هایی با همبستگی بیشتر از صدک ۲۵ام را حذف می‌کند."""
-    if corr_df.empty:
-        return corr_df, float("nan")
-    threshold = float(np.percentile(corr_df["correlation"], CORR_PERCENTILE_THRESHOLD))
-    kept = corr_df[corr_df["correlation"] <= threshold].copy()
-    return kept, threshold
+    """
+    ========== باگ ۷ رفع شد ==========
+    قبلاً این تابع جفت‌هایی با همبستگی بالاتر از صدک ۲۵ام *همان گروهی که
+    فراخوانی شده* را حذف می‌کرد. مشکل این بود که این آستانه مطلق نبود،
+    نسبت‌به‌اندازه‌/ترکیبِ گروه بود: همان جفتِ استراتژی، بسته به این‌که
+    evaluate_group با یک گروه کوچک (مثل run_timeline، یک کوین+امضا) صدا
+    زده شده یا با کل استخر (run_whole_time)، ممکن بود یک‌بار قبول و یک‌بار
+    رد شود — بدون هیچ ربطی به survival_rate/avg_return واقعی آن جفت. در
+    عمل یعنی سبدهایی با نرخ بقای بالاتر می‌توانستند پیش از رسیدن به مرحله‌ی
+    امتیازدهی، فقط به‌خاطر رتبه‌ی نسبیِ همبستگی‌شان در همان اجرا، کلاً حذف
+    شوند و هیچ‌وقت دیده نشوند.
+
+    حالا این فیلتر دیگر چیزی را حذف نمی‌کند — همه‌ی جفت‌های معتبر (با هر
+    همبستگی) وارد مرحله‌ی ساخت سبد می‌شوند و انتخاب نهایی صرفاً بر اساس
+    survival_rate/avg_return واقعی هر سبد انجام می‌شود (دقیقاً معیارهایی که
+    هدف واقعی است)؛ همبستگی هم‌چنان محاسبه و در ستون avg_correlation خروجی
+    گزارش می‌شود، فقط دیگر پیش از دیده‌شدن هیچ سبدی را رد نمی‌کند.
+    """
+    return corr_df.copy(), float("nan")
 
 
 # -----------------------------------------------------------------------------
@@ -1175,11 +1188,38 @@ def evaluate_group(
         return [], 0
 
     # ========== محافظ کارایی برای رفع باگ ۱ (حذف قید هم‌گروهی) ==========
+    #
+    # ========== باگ ۸ رفع شد ==========
+    # قبلاً این محدودسازی فقط بر پایه‌ی یک معیار بود: میانگین بازده ماهانه‌ی
+    # هر strategy_id به‌تنهایی. یعنی استراتژی‌هایی با نرخ بقای فردی بسیار
+    # بالا ولی بازده متوسط، همیشه اولین قربانی‌های این cutoff بودند — حتی
+    # اگر هدف اصلی (طبق درخواست کاربر) پیدا کردن بالاترین survival_rate هم
+    # باشد. حالا این cutoff دو دسته را همیشه تضمین‌شده نگه می‌دارد: ۱۰ تای
+    # برتر بر اساس نرخ بقای فردی + ۱۰ تای برتر بر اساس بازده فردی؛ باقی
+    # ظرفیت (تا سقف MAX_GLOBAL_CANDIDATES) طبق روال قبلی با بازده پر می‌شود.
+    # توجه: این هنوز تضمین نمی‌کند بهترین *ترکیب* (سبد) لزوماً از استراتژی‌های
+    # با معیار فردیِ بالا ساخته می‌شود — دو عضو با معیار فردیِ متوسط اما
+    # هم‌بستگیِ خیلی پایین می‌توانند سبدی برتر از هرکدام به‌تنهایی بسازند؛
+    # این محدودیت ذاتیِ هر پیش‌فیلترِ مبتنی‌بر-معیارِ-فردی است، نه چیزی که
+    # صرفاً با افزودن یک معیار دوم کامل رفع شود.
+    TOP_GUARANTEED_PER_METRIC = 10
     if MAX_GLOBAL_CANDIDATES and len(candidate_strategies) > MAX_GLOBAL_CANDIDATES:
-        indiv_quality = monthly[candidate_strategies].mean(skipna=True)
-        candidate_strategies = sorted(
-            indiv_quality.sort_values(ascending=False).head(MAX_GLOBAL_CANDIDATES).index.tolist()
+        indiv_return = monthly[candidate_strategies].mean(skipna=True)
+        indiv_survival = (monthly[candidate_strategies] > 0).mean(skipna=True) * 100.0
+
+        top_survival = set(
+            indiv_survival.sort_values(ascending=False).head(TOP_GUARANTEED_PER_METRIC).index
         )
+        top_return = set(
+            indiv_return.sort_values(ascending=False).head(TOP_GUARANTEED_PER_METRIC).index
+        )
+        guaranteed = top_survival | top_return
+
+        remaining_slots = max(MAX_GLOBAL_CANDIDATES - len(guaranteed), 0)
+        fill_pool = indiv_return.drop(index=guaranteed, errors="ignore")
+        fill = set(fill_pool.sort_values(ascending=False).head(remaining_slots).index)
+
+        candidate_strategies = sorted(guaranteed | fill)
         cs_set = set(candidate_strategies)
         kept_pairs = kept_pairs[kept_pairs["a"].isin(cs_set) & kept_pairs["b"].isin(cs_set)]
         corr_lookup = {(r.a, r.b): r.correlation for r in kept_pairs.itertuples()}
