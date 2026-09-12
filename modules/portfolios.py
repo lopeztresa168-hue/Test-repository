@@ -49,6 +49,7 @@ portfolios.py - ماژول دوم: سبدهای مکمل (Complementary Portfoli
 from __future__ import annotations
 
 import argparse
+import ast
 import itertools
 import json
 import logging
@@ -1928,35 +1929,126 @@ def _build_timeline_segments(pool: list[dict], returns_lookup: pd.Series, global
     return _collapse_adjacent(segments)
 
 
+def _load_whole_time_pool(
+    whole_time_csv_path: Path,
+    candidates: pd.DataFrame,
+) -> list[dict]:
+    """
+    ========== باگ ۹ رفع شد (معماری): timeline دیگر استخر خودش را نمی‌سازد ==========
+    قبلاً run_timeline با evaluate_group روی گروه‌های (coin, امضای بدون
+    رژیم) از صفر یک استخر کاندیدِ مستقل می‌ساخت — با فیلتر همبستگیِ خودش،
+    survival_rate/avg_return خودش، بدون هیچ ارتباطی به portfolios_whole_time.csv.
+    نتیجه: همان جفت استراتژی می‌توانست در یکی قبول و در دیگری رد شود (چون
+    آستانه‌ها نسبت‌به‌گروه بودند)، و survival_rate بین دو فایل ناسازگار
+    می‌شد (طبق بحث قبلی: یک سبد survival_rate=70.3 در timeline که اصلاً در
+    whole_time دیده نمی‌شد).
+
+    حالا: تنها منبع کاندید برای جدول زمانی، سبدهایی هستند که از قبل در
+    portfolios_whole_time.csv واجد شرایط شده‌اند (survival_rate/avg_return
+    دقیقاً همان‌هایی که در آن‌جا محاسبه شده، نه از نو). این تابع برای هر
+    ردیفِ whole_time، بازه‌های زمانیِ واقعیِ فعال‌بودن (_intervals) را از
+    روی داده‌ی خامِ همین اجرا بازسازی می‌کند (چون whole_time.csv فقط بازه‌ی
+    تجمیعیِ شروع/پایان را دارد، نه پنجره‌های روز‌به‌روز که موتور sweep-line
+    نیاز دارد) — بدون این‌که هیچ فیلتر همبستگی یا آستانه‌ی جدیدی اعمال کند.
+
+    اگر portfolios_whole_time.csv خالی/موجود نباشد، استخر خالی برمی‌گردد —
+    طبق تصمیم صریح کاربر: «وگرنه اصلاً نباید کاری کند» (بدون fallback به
+    ساخت مستقل کاندید).
+    """
+    if whole_time_csv_path is None or not Path(whole_time_csv_path).exists():
+        log.warning(
+            "فایل portfolios_whole_time.csv یافت نشد (%s) — طبق طراحیِ جدید، "
+            "timeline بدون آن هیچ سبدی نمی‌سازد و جدول زمانی خالی خواهد بود.",
+            whole_time_csv_path,
+        )
+        return []
+
+    wt = pd.read_csv(whole_time_csv_path)
+    if wt.empty:
+        log.warning("portfolios_whole_time.csv خالی است — جدول زمانی خالی خواهد بود.")
+        return []
+
+    exact_valid_periods = {
+        strat: set(sub["release_date"]) for strat, sub in candidates.groupby("strategy_id")
+    }
+    period_bounds = _period_bounds_by_date(candidates)
+
+    pool: list[dict] = []
+    skipped_no_timing = 0
+    for _, row in wt.iterrows():
+        try:
+            members = tuple(ast.literal_eval(row["members"]))
+        except Exception:
+            continue
+        if len(members) < 2:
+            continue
+
+        try:
+            member_coins = ast.literal_eval(row.get("member_coin_compositions", "[]"))
+        except Exception:
+            member_coins = []
+
+        exact_union: set = set()
+        for m in members:
+            exact_union |= exact_valid_periods.get(m, set())
+        sorted_exact = sorted(exact_union)
+        raw_intervals = [period_bounds[d] for d in sorted_exact if d in period_bounds]
+        intervals = _merge_intervals(raw_intervals)
+        if not intervals:
+            # این سبد در whole_time واجد شرایط بوده، ولی در داده‌ی خامِ این
+            # اجرای خاص (مثلاً یک بازه‌ی زمانیِ متفاوت/جدیدتر) رد پایی از
+            # بازه‌ی فعال‌بودنش پیدا نشد — رد می‌شود، نه این‌که با مقدار
+            # تخمینی جایگزین شود.
+            skipped_no_timing += 1
+            continue
+
+        pool.append({
+            "coin_composition": "+".join(sorted(set(member_coins))) if member_coins else "",
+            "signature": "+".join(members),
+            "members": list(members),
+            "survival_rate": float(row["survival_rate"]),
+            "compensation_ratio": float(row["compensation_ratio"]),
+            "avg_return": float(row["avg_return"]),
+            "avg_correlation": float(row["avg_correlation"]),
+            "sample_count": int(row["sample_count"]),
+            "_intervals": intervals,
+            "_passes_abs": True,
+        })
+
+    if skipped_no_timing:
+        log.info(
+            "%d سبد از whole_time به‌خاطر نبود بازه‌ی زمانیِ قابل‌بازسازی در داده‌ی خام این اجرا رد شدند.",
+            skipped_no_timing,
+        )
+    return pool
+
+
 def run_timeline(
     signatures_dir: Path,
     golden_scores_path: Optional[Path],
     version_schema_path: Optional[Path],
     output_dir: Path,
-    top_n: int,
+    whole_time_csv: Path,
     signatures_filter: Optional[Path] = None,
 ) -> Path:
     """
     ماژول سوم: یک جدول زمانی پیوسته از اولین تا آخرین رخداد واقعی می‌سازد که
-    برای هر بازه می‌گوید دقیقاً چه سبدی (یا ترکیبی) باید اجرا شود، با هدف
-    پوشش حداکثریِ محور زمان (نه فقط ~۱۵٪ فعلیِ هر سبد به‌تنهایی):
+    برای هر بازه می‌گوید دقیقاً چه سبدی (یا ترکیبی) باید اجرا شود.
 
-      ۱) هر سبدِ واجد شرایط + بازه‌های واقعیِ دقیقِ فعال‌بودنش (نه فقط
-         شروع/پایان تجمیعی) از raw jsonl بازسازی می‌شود؛ هم‌زمان، همه‌ی
-         کاندیدهای *زیر آستانه‌ی فیلتر مطلق* هم (بدون حذف) نگه داشته می‌شوند
-         تا در نبود گزینه‌ی واجدشرایط، به‌عنوان پرکننده‌ی شکاف در دسترس باشند.
-      ۲) sweep-line روی محور زمان، بازه‌های اتمی (مجموعه‌ی فعال ثابت) را
-         مشخص می‌کند.
-      ۳) در هر بازه‌ی اتمی: ۱ سبد واجد فعال → همان؛ ۲+ سبد واجد فعال
-         (هم‌پوشانی) → اعضا Union و با فرمول evaluate_group از نو روی داده‌ی
-         خام واقعیِ همان بازه ارزیابی می‌شود، و در صورت quality_score بالاتر
-         از بهترین تکی، ترکیب انتخاب می‌شود؛ صفر سبد واجد ولی سبد زیرِ
-         آستانه موجود → آن به‌عنوان «پرکننده‌ی شکاف» با برچسب صریح انتخاب
-         می‌شود؛ صفر مطلق → «بدون‌پوشش».
-      ۴) برای مقایسه‌ی *بین‌گروهی* (که score محلی evaluate_group به‌خاطر
-         صدک‌بندی درون‌گروهی برایش نامعتبر است)، یک quality_score سراسری
-         (بازده ۴۰٪ + جبران‌سازی ۳۰٪ + بقا ۲۰٪ + همبستگی پایین ۱۰٪، صدک‌بندی
-         روی کل استخر) محاسبه و برای همه‌ی تصمیم‌ها استفاده می‌شود.
+    ========== باگ ۹ رفع شد (معماری) ==========
+    این ماژول دیگر کاندید خودش را نمی‌سازد؛ فقط از میان سبدهایی که
+    portfolios_whole_time.csv از قبل واجد شرایط کرده انتخاب می‌کند (نگاه
+    کنید _load_whole_time_pool). اگر برای یک بازه هیچ سبد واجدشرایطی
+    هم‌پوشانی نداشته باشد، آن بازه «بدون‌پوشش» علامت می‌خورد — دیگر
+    «پرکننده‌ی شکاف با کاندید زیر آستانه» ساخته نمی‌شود، چون آن استخرِ
+    زیرآستانه دیگر در این‌جا وجود ندارد (طبق تصمیم صریح کاربر).
+
+    به همین دلیل build_fixed_portfolio_per_condition (که مفهوم «شرط خبری
+    X» را بر پایه‌ی یک coin_composition/signature واحد به‌ازای هر کاندید
+    فرض می‌کرد) دیگر این‌جا صدا زده نمی‌شود: سبدهای whole_time می‌توانند
+    اعضایی از چند کوین/امضای متفاوت هم‌زمان داشته باشند (دقیقاً همان قیدی
+    که در run_whole_time هم عمداً حذف شد)، پس دیگر یک «شرط خبری واحد»ی
+    که بشود کاندیدها را بر اساسش گروه‌بندی کرد، معنادار نیست.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1970,71 +2062,34 @@ def run_timeline(
         log.warning("golden_scores ارائه نشده — پیش‌فیلتر Golden رد می‌شود.")
         candidates = signatures
 
-    if candidates.empty:
-        log.warning("هیچ رکورد کاندیدی برای ساخت جدول زمانی یافت نشد.")
-
-    candidates = candidates.copy()
-    candidates["امضا_بدون_رژیم"] = candidates["signature"].apply(strip_market_regime)
-
-    pool: list[dict] = []
-    coin_groups = candidates.groupby(["coin_composition", "امضا_بدون_رژیم"])
-    group_keys = list(coin_groups.groups.keys())
-    log.info("حالت جدول زمانی: %d گروه (coin, امضای بدون رژیم) برای بررسی.", len(group_keys))
-
-    for coin_composition, sig_no_regime in group_keys:
-        group = coin_groups.get_group((coin_composition, sig_no_regime))
-        if group["strategy_id"].nunique() < 2:
-            continue
-        # abs_filters=False: هم واجدشرایط‌ها و هم زیرآستانه‌ای‌ها نگه داشته
-        # می‌شوند (با کلید _passes_abs مشخص می‌شوند)؛ top_n بزرگ (یا None
-        # برای بدون‌سقف) تا استخر پرکردن شکاف محدود نشود.
-        pool_top_n = None if top_n is None else max(top_n, 50)
-        raw, _raw_count = evaluate_group(
-            coin_composition, sig_no_regime, group, top_n=pool_top_n,
-            attach_periods=True, abs_filters=False,
-        )
-        pool.extend(raw)
-
-    n_qualified = sum(1 for r in pool if r.get("_passes_abs"))
-    log.info("استخر کل: %d کاندید (%d واجد شرایط، %d زیر آستانه/پرکننده شکاف).",
-              len(pool), n_qualified, len(pool) - n_qualified)
-
     columns = [
         "شروع", "پایان", "روز", "حالت", "coin_composition", "signature",
         "members", "avg_return", "compensation_ratio", "survival_rate",
         "avg_correlation", "quality_score",
     ]
 
-    if not pool:
-        log.warning("هیچ کاندیدی (حتی زیر آستانه) یافت نشد — جدول زمانی خالی خواهد بود.")
+    if candidates.empty:
+        log.warning("هیچ رکورد کاندیدی برای ساخت جدول زمانی یافت نشد.")
         out_df = pd.DataFrame(columns=columns)
-        output_path = output_dir / "portfolios_timeline"
-        return _save_dataframe(out_df, output_path)
+        return _save_dataframe(out_df, output_dir / "portfolios_timeline")
+
+    candidates = build_release_dates(candidates.copy())
+
+    pool = _load_whole_time_pool(whole_time_csv, candidates)
+    log.info("حالت جدول زمانی: %d سبد از portfolios_whole_time.csv برای پوشش محور زمان بارگذاری شد.", len(pool))
+
+    if not pool:
+        log.warning("هیچ سبد قابل‌استفاده‌ای از whole_time یافت نشد — جدول زمانی خالی خواهد بود.")
+        out_df = pd.DataFrame(columns=columns)
+        return _save_dataframe(out_df, output_dir / "portfolios_timeline")
 
     global_arrays = _build_global_quality_arrays(pool)
     for record in pool:
         record["quality_score"] = _quality_score(record, global_arrays)
 
-    # [افزوده] سبد ثابت به‌ازای هر شرط خبری X (فارغ از رخداد/تاریخِ خاص) —
-    # خروجی مستقل از portfolios_timeline، چون منطقش متفاوت است: اینجا هر
-    # شرط دقیقاً یک ردیف/یک سبد ثابت دارد، نه یک ردیف به‌ازای هر بازه‌ی
-    # زمانیِ واقعی.
-    fixed_rows = build_fixed_portfolio_per_condition(pool)
-    fixed_df = pd.DataFrame(fixed_rows).sort_values("quality_score", ascending=False)
-    fixed_path = _save_dataframe(fixed_df, output_dir / "portfolios_fixed_per_condition")
-    n_ambiguous = 0
-    if not fixed_df.empty:
-        n_ambiguous = int(((fixed_df["تعداد_کاندید_رقیب"] > 1) & (fixed_df["فاصله_تا_نفر_دوم"] < 5.0)).sum())
-    log.info(
-        "سبد ثابت به‌ازای هر شرط: %s (%d شرط خبری X، %d مورد با فاصله‌ی امتیاز کمتر از ۵ تا نفر دوم — انتخاب مشکوک/شکننده).",
-        fixed_path, len(fixed_df), n_ambiguous,
-    )
-
     # ---- نمایه‌ی بازده‌ی خام هر strategy_id در هر release_date، برای محاسبه‌ی دقیق سبدهای ادغام‌شده ----
-    returns_index = candidates.copy()
-    returns_index["release_date"] = returns_index.apply(compute_release_date, axis=1)
     returns_lookup = (
-        returns_index.groupby(["strategy_id", "release_date"])["total_return"].mean()
+        candidates.groupby(["strategy_id", "release_date"])["total_return"].mean()
     )
 
     segments = _build_timeline_segments(pool, returns_lookup, global_arrays)
@@ -2047,6 +2102,7 @@ def run_timeline(
     final_path = _save_dataframe(out_df, output_path)
     log.info("ذخیره شد: %s (%d بازه‌ی نهایی پس از فشرده‌سازی)", final_path, len(out_df))
     return final_path
+
 
 
 # -----------------------------------------------------------------------------
@@ -2212,12 +2268,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--timeline", action="store_true", default=False,
-        help="ماژول سوم: به‌جای انتخاب یک سبد به‌ازای هر شرایط، یک جدول "
-             "زمانی پیوسته (از اولین تا آخرین رخداد واقعی) می‌سازد که برای "
-             "هر بازه دقیقاً می‌گوید چه سبدی (یا ترکیبی از چند سبد هم‌پوشان) "
-             "باید اجرا شود؛ شکاف‌ها را با بهترین گزینه‌ی موجود (حتی زیر "
-             "آستانه‌ی فیلتر مطلق) پر می‌کند. خروجی در portfolios_timeline.* "
-             "ذخیره می‌شود. با --whole-time قابل ترکیب نیست.",
+        help="ماژول سوم: یک جدول زمانی پیوسته (از اولین تا آخرین رخداد "
+             "واقعی) می‌سازد که برای هر بازه می‌گوید دقیقاً چه سبدی (یا "
+             "ترکیبی از چند سبد هم‌پوشان) باید اجرا شود. [فیکس معماری] "
+             "کاندیدهای این حالت دیگر از صفر ساخته نمی‌شوند؛ فقط از میان "
+             "سبدهایی که portfolios_whole_time.csv از قبل واجد شرایط کرده "
+             "انتخاب می‌شوند — پس --whole-time-csv الزامی است. خروجی در "
+             "portfolios_timeline.* ذخیره می‌شود. با --whole-time قابل "
+             "ترکیب نیست.",
+    )
+    parser.add_argument(
+        "--whole-time-csv", required=False, type=Path, default=None,
+        help="مسیر فایل portfolios_whole_time.csv (خروجیِ از پیش تولیدشده‌ی "
+             "--whole-time). فقط با --timeline استفاده می‌شود و برای آن "
+             "الزامی است — timeline دیگر کاندید مستقل نمی‌سازد.",
     )
     return parser.parse_args(argv)
 
@@ -2236,12 +2300,19 @@ def main(argv=None) -> int:
 
     try:
         if args.timeline:
+            if args.whole_time_csv is None:
+                log.error(
+                    "--timeline بدون --whole-time-csv اجرا نمی‌شود (طبق طراحیِ "
+                    "جدید، timeline کاندید مستقل نمی‌سازد و باید از "
+                    "portfolios_whole_time.csv از پیش‌تولیدشده بخواند)."
+                )
+                return 1
             run_timeline(
                 signatures_dir=args.signatures_dir,
                 golden_scores_path=args.golden_scores,
                 version_schema_path=args.version_schema,
                 output_dir=output_dir,
-                top_n=args.top_n,
+                whole_time_csv=args.whole_time_csv,
                 signatures_filter=args.signatures_filter,
             )
         elif args.whole_time:
