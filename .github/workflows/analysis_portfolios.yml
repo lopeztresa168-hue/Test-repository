@@ -887,23 +887,6 @@ jobs:
           fi
           rm -f /tmp/portfolios_scores.csv /tmp/portfolios_csv_list.txt
 
-      - name: فراخوانی مجدد loop_analysis.yml
-        env:
-          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
-        run: |
-          CS="${{ github.event.inputs.chunk_start }}"
-          CE="${{ github.event.inputs.chunk_end }}"
-          if [ -n "$CS" ] || [ -n "$CE" ]; then
-            gh api repos/${{ github.repository }}/actions/workflows/loop_analysis.yml/dispatches \
-              -X POST \
-              -f ref="main" \
-              -f "inputs[chunk_start]=${CS}" \
-              -f "inputs[chunk_end]=${CE}"
-          else
-            gh api repos/${{ github.repository }}/actions/workflows/loop_analysis.yml/dispatches \
-              -X POST -f ref="main"
-          fi
-
   # ================================================================
   # [فیکس] portfolios-whole-time: اجرای واقعی حالت run_whole_time() که در
   # portfolios.py پیاده‌سازی شده بود ولی هیچ‌جای این workflow صدا زده نمی‌شد
@@ -1337,3 +1320,35 @@ jobs:
             done
           fi
 
+  # ================================================================
+  # [فیکس] فراخوانی مجدد loop_analysis.yml قبلاً داخل جاب portfolios-cleanup
+  # بود. چون portfolios-cleanup / portfolios-whole-time / portfolios-timeline
+  # هر سه فقط به portfolios-batch وابسته‌اند (نه به یکدیگر)، هر سه به‌صورت
+  # موازی اجرا می‌شوند — یعنی ممکن بود cleanup زودتر از whole-time/timeline
+  # تمام شود و ران بعدیِ loop را همان لحظه صدا بزند، در حالی که دو جاب دیگر
+  # همین اجرا هنوز روی داده کار می‌کردند یا commit/push نکرده بودند (ریسک
+  # race condition و شروع اجرای بعدی با داده‌ی ناقص). حالا این فراخوانی به
+  # یک جاب مستقل منتقل شده که به هر سه‌ی آن‌ها وابسته است، تا فقط پس از
+  # تکمیل واقعیِ کل اجرا (نه فقط cleanup) ران بعدی شروع شود.
+  # ================================================================
+  portfolios-trigger-next-loop:
+    needs: [portfolios-cleanup, portfolios-whole-time, portfolios-timeline]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.portfolios-batch.result != 'skipped' }}
+    steps:
+      - name: فراخوانی مجدد loop_analysis.yml
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          CS="${{ github.event.inputs.chunk_start }}"
+          CE="${{ github.event.inputs.chunk_end }}"
+          if [ -n "$CS" ] || [ -n "$CE" ]; then
+            gh api repos/${{ github.repository }}/actions/workflows/loop_analysis.yml/dispatches \
+              -X POST \
+              -f ref="main" \
+              -f "inputs[chunk_start]=${CS}" \
+              -f "inputs[chunk_end]=${CE}"
+          else
+            gh api repos/${{ github.repository }}/actions/workflows/loop_analysis.yml/dispatches \
+              -X POST -f ref="main"
+          fi
