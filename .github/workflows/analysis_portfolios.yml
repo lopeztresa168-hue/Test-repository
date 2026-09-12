@@ -84,7 +84,7 @@ jobs:
             echo "queue_empty=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: تقسیم صف به چانک‌های ۲۵۰۰ تایی (نگهداری کامل signature_path و archive_path)
+      - name: تقسیم صف به چانک‌های حداکثر ۶۲۵ تایی (نگهداری کامل signature_path و archive_path)
         id: gen
         if: steps.queue.outputs.queue_empty != 'true'
         run: |
@@ -95,11 +95,21 @@ jobs:
           # هر job در مرحله‌ی portfolios-batch بتواند archive_path لازم خودش
           # را مستقیماً دانلود کند و دیگر نیازی به artifact عظیم all-signatures
           # نباشد. همچنین یک سقف MAX_COMBOS_PER_RUN اعمال می‌شود تا هر اجرا
-          # حداکثر روی ۳۰,۰۰۰ آیتم اول صف کار کند. ==========
+          # حداکثر روی آیتم‌های اول صف کار کند. ==========
           jq -c '[.[] | select(. != null)]' \
             /tmp/all_combinations_portfolios.json > /tmp/portfolios_chunks/queue_items_full.json
 
-          MAX_COMBOS_PER_RUN=30000
+          # [فیکس مشابه analysis_fixed_batch.yml] قبلاً CHUNK_SIZE=2500 هاردکد
+          # بود، یعنی chunk آخر با تقسیم غیردقیق TOTAL می‌توانست کوچک‌تر/بزرگ‌تر
+          # از بقیه دربیاید. راه‌حل: به‌جای CHUNK_SIZE ثابت، تعداد چانک را ثابت
+          # نگه می‌داریم (DESIRED_CHUNK_COUNT) و مرز هر چانک را با
+          # floor(TOTAL*i/CHUNK_COUNT) محاسبه می‌کنیم — این‌طور همیشه دقیقاً
+          # DESIRED_CHUNK_COUNT چانک تولید می‌شود (مگر وقتی TOTAL از آن کمتر
+          # باشد) و چون MAX_COMBOS_PER_RUN=DESIRED_CHUNK_COUNT*MAX_CHUNK_SIZE،
+          # هیچ چانکی هرگز از MAX_CHUNK_SIZE بزرگ‌تر نمی‌شود.
+          DESIRED_CHUNK_COUNT=20
+          MAX_CHUNK_SIZE=625
+          MAX_COMBOS_PER_RUN=$((DESIRED_CHUNK_COUNT * MAX_CHUNK_SIZE))
           jq -c ".[0:${MAX_COMBOS_PER_RUN}]" /tmp/portfolios_chunks/queue_items_full.json \
             > /tmp/portfolios_chunks/queue_items.json
           rm -f /tmp/portfolios_chunks/queue_items_full.json
@@ -113,11 +123,9 @@ jobs:
             exit 0
           fi
 
-          CHUNK_SIZE=2500
-          CHUNK_COUNT=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
-          if [ "$CHUNK_COUNT" -gt 256 ]; then
-            CHUNK_SIZE=$(( (TOTAL + 255) / 256 ))
-            CHUNK_COUNT=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+          CHUNK_COUNT=$DESIRED_CHUNK_COUNT
+          if [ "$TOTAL" -lt "$DESIRED_CHUNK_COUNT" ]; then
+            CHUNK_COUNT=$TOTAL
           fi
 
           INPUT_START="${{ github.event.inputs.chunk_start }}"
@@ -144,8 +152,8 @@ jobs:
 
           INDICES="["
           for ((i=0; i<CHUNK_COUNT; i++)); do
-            START=$((i * CHUNK_SIZE))
-            END=$((START + CHUNK_SIZE))
+            START=$(( TOTAL * i / CHUNK_COUNT ))
+            END=$(( TOTAL * (i + 1) / CHUNK_COUNT ))
             jq ".[$START:$END]" /tmp/portfolios_chunks/queue_items.json > /tmp/portfolios_chunks/chunk_${i}.json
             if [ "$i" -ge "$INPUT_START" ] && [ "$i" -le "$INPUT_END" ]; then
               if [ "${#INDICES}" -gt 1 ]; then INDICES+=", "; fi
@@ -156,7 +164,7 @@ jobs:
           rm -f /tmp/portfolios_chunks/queue_items.json
           echo "matrix_items=$INDICES" >> $GITHUB_OUTPUT
           echo "empty=false" >> $GITHUB_OUTPUT
-          echo "✅ $TOTAL آیتم در $CHUNK_COUNT چانک (سایز $CHUNK_SIZE) — اجرای chunk‌های $INPUT_START تا $INPUT_END."
+          echo "✅ $TOTAL آیتم در $CHUNK_COUNT چانک (حداکثر $MAX_CHUNK_SIZE در هر چانک) — اجرای chunk‌های $INPUT_START تا $INPUT_END."
 
       - name: آپلود چانک‌های portfolios
         if: steps.gen.outputs.empty == 'false'
@@ -1119,9 +1127,14 @@ jobs:
   # غیرچانک‌بندی‌شده‌ی portfolios-whole-time اینجا هم به کار می‌رود.
   # ================================================================
   portfolios-timeline:
-    needs: [portfolios-generate-matrix, portfolios-batch]
+    # [فیکس معماری] timeline دیگر کاندید مستقل نمی‌سازد، بلکه فقط از میان
+    # سبدهایی که portfolios-whole-time از قبل واجد شرایط کرده انتخاب
+    # می‌کند (portfolios_outputs/portfolios_whole_time.csv که آن جاب
+    # commit/push کرده). پس باید *بعد از* اتمام واقعیِ whole-time اجرا
+    # شود، نه موازی با آن.
+    needs: [portfolios-generate-matrix, portfolios-batch, portfolios-whole-time]
     runs-on: ubuntu-latest
-    if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' }}
+    if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' && needs.portfolios-whole-time.result == 'success' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -1275,6 +1288,12 @@ jobs:
       - name: 4. اجرای portfolios.py --timeline
         if: steps.queue_full.outputs.queue_empty != 'true'
         run: |
+          if [ ! -s portfolios_outputs/portfolios_whole_time.csv ]; then
+            echo "❌ portfolios_outputs/portfolios_whole_time.csv یافت نشد یا خالی است."
+            echo "   طبق طراحیِ جدید، timeline بدون آن هیچ سبدی نمی‌سازد."
+            exit 1
+          fi
+
           mkdir -p /tmp/portfolios_timeline_out
           GOLDEN_ARG=""
           if [ -f /tmp/golden_scores/golden_scores.csv ]; then
@@ -1287,7 +1306,7 @@ jobs:
             --signatures-dir /tmp/archives_extracted_tl \
             $GOLDEN_ARG \
             --output-dir /tmp/portfolios_timeline_out \
-            --top-n 15 \
+            --whole-time-csv portfolios_outputs/portfolios_whole_time.csv \
             --timeline
           echo "✅ portfolios.py --timeline اجرا شد."
 
@@ -1334,7 +1353,17 @@ jobs:
   portfolios-trigger-next-loop:
     needs: [portfolios-cleanup, portfolios-whole-time, portfolios-timeline]
     runs-on: ubuntu-latest
-    if: ${{ always() && needs.portfolios-batch.result != 'skipped' }}
+    # [فیکس] این جاب قبلاً به needs.portfolios-batch ارجاع می‌داد، در حالی
+    # که portfolios-batch در لیست needs همین جاب نبود — در GitHub Actions
+    # فقط می‌شود به needs.<job>ی ارجاع داد که در همان needs: لیست شده
+    # باشد. حالا به‌جایش نتیجه‌ی خودِ سه جابِ وابسته بررسی می‌شود: اگر
+    # هر سه skipped بودند (یعنی از اول چیزی برای پردازش نبوده)، ران بعدی
+    # صدا زده نمی‌شود.
+    if: >-
+      ${{ always() &&
+          !(needs.portfolios-cleanup.result == 'skipped' &&
+            needs.portfolios-whole-time.result == 'skipped' &&
+            needs.portfolios-timeline.result == 'skipped') }}
     steps:
       - name: فراخوانی مجدد loop_analysis.yml
         env:
