@@ -896,22 +896,38 @@ jobs:
           rm -f /tmp/portfolios_scores.csv /tmp/portfolios_csv_list.txt
 
   # ================================================================
-  # [فیکس] portfolios-whole-time: اجرای واقعی حالت run_whole_time() که در
-  # portfolios.py پیاده‌سازی شده بود ولی هیچ‌جای این workflow صدا زده نمی‌شد
-  # (فقط حالت پیش‌فرض run() با خروجی portfolios.csv اجرا می‌شد).
+  # [فیکس معماری matrix-پذیر] portfolios-whole-time قبلاً یک job تک‌تکه بود
+  # که هم دانلود کامل آرشیوها، هم ساخت گراف/صف ترکیبات، هم امتیازدهی هر
+  # ترکیب، هم نرمال‌سازی/انتخاب نهایی سراسری را در یک اجرای سریال انجام
+  # می‌داد.
   #
-  # طبق مستندات خودِ run_whole_time در portfolios.py: این حالت نیازی به
-  # chunk/resume/interrupt جداگانه ندارد (چون گروه‌بندی فقط بر اساس
-  # coin_composition است، نه (coin, signature))، اما برای درست‌بودن آماری
-  # (survival_rate/correlation باید روی کل تاریخچه‌ی یک coin_composition
-  # حساب شوند، نه فقط یک chunk) باید تمام آرشیوهای صف (نه فقط آرشیوهای یک
-  # chunk) دانلود و استخراج شوند — برای همین یک job مستقل و غیرچانک‌بندی‌شده
-  # است، بعد از تکمیل portfolios-batch اجرا می‌شود.
+  # طبق تحلیل evaluate_group در portfolios.py: فقط امتیازدهیِ هر ترکیب
+  # (score_combo) واقعاً مستقل و قابل‌توزیع بین چند job است — چون فقط به
+  # داده‌ی خودِ اعضای همان ترکیب نیاز دارد. ساختِ صف ترکیبات
+  # (evaluate_group_build؛ نیازمند دیدن همه‌ی کاندیدها همزمان برای تشخیص
+  # کدام جفت‌ها اصلاً یک لبه‌ی معتبر در گراف‌اند) و نرمال‌سازیِ percentile
+  # نهایی (evaluate_group_finalize؛ نیازمند دیدن کل مجموعه‌ی سبدهای
+  # یافت‌شده همزمان تا رتبه‌بندی نسبی درست باشد) هر دو ذاتاً سراسری‌اند و
+  # فقط یک‌بار معنا دارند. پس این یک job اکنون سه job شده:
+  #   ۱) portfolios-whole-time-build   (یک‌بار، سراسری — تنها فازی که به
+  #      دانلود کامل آرشیوها نیاز دارد)
+  #   ۲) portfolios-whole-time-score   (matrix — دقیقاً ۲۰ chunk. برخلاف
+  #      chunk‌بندیِ صف archive/signature در portfolios-generate-matrix،
+  #      این‌جا هیچ سقفی روی تعداد کل ترکیبات گذاشته نمی‌شود: چون انتخاب
+  #      نهایی سراسری است، همه‌ی ترکیبات باید در همین اجرا امتیازدهی شوند
+  #      وگرنه رتبه‌بندی/انتخاب نهایی ناقص و غلط می‌شود — مازاد را نمی‌شود
+  #      برای اجرای بعدی نگه داشت.)
+  #   ۳) portfolios-whole-time-merge   (یک‌بار، سراسری)
+  # منطق محاسباتیِ خودِ portfolios.py تغییر نکرده (فقط evaluate_group به سه
+  # تابع مستقل افراز شده)، پس نتیجه‌ی نهایی با حالت تک‌جابی قبلی یکسان است.
   # ================================================================
-  portfolios-whole-time:
+  portfolios-whole-time-build:
     needs: [portfolios-generate-matrix, portfolios-batch]
     runs-on: ubuntu-latest
     if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' }}
+    outputs:
+      empty: ${{ steps.chunk.outputs.empty }}
+      matrix_items: ${{ steps.chunk.outputs.matrix_items }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -935,7 +951,7 @@ jobs:
         id: queue_full
         run: |
           # [فیکس race condition] قبلاً این استپ صف را مستقیماً از مخزن سوم
-          # دوباره دانلود می‌کرد. چون portfolios-whole-time هیچ وابستگی‌ای به
+          # دوباره دانلود می‌کرد. چون این job هیچ وابستگی‌ای به
           # portfolios-cleanup نداشت، ترتیب اجرا تضمین‌شده نبود: اگر cleanup
           # زودتر از این استپ اجرا می‌شد، صف را قبلاً خالی کرده بود و اینجا
           # QUEUE_TOTAL=0 دیده می‌شد — بدون خطا، بدون warning. حالا به‌جای
@@ -1016,11 +1032,9 @@ jobs:
           THIRD_REPO: ${{ secrets.THIRD_REPO }}
           RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
         run: |
-          # [نکته مهم] برخلاف portfolios-batch که فقط archive_path های یک
-          # chunk را می‌گیرد، اینجا عمداً تمام archive_path های یکتای کل صف
-          # دانلود می‌شوند — چون run_whole_time روی کل تاریخچه‌ی هر
-          # coin_composition کار می‌کند و نمی‌توان بخشی از داده‌ی یک کوین را
-          # جا انداخت (وگرنه survival_rate/correlation غلط محاسبه می‌شود).
+          # [نکته مهم] عمداً تمام archive_path های یکتای کل صف دانلود
+          # می‌شوند — چون تعیین کاندیدهای نهایی/گراف ترکیبات باید روی کل
+          # تاریخچه انجام شود، نمی‌توان بخشی از داده را جا انداخت.
           mkdir -p /tmp/archives_extracted_wt
           jq -r '[.[] | if type == "object" then .archive_path else empty end]
                  | map(select(. != null and . != "")) | unique | .[]' \
@@ -1069,10 +1083,11 @@ jobs:
             echo "❌ هیچ فایل .jsonl استخراج نشد."; exit 1
           fi
 
-      - name: 4. اجرای portfolios.py --whole-time
+      - name: 4. اجرای portfolios.py --whole-time-build (فاز ۱ — ساخت صف کامل ترکیبات + داده‌ی مشترک سبک)
+        id: build
         if: steps.queue_full.outputs.queue_empty != 'true'
         run: |
-          mkdir -p /tmp/portfolios_whole_time_out
+          mkdir -p /tmp/portfolios_wt_build
           GOLDEN_ARG=""
           if [ -f /tmp/golden_scores/golden_scores.csv ]; then
             GOLDEN_ARG="--golden-scores /tmp/golden_scores/golden_scores.csv"
@@ -1083,13 +1098,161 @@ jobs:
           python modules/portfolios.py \
             --signatures-dir /tmp/archives_extracted_wt \
             $GOLDEN_ARG \
-            --output-dir /tmp/portfolios_whole_time_out \
-            --top-n 15 \
-            --whole-time
-          echo "✅ portfolios.py --whole-time اجرا شد."
+            --output-dir /tmp/portfolios_wt_build \
+            --whole-time-build
+          echo "✅ فاز build کامل شد."
 
-      - name: 5. آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
+      - name: 5. تقسیم صف ترکیبات به دقیقاً ۲۰ chunk (بدون هیچ سقفی روی تعداد کل ترکیبات)
+        id: chunk
         if: steps.queue_full.outputs.queue_empty != 'true'
+        run: |
+          if [ ! -f /tmp/portfolios_wt_build/combos.json ] || [ "$(cat /tmp/portfolios_wt_build/empty.flag 2>/dev/null)" = "1" ]; then
+            echo "⚠️ صف ترکیبات خالی است (هیچ کاندید/ترکیب معتبری یافت نشد)."
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          TOTAL=$(jq 'length' /tmp/portfolios_wt_build/combos.json)
+          echo "ℹ️ تعداد کل ترکیبات کاندید (بدون هیچ سقفی): $TOTAL"
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # [الگوی analysis_fixed_batch.yml/analysis_portfolios.yml] دقیقاً
+          # ۲۰ chunk با مرزبندی floor(TOTAL*i/CHUNK_COUNT) — اما برخلاف آن
+          # دو مورد، اینجا هیچ MAX_COMBOS_PER_RUN/سقفی روی TOTAL اعمال
+          # نمی‌شود: چون evaluate_group_finalize (نرمال‌سازی/انتخاب نهایی)
+          # باید کل مجموعه‌ی ترکیبات را ببیند، نمی‌شود مازاد را برای اجرای
+          # بعدی نگه داشت — هر ۲۰ chunk این‌جا فقط برای موازی‌سازیِ
+          # امتیازدهی است، نه برای محدود کردن دامنه‌ی محاسبه.
+          DESIRED_CHUNK_COUNT=20
+          CHUNK_COUNT=$DESIRED_CHUNK_COUNT
+          if [ "$TOTAL" -lt "$DESIRED_CHUNK_COUNT" ]; then
+            CHUNK_COUNT=$TOTAL
+          fi
+
+          mkdir -p /tmp/portfolios_wt_build/chunks
+          INDICES="["
+          for ((i=0; i<CHUNK_COUNT; i++)); do
+            START=$(( TOTAL * i / CHUNK_COUNT ))
+            END=$(( TOTAL * (i + 1) / CHUNK_COUNT ))
+            jq ".[$START:$END]" /tmp/portfolios_wt_build/combos.json > /tmp/portfolios_wt_build/chunks/combo_chunk_${i}.json
+            if [ "$i" -gt 0 ]; then INDICES+=", "; fi
+            INDICES+="$i"
+          done
+          INDICES+="]"
+          echo "matrix_items=$INDICES" >> $GITHUB_OUTPUT
+          echo "empty=false" >> $GITHUB_OUTPUT
+          echo "✅ $TOTAL ترکیب در $CHUNK_COUNT chunk (بدون هیچ سقفی روی سایز هر chunk) تقسیم شد."
+
+      - name: آپلود داده‌ی مشترک + chunkهای صف ترکیبات (برای فاز ۲ — matrix)
+        if: steps.chunk.outputs.empty != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-wt-shared-${{ github.run_id }}
+          path: |
+            /tmp/portfolios_wt_build/monthly_returns.parquet
+            /tmp/portfolios_wt_build/corr_lookup.parquet
+            /tmp/portfolios_wt_build/strategy_meta.parquet
+            /tmp/portfolios_wt_build/exact_valid_periods.parquet
+            /tmp/portfolios_wt_build/period_length_by_date.parquet
+            /tmp/portfolios_wt_build/chunks/*.json
+          retention-days: 1
+
+  # ================================================================
+  # portfolios-whole-time-score: فاز ۲ (matrix، دقیقاً ۲۰ job موازی — یا
+  # کمتر اگر تعداد کل ترکیبات کمتر از ۲۰ باشد). هیچ آرشیوی دوباره دانلود
+  # نمی‌شود؛ فقط جدول‌های سبکِ فاز build (monthly/corr/meta) که حجمشان
+  # اساساً کوچک‌تر از آرشیوهای خام است دانلود و در حافظه پردازش می‌شوند.
+  # ================================================================
+  portfolios-whole-time-score:
+    needs: [portfolios-whole-time-build]
+    runs-on: ubuntu-latest
+    if: ${{ needs.portfolios-whole-time-build.outputs.empty == 'false' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk_index: ${{ fromJson(needs.portfolios-whole-time-build.outputs.matrix_items || '[0]') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود داده‌ی مشترک فاز build
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-wt-shared-${{ github.run_id }}
+          path: /tmp/portfolios_wt_shared
+
+      - name: امتیازدهیِ برشِ این job از صف ترکیبات (مستقل از بقیه‌ی chunkها)
+        run: |
+          mkdir -p /tmp/portfolios_wt_parts
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_wt_out \
+            --whole-time-score \
+            --shared-dir /tmp/portfolios_wt_shared \
+            --combos-file /tmp/portfolios_wt_shared/chunks/combo_chunk_${{ matrix.chunk_index }}.json \
+            --output-file /tmp/portfolios_wt_parts/part_${{ matrix.chunk_index }}.parquet
+
+      - name: آپلود part این chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-wt-part-${{ matrix.chunk_index }}-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts/part_${{ matrix.chunk_index }}.parquet
+          retention-days: 1
+
+  # ================================================================
+  # portfolios-whole-time-merge: فاز ۳ (یک‌بار، سراسری). همه‌ی
+  # part_*.parquet فاز ۲ را ادغام و evaluate_group_finalize (نرمال‌سازیِ
+  # percentile_rank/انتخاب قطعی‌یا-fallback — دقیقاً همان تابعی که
+  # evaluate_group هم در حالت تک‌جابی استفاده می‌کند) را یک‌بار روی کل
+  # مجموعه‌ی ادغام‌شده اجرا می‌کند تا نتیجه با حالت قبلی یکسان بماند.
+  # ================================================================
+  portfolios-whole-time-merge:
+    needs: [portfolios-whole-time-build, portfolios-whole-time-score]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.portfolios-whole-time-build.outputs.empty == 'false' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود همه‌ی partهای فاز ۲ (matrix)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts
+          merge-multiple: true
+
+      - name: ادغام نهایی + نرمال‌سازی/انتخاب سراسری (فاز ۳)
+        run: |
+          mkdir -p /tmp/portfolios_whole_time_out
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_whole_time_out \
+            --whole-time-merge \
+            --parts-dir /tmp/portfolios_wt_parts \
+            --top-n 15
+          echo "✅ portfolios.py --whole-time-merge اجرا شد."
+
+      - name: آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
         run: |
           FOUND=$(find /tmp/portfolios_whole_time_out -name 'portfolios_whole_time*.csv' | head -1)
           if [ -z "$FOUND" ]; then
@@ -1132,9 +1295,9 @@ jobs:
     # می‌کند (portfolios_outputs/portfolios_whole_time.csv که آن جاب
     # commit/push کرده). پس باید *بعد از* اتمام واقعیِ whole-time اجرا
     # شود، نه موازی با آن.
-    needs: [portfolios-generate-matrix, portfolios-batch, portfolios-whole-time]
+    needs: [portfolios-generate-matrix, portfolios-batch, portfolios-whole-time-merge]
     runs-on: ubuntu-latest
-    if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' && needs.portfolios-whole-time.result == 'success' }}
+    if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' && needs.portfolios-whole-time-merge.result == 'success' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -1351,7 +1514,7 @@ jobs:
   # تکمیل واقعیِ کل اجرا (نه فقط cleanup) ران بعدی شروع شود.
   # ================================================================
   portfolios-trigger-next-loop:
-    needs: [portfolios-cleanup, portfolios-whole-time, portfolios-timeline]
+    needs: [portfolios-cleanup, portfolios-whole-time-merge, portfolios-timeline]
     runs-on: ubuntu-latest
     # [فیکس] این جاب قبلاً به needs.portfolios-batch ارجاع می‌داد، در حالی
     # که portfolios-batch در لیست needs همین جاب نبود — در GitHub Actions
@@ -1362,7 +1525,7 @@ jobs:
     if: >-
       ${{ always() &&
           !(needs.portfolios-cleanup.result == 'skipped' &&
-            needs.portfolios-whole-time.result == 'skipped' &&
+            needs.portfolios-whole-time-merge.result == 'skipped' &&
             needs.portfolios-timeline.result == 'skipped') }}
     steps:
       - name: فراخوانی مجدد loop_analysis.yml
