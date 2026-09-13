@@ -1241,16 +1241,69 @@ jobs:
           path: /tmp/portfolios_wt_parts
           merge-multiple: true
 
+      - name: "[دیباگ کد ۱۴۳] چک اینکه فایل‌های part واقعاً دانلود شده‌اند"
+        run: |
+          echo "تعداد فایل part_*.parquet روی دیسک:"
+          find /tmp/portfolios_wt_parts -name 'part_*.parquet' | wc -l
+          echo "لیست کامل + حجم هرکدام:"
+          ls -la /tmp/portfolios_wt_parts/ || echo "⚠️ پوشه‌ی parts وجود ندارد"
+          echo "مجموع حجم:"
+          du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
+          echo "حافظه‌ی آزاد runner قبل از شروع merge:"
+          free -h
+
       - name: ادغام نهایی + نرمال‌سازی/انتخاب سراسری (فاز ۳)
         run: |
           mkdir -p /tmp/portfolios_whole_time_out
+
+          # [دیباگ کد ۱۴۳] یک مانیتور پس‌زمینه که هر ۲ ثانیه وضعیت حافظه/دیسک را
+          # با fsync روی دیسک می‌نویسد. چون exit 143 یعنی خودِ runner با
+          # SIGTERM کشته شده (نه یک خطای پایتون با traceback)، این تنها راهیه
+          # که حتی اگر پروسس اصلی وسط کار کشته بشه، بازم بفهمیم دقیقاً چند
+          # ثانیه بعد از شروع و در چه سطحی از مصرف حافظه این اتفاق افتاده.
+          (
+            while true; do
+              {
+                echo "---- $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) ----"
+                free -m
+                echo "top 5 پروسس از نظر حافظه:"
+                ps aux --sort=-%mem | head -6
+              } >> /tmp/oom_watch.log
+              sync
+              sleep 2
+            done
+          ) &
+          WATCHER_PID=$!
+
+          set +e
           python modules/portfolios.py \
             --signatures-dir /tmp \
             --output-dir /tmp/portfolios_whole_time_out \
             --whole-time-merge \
+            --whole-time-merge-strategy full \
             --parts-dir /tmp/portfolios_wt_parts \
-            --top-n 15
-          echo "✅ portfolios.py --whole-time-merge اجرا شد."
+            --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          kill "$WATCHER_PID" 2>/dev/null || true
+
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "❌ portfolios.py --whole-time-merge (strategy=full) با کد $PY_EXIT شکست خورد."
+            exit "$PY_EXIT"
+          fi
+          echo "✅ portfolios.py --whole-time-merge (strategy=full) اجرا شد."
+
+      - name: "[دیباگ کد ۱۴۳] آپلود لاگ‌های دیباگ (همیشه، حتی روی fail)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-merge-debug-logs-${{ github.run_id }}
+          path: |
+            /tmp/oom_watch.log
+            /tmp/portfolios_merge.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
         run: |
@@ -1281,6 +1334,257 @@ jobs:
           fi
 
   # ================================================================
+  # [فیکس کد ۱۴۳ / ایده‌ی همکار] اگر portfolios-whole-time-merge با کد ۱۴۳
+  # (یا هر خطای دیگری) شکست بخورد، این جاب با راهبرد دومِ ادغام
+  # (lazy-json — همان منطق، مصرف حافظه‌ی خیلی کمتر چون decode ستون‌های
+  # تودرتو تا بعد از انتخاب نهایی عقب می‌افتد) دوباره تلاش می‌کند. چون یک
+  # SIGTERM/شات‌داون واقعیِ خودِ runner را نمی‌شود از *داخل* همان پروسس
+  # گرفت، فالبک فقط در سطح جاب/runner جدید ممکن است — نه try/except داخل
+  # پایتون.
+  # ================================================================
+  portfolios-whole-time-merge-retry1:
+    needs: [portfolios-whole-time-merge]
+    runs-on: ubuntu-latest
+    if: ${{ needs.portfolios-whole-time-merge.result == 'failure' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود همه‌ی partهای فاز ۲ (matrix)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts
+          merge-multiple: true
+
+      - name: "[دیباگ کد ۱۴۳] چک اینکه فایل‌های part واقعاً دانلود شده‌اند"
+        run: |
+          echo "تعداد فایل part_*.parquet روی دیسک:"
+          find /tmp/portfolios_wt_parts -name 'part_*.parquet' | wc -l
+          ls -la /tmp/portfolios_wt_parts/ || echo "⚠️ پوشه‌ی parts وجود ندارد"
+          du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
+          free -h
+
+      - name: "تلاش دوم: ادغام با راهبرد lazy-json (فالبک ۱)"
+        run: |
+          mkdir -p /tmp/portfolios_whole_time_out
+          (
+            while true; do
+              {
+                echo "---- $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) ----"
+                free -m
+                ps aux --sort=-%mem | head -6
+              } >> /tmp/oom_watch.log
+              sync
+              sleep 2
+            done
+          ) &
+          WATCHER_PID=$!
+
+          set +e
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_whole_time_out \
+            --whole-time-merge \
+            --whole-time-merge-strategy lazy-json \
+            --parts-dir /tmp/portfolios_wt_parts \
+            --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          kill "$WATCHER_PID" 2>/dev/null || true
+
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "❌ فالبک ۱ (lazy-json) هم با کد $PY_EXIT شکست خورد."
+            exit "$PY_EXIT"
+          fi
+          echo "✅ فالبک ۱ (lazy-json) موفق بود."
+
+      - name: "[دیباگ کد ۱۴۳] آپلود لاگ‌های دیباگ (همیشه، حتی روی fail)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-merge-retry1-debug-logs-${{ github.run_id }}
+          path: |
+            /tmp/oom_watch.log
+            /tmp/portfolios_merge.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
+        run: |
+          FOUND=$(find /tmp/portfolios_whole_time_out -name 'portfolios_whole_time*.csv' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "⚠️ هیچ portfolios_whole_time*.csv تولید نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp "$FOUND" portfolios_outputs/portfolios_whole_time.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios whole-time outputs (run ${{ github.run_id }}, fallback=lazy-json)"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/portfolios_whole_time.csv موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+  # ================================================================
+  # [فیکس کد ۱۴۳ / ایده‌ی همکار] فالبک ۲: اگر تلاش دوم (lazy-json) هم
+  # شکست بخورد، آخرین راهبرد (columnar — کم‌مصرف‌ترین از نظر حافظه، چون
+  # ستون‌های تودرتو اصلاً برای ردیف‌های غیربرنده به حافظه نمی‌آیند) اجرا
+  # می‌شود.
+  # ================================================================
+  portfolios-whole-time-merge-retry2:
+    needs: [portfolios-whole-time-merge-retry1]
+    runs-on: ubuntu-latest
+    if: ${{ needs.portfolios-whole-time-merge-retry1.result == 'failure' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود همه‌ی partهای فاز ۲ (matrix)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts
+          merge-multiple: true
+
+      - name: "[دیباگ کد ۱۴۳] چک اینکه فایل‌های part واقعاً دانلود شده‌اند"
+        run: |
+          echo "تعداد فایل part_*.parquet روی دیسک:"
+          find /tmp/portfolios_wt_parts -name 'part_*.parquet' | wc -l
+          ls -la /tmp/portfolios_wt_parts/ || echo "⚠️ پوشه‌ی parts وجود ندارد"
+          du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
+          free -h
+
+      - name: "تلاش سوم: ادغام با راهبرد columnar (فالبک ۲، کم‌مصرف‌ترین)"
+        run: |
+          mkdir -p /tmp/portfolios_whole_time_out
+          (
+            while true; do
+              {
+                echo "---- $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) ----"
+                free -m
+                ps aux --sort=-%mem | head -6
+              } >> /tmp/oom_watch.log
+              sync
+              sleep 2
+            done
+          ) &
+          WATCHER_PID=$!
+
+          set +e
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_whole_time_out \
+            --whole-time-merge \
+            --whole-time-merge-strategy columnar \
+            --parts-dir /tmp/portfolios_wt_parts \
+            --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          kill "$WATCHER_PID" 2>/dev/null || true
+
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "❌ فالبک ۲ (columnar) هم با کد $PY_EXIT شکست خورد — هر سه راهبرد ناموفق بودند."
+            exit "$PY_EXIT"
+          fi
+          echo "✅ فالبک ۲ (columnar) موفق بود."
+
+      - name: "[دیباگ کد ۱۴۳] آپلود لاگ‌های دیباگ (همیشه، حتی روی fail)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-merge-retry2-debug-logs-${{ github.run_id }}
+          path: |
+            /tmp/oom_watch.log
+            /tmp/portfolios_merge.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
+        run: |
+          FOUND=$(find /tmp/portfolios_whole_time_out -name 'portfolios_whole_time*.csv' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "⚠️ هیچ portfolios_whole_time*.csv تولید نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp "$FOUND" portfolios_outputs/portfolios_whole_time.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios whole-time outputs (run ${{ github.run_id }}, fallback=columnar)"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/portfolios_whole_time.csv موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+  # ================================================================
+  # [فیکس کد ۱۴۳] جمع‌بندیِ نتیجه‌ی هر سه تلاش ادغام (اصلی + ۲ فالبک) در
+  # یک output واحد، چون جاب‌های پایین‌دست (portfolios-timeline و
+  # portfolios-trigger-next-loop) باید بدانند آیا *هرکدام* از این سه
+  # موفق شده یا نه — نه فقط جاب اول.
+  # ================================================================
+  portfolios-whole-time-merge-final:
+    needs: [portfolios-whole-time-merge, portfolios-whole-time-merge-retry1, portfolios-whole-time-merge-retry2]
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      result: ${{ steps.decide.outputs.result }}
+    steps:
+      - name: تعیین نتیجه‌ی نهایی سه تلاش ادغام
+        id: decide
+        run: |
+          if [ "${{ needs.portfolios-whole-time-merge.result }}" = "success" ] || \
+             [ "${{ needs.portfolios-whole-time-merge-retry1.result }}" = "success" ] || \
+             [ "${{ needs.portfolios-whole-time-merge-retry2.result }}" = "success" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          elif [ "${{ needs.portfolios-whole-time-merge.result }}" = "skipped" ] && \
+               [ "${{ needs.portfolios-whole-time-merge-retry1.result }}" = "skipped" ] && \
+               [ "${{ needs.portfolios-whole-time-merge-retry2.result }}" = "skipped" ]; then
+            echo "result=skipped" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ================================================================
   # [فیکس] portfolios-timeline: اجرای واقعی حالت run_timeline() (ماژول
   # سوم) که در portfolios.py پیاده‌سازی شده بود ولی هیچ‌جای این workflow
   # صدا زده نمی‌شد — دقیقاً مثل باگ مشابهی که برای run_whole_time وجود
@@ -1295,9 +1599,9 @@ jobs:
     # می‌کند (portfolios_outputs/portfolios_whole_time.csv که آن جاب
     # commit/push کرده). پس باید *بعد از* اتمام واقعیِ whole-time اجرا
     # شود، نه موازی با آن.
-    needs: [portfolios-generate-matrix, portfolios-batch, portfolios-whole-time-merge]
+    needs: [portfolios-generate-matrix, portfolios-batch, portfolios-whole-time-merge-final]
     runs-on: ubuntu-latest
-    if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' && needs.portfolios-whole-time-merge.result == 'success' }}
+    if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' && needs.portfolios-whole-time-merge-final.outputs.result == 'success' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -1514,7 +1818,7 @@ jobs:
   # تکمیل واقعیِ کل اجرا (نه فقط cleanup) ران بعدی شروع شود.
   # ================================================================
   portfolios-trigger-next-loop:
-    needs: [portfolios-cleanup, portfolios-whole-time-merge, portfolios-timeline]
+    needs: [portfolios-cleanup, portfolios-whole-time-merge-final, portfolios-timeline]
     runs-on: ubuntu-latest
     # [فیکس] این جاب قبلاً به needs.portfolios-batch ارجاع می‌داد، در حالی
     # که portfolios-batch در لیست needs همین جاب نبود — در GitHub Actions
@@ -1522,10 +1826,13 @@ jobs:
     # باشد. حالا به‌جایش نتیجه‌ی خودِ سه جابِ وابسته بررسی می‌شود: اگر
     # هر سه skipped بودند (یعنی از اول چیزی برای پردازش نبوده)، ران بعدی
     # صدا زده نمی‌شود.
+    # [فیکس کد ۱۴۳] portfolios-whole-time-merge با portfolios-whole-time-merge-final
+    # جایگزین شد چون حالا merge ممکن است در هر یک از سه جابِ
+    # merge/retry1/retry2 موفق شده باشد؛ فقط جاب final نتیجه‌ی جمع‌بندی‌شده را دارد.
     if: >-
       ${{ always() &&
           !(needs.portfolios-cleanup.result == 'skipped' &&
-            needs.portfolios-whole-time-merge.result == 'skipped' &&
+            needs.portfolios-whole-time-merge-final.outputs.result == 'skipped' &&
             needs.portfolios-timeline.result == 'skipped') }}
     steps:
       - name: فراخوانی مجدد loop_analysis.yml
