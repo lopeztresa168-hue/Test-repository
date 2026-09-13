@@ -1172,21 +1172,65 @@ def evaluate_group(
 
     خروجی: (لیست سبدهای برتر تا top_n، تعداد کل سبدهای کاندید بررسی‌شده پیش از فیلتر مطلق)
     """
+    built = evaluate_group_build(group, attach_periods=attach_periods)
+    if built is None:
+        return [], 0
+    (candidate_strategies, clique_members, monthly, corr_lookup, strategy_meta,
+     period_length_by_date, exact_valid_periods, period_bounds) = built
+
+    portfolios = []
+    raw_candidate_count = 0
+    for size in PORTFOLIO_SIZES:
+        for members in clique_members.get(size, []):
+            record = score_combo(
+                members, monthly, corr_lookup, strategy_meta,
+                period_length_by_date, exact_valid_periods,
+                coin_composition, signature,
+                attach_periods=attach_periods, period_bounds=period_bounds,
+            )
+            if record is None:
+                continue
+            raw_candidate_count += 1
+            portfolios.append(record)
+
+    return evaluate_group_finalize(portfolios, raw_candidate_count, top_n, abs_filters)
+
+
+# ========== فیکس معماری (matrix-پذیر کردن whole-time): evaluate_group قبلاً
+# یک تابع یک‌تکه بود که هم گراف/ترکیبات را می‌ساخت، هم هر ترکیب را
+# امتیازدهی می‌کرد، هم نرمال‌سازی/انتخاب نهایی سراسری را انجام می‌داد.
+# اکنون به سه بخش مجزا افراز شده: evaluate_group_build (باید یک‌جا و
+# سراسری اجرا شود — نیازمند دیدن همه‌ی کاندیدها همزمان)، score_combo (کاملاً
+# مستقل به‌ازای هر ترکیب — قابل توزیع بین matrix jobها) و
+# evaluate_group_finalize (نرمال‌سازیِ percentile_rank/امتیاز/انتخاب
+# قطعی‌یا-fallback — این هم ذاتاً سراسری است، چون percentile نسبت به کل
+# مجموعه‌ی سبدهای یافت‌شده معنا دارد، نه یک زیرمجموعه‌ی chunk). evaluate_group
+# اکنون فقط این سه را پشت سر هم صدا می‌زند؛ منطق محاسباتی هیچ‌کدام تغییر
+# نکرده — فقط جابه‌جا شده — پس رفتار run()/run_timeline() که evaluate_group
+# را صدا می‌زنند بدون تغییر می‌ماند. ==========
+
+def evaluate_group_build(group: pd.DataFrame, attach_periods: bool = False):
+    """بخش سراسریِ evaluate_group: باید یک‌جا اجرا شود چون تشخیصِ این‌که کدام
+    جفت استراتژی اصلاً یک لبه‌ی معتبر (MIN_PAIR_OVERLAP) هستند و کدام
+    استراتژی‌ها داخل سقف MAX_GLOBAL_CANDIDATES باقی می‌مانند، فقط با دیدن
+    همه‌ی کاندیدها همزمان ممکن است. خروجی None یعنی هیچ ترکیبی قابل‌ساخت
+    نیست (دقیقاً معادل موارد قبلی که evaluate_group مستقیماً ([], 0)
+    برمی‌گرداند)."""
     group = build_release_dates(group)
     period_bounds = _period_bounds_by_date(group) if attach_periods else {}
 
     corr_df, monthly, exact_valid_periods = compute_monthly_correlation_matrix(group)
     if corr_df.empty:
-        return [], 0
+        return None
 
     kept_pairs, _threshold = filter_pairs_by_correlation(corr_df)
     if kept_pairs.empty:
-        return [], 0
+        return None
 
     corr_lookup = {(r.a, r.b): r.correlation for r in kept_pairs.itertuples()}
     candidate_strategies = sorted(set(kept_pairs["a"]) | set(kept_pairs["b"]))
     if len(candidate_strategies) < 2:
-        return [], 0
+        return None
 
     # ========== محافظ کارایی برای رفع باگ ۱ (حذف قید هم‌گروهی) ==========
     #
@@ -1225,7 +1269,7 @@ def evaluate_group(
         kept_pairs = kept_pairs[kept_pairs["a"].isin(cs_set) & kept_pairs["b"].isin(cs_set)]
         corr_lookup = {(r.a, r.b): r.correlation for r in kept_pairs.itertuples()}
         if len(candidate_strategies) < 2 or kept_pairs.empty:
-            return [], 0
+            return None
 
     adj = _build_adjacency(candidate_strategies, kept_pairs)
     clique_members = _enumerate_clique_members(candidate_strategies, adj, PORTFOLIO_SIZES)
@@ -1247,115 +1291,145 @@ def evaluate_group(
             group.groupby("release_date")["period_length_days"].max().to_dict()
         )
 
-    portfolios = []
-    raw_candidate_count = 0  # ========== باگ ۷ رفع شد: شمارش کاندیدها پیش از فیلتر مطلق ==========
-    for size in PORTFOLIO_SIZES:
-        for members in clique_members.get(size, []):
-            pairs = list(itertools.combinations(sorted(members), 2))
-            if not all(p in corr_lookup for p in pairs):
-                continue  # عملاً هیچ‌وقت نباید اجرا شود (ساخت clique تضمینش می‌کند)؛ فقط برای اطمینان
+    return (candidate_strategies, clique_members, monthly, corr_lookup, strategy_meta,
+            period_length_by_date, exact_valid_periods, period_bounds)
 
-            # ========== رفع باگ ۲: Union ماه‌های فعال (نه Intersection) ==========
-            # ماهی که یک عضو معامله نداشته، از سبد حذف نمی‌شود — سهم آن عضو
-            # در آن ماه صفر در نظر گرفته می‌شود («این ماه معامله‌ای نداشت»،
-            # نه «این ترکیب رد است»).
-            active_months: set = set()
-            for m in members:
-                active_months |= set(monthly[m].dropna().index)
-            if len(active_months) < MIN_PORTFOLIO_SAMPLES:
-                continue
 
-            sorted_months = sorted(active_months)
-            returns = monthly.loc[sorted_months, list(members)].fillna(0.0)
+def score_combo(
+    members: tuple,
+    monthly: pd.DataFrame,
+    corr_lookup: dict,
+    strategy_meta: pd.DataFrame,
+    period_length_by_date: dict,
+    exact_valid_periods: dict,
+    coin_composition: str,
+    signature: str,
+    attach_periods: bool = False,
+    period_bounds: Optional[dict] = None,
+) -> Optional[dict]:
+    """امتیازدهی خامِ یک ترکیب (clique) — کاملاً مستقل از بقیه‌ی ترکیبات؛
+    فقط به داده‌ی خودِ اعضای همین ترکیب نیاز دارد (monthly/corr_lookup که
+    evaluate_group_build یک‌بار برای کل استخر ساخته). دقیقاً همان منطق
+    قبلیِ بدنه‌ی حلقه‌ی evaluate_group است — فقط استخراج‌شده تا هر matrix
+    job بتواند این تابع را مستقل برای برشی از صف ترکیبات صدا بزند. خروجی
+    None یعنی این ترکیب رد می‌شود (دقیقاً معادل continue قبلی). توجه:
+    نرمال‌سازی percentile_rank/امتیاز نهایی این‌جا انجام نمی‌شود — آن فقط
+    در evaluate_group_finalize و روی کل مجموعه‌ی ادغام‌شده معنا دارد."""
+    pairs = list(itertools.combinations(sorted(members), 2))
+    if not all(p in corr_lookup for p in pairs):
+        return None  # عملاً هیچ‌وقت نباید اجرا شود (ساخت clique تضمینش می‌کند)؛ فقط برای اطمینان
 
-            sr = survival_rate(returns)
-            comp = compensation_ratio(returns)
-            ar = avg_return(returns)
-            ac = avg_correlation(members, corr_lookup)
+    # ========== رفع باگ ۲: Union ماه‌های فعال (نه Intersection) ==========
+    # ماهی که یک عضو معامله نداشته، از سبد حذف نمی‌شود — سهم آن عضو
+    # در آن ماه صفر در نظر گرفته می‌شود («این ماه معامله‌ای نداشت»،
+    # نه «این ترکیب رد است»).
+    active_months: set = set()
+    for m in members:
+        active_months |= set(monthly[m].dropna().index)
+    if len(active_months) < MIN_PORTFOLIO_SAMPLES:
+        return None
 
-            raw_candidate_count += 1
+    sorted_months = sorted(active_months)
+    returns = monthly.loc[sorted_months, list(members)].fillna(0.0)
 
-            # گام ۸: فیلتر مطلق دیگر چیزی را رد نمی‌کند — فقط برچسب می‌زند.
-            # [فیکس درخواستی کاربر] به‌جای continue/حذف، همیشه نگه داشته
-            # می‌شود؛ تصمیم «رد شدن یا نه» بعداً و به‌صورت سراسری (بر اساس
-            # تعداد کل واجدشرایط‌ها) گرفته می‌شود — نگاه کنید MIN_QUALIFIED_ROWS.
-            passes_abs = (
-                sr >= ABS_MIN_SURVIVAL_RATE
-                and ar >= ABS_MIN_AVG_RETURN
-            )
+    sr = survival_rate(returns)
+    comp = compensation_ratio(returns)
+    ar = avg_return(returns)
+    ac = avg_correlation(members, corr_lookup)
 
-            # بازه‌ی روزانه‌ی واقعیِ فعال‌بودن سبد: از Union دقیق release_date
-            # همه‌ی اعضا (نه از ماه‌ها) — برای اینکه ستون‌های روزی و بازسازی
-            # _intervals (زمان‌بندی اجرای واقعی) دقیق بمانند.
-            exact_union: set = set()
-            for m in members:
-                exact_union |= exact_valid_periods.get(m, set())
-            sorted_exact = sorted(exact_union)
-            if sorted_exact:
-                بازه_شروع = sorted_exact[0]
-                بازه_پایان = sorted_exact[-1]
-            else:
-                بازه_شروع = sorted_months[0].to_timestamp()
-                بازه_پایان = sorted_months[-1].to_timestamp()
-            if period_length_by_date and sorted_exact:
-                روز_فعال = int(sum(period_length_by_date.get(d, 0) for d in sorted_exact))
-            else:
-                # داده‌ی قدیمی بدون period_length_days: به تعداد دوره (نه
-                # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
-                روز_فعال = len(sorted_exact) if sorted_exact else len(sorted_months)
+    # گام ۸: فیلتر مطلق دیگر چیزی را رد نمی‌کند — فقط برچسب می‌زند.
+    # [فیکس درخواستی کاربر] به‌جای continue/حذف، همیشه نگه داشته
+    # می‌شود؛ تصمیم «رد شدن یا نه» بعداً و به‌صورت سراسری (بر اساس
+    # تعداد کل واجدشرایط‌ها) گرفته می‌شود — نگاه کنید MIN_QUALIFIED_ROWS.
+    passes_abs = (
+        sr >= ABS_MIN_SURVIVAL_RATE
+        and ar >= ABS_MIN_AVG_RETURN
+    )
 
-            # [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد: از روی
-            # بازده‌ی سبد در هر ماه فعال.
-            #
-            # ========== باگ ۵ رفع شد ==========
-            # قبلاً این‌جا از period_sums خام (مجموع اعضا، returns.sum(axis=1))
-            # استفاده می‌شد که همان سوگیریِ به‌نفع سبدهای چندعضوی را دارد که
-            # در بالای survival_rate/avg_return توضیح داده شده (کامنت «باگ ۲
-            # رفع شد»). آن‌جا برای رفعش avg_return و survival_rate را با
-            # میانگین (sum+mean)/2 متعادل کردند، اما همین تصحیح برای این ۱۶
-            # ستون ماهانه اعمال نشده بود؛ در نتیجه اعدادی مثل
-            # میانگین_سود_ماهانه/بهترین_ماه_درصد نسبت به avg_return واقعیِ
-            # همان سبد ~۱.۳ تا ۱.۶ برابر تورم داشتند (برای سبدهای ۲ و ۳
-            # عضوی). این‌جا هم از همان معیار متعادل‌شده استفاده می‌کنیم تا با
-            # avg_return/survival_rate سازگار بماند.
-            period_sums = returns.sum(axis=1)
-            period_means = returns.mean(axis=1)
-            balanced_returns = (period_sums + period_means) / 2.0
-            dated_values = [(idx, float(v)) for idx, v in balanced_returns.items()]
-            ext16 = _period_monthly_stats(dated_values)
+    # بازه‌ی روزانه‌ی واقعیِ فعال‌بودن سبد: از Union دقیق release_date
+    # همه‌ی اعضا (نه از ماه‌ها) — برای اینکه ستون‌های روزی و بازسازی
+    # _intervals (زمان‌بندی اجرای واقعی) دقیق بمانند.
+    exact_union: set = set()
+    for m in members:
+        exact_union |= exact_valid_periods.get(m, set())
+    sorted_exact = sorted(exact_union)
+    if sorted_exact:
+        بازه_شروع = sorted_exact[0]
+        بازه_پایان = sorted_exact[-1]
+    else:
+        بازه_شروع = sorted_months[0].to_timestamp()
+        بازه_پایان = sorted_months[-1].to_timestamp()
+    if period_length_by_date and sorted_exact:
+        روز_فعال = int(sum(period_length_by_date.get(d, 0) for d in sorted_exact))
+    else:
+        # داده‌ی قدیمی بدون period_length_days: به تعداد دوره (نه
+        # روز) برمی‌گردیم — این تخمین کمینه است، نه دقیق.
+        روز_فعال = len(sorted_exact) if sorted_exact else len(sorted_months)
 
-            member_coins = [
-                strategy_meta.loc[m, "__coin"] if m in strategy_meta.index else "" for m in members
-            ]
-            member_sigs = [
-                strategy_meta.loc[m, "__sig"] if m in strategy_meta.index else [] for m in members
-            ]
+    # [افزوده] ۱۶ ستون آماری ماهانه/افت‌سرمایه/ریسک‌به‌ریوارد: از روی
+    # بازده‌ی سبد در هر ماه فعال.
+    #
+    # ========== باگ ۵ رفع شد ==========
+    # قبلاً این‌جا از period_sums خام (مجموع اعضا، returns.sum(axis=1))
+    # استفاده می‌شد که همان سوگیریِ به‌نفع سبدهای چندعضوی را دارد که
+    # در بالای survival_rate/avg_return توضیح داده شده (کامنت «باگ ۲
+    # رفع شد»). آن‌جا برای رفعش avg_return و survival_rate را با
+    # میانگین (sum+mean)/2 متعادل کردند، اما همین تصحیح برای این ۱۶
+    # ستون ماهانه اعمال نشده بود؛ در نتیجه اعدادی مثل
+    # میانگین_سود_ماهانه/بهترین_ماه_درصد نسبت به avg_return واقعیِ
+    # همان سبد ~۱.۳ تا ۱.۶ برابر تورم داشتند (برای سبدهای ۲ و ۳
+    # عضوی). این‌جا هم از همان معیار متعادل‌شده استفاده می‌کنیم تا با
+    # avg_return/survival_rate سازگار بماند.
+    period_sums = returns.sum(axis=1)
+    period_means = returns.mean(axis=1)
+    balanced_returns = (period_sums + period_means) / 2.0
+    dated_values = [(idx, float(v)) for idx, v in balanced_returns.items()]
+    ext16 = _period_monthly_stats(dated_values)
 
-            record = {
-                "coin_composition": coin_composition,
-                "signature": signature,
-                "member_coin_compositions": member_coins,
-                "member_signatures": member_sigs,
-                "members": list(members),
-                "survival_rate": sr,
-                "compensation_ratio": comp,
-                "avg_return": ar,
-                "avg_correlation": ac,
-                # ========== رفع باگ ۴: تعداد ماه‌هایی که حداقل یک عضو فعال
-                # بوده (Union) — نه تعداد دوره‌های مشترک (Intersection) ==========
-                "sample_count": len(active_months),
-                "بازه_زمانی_شروع": pd.Timestamp(بازه_شروع).date().isoformat(),
-                "بازه_زمانی_پایان": pd.Timestamp(بازه_پایان).date().isoformat(),
-                "تعداد_روز_فعال": روز_فعال,
-                "تعداد_روز_کل_بازه": (pd.Timestamp(بازه_پایان) - pd.Timestamp(بازه_شروع)).days + 1,
-                **ext16,
-            }
-            record["_passes_abs"] = passes_abs
-            if attach_periods:
-                raw_intervals = [period_bounds[d] for d in sorted_exact if d in period_bounds]
-                record["_intervals"] = _merge_intervals(raw_intervals)
-            portfolios.append(record)
+    member_coins = [
+        strategy_meta.loc[m, "__coin"] if m in strategy_meta.index else "" for m in members
+    ]
+    member_sigs = [
+        strategy_meta.loc[m, "__sig"] if m in strategy_meta.index else [] for m in members
+    ]
 
+    record = {
+        "coin_composition": coin_composition,
+        "signature": signature,
+        "member_coin_compositions": member_coins,
+        "member_signatures": member_sigs,
+        "members": list(members),
+        "survival_rate": sr,
+        "compensation_ratio": comp,
+        "avg_return": ar,
+        "avg_correlation": ac,
+        # ========== رفع باگ ۴: تعداد ماه‌هایی که حداقل یک عضو فعال
+        # بوده (Union) — نه تعداد دوره‌های مشترک (Intersection) ==========
+        "sample_count": len(active_months),
+        "بازه_زمانی_شروع": pd.Timestamp(بازه_شروع).date().isoformat(),
+        "بازه_زمانی_پایان": pd.Timestamp(بازه_پایان).date().isoformat(),
+        "تعداد_روز_فعال": روز_فعال,
+        "تعداد_روز_کل_بازه": (pd.Timestamp(بازه_پایان) - pd.Timestamp(بازه_شروع)).days + 1,
+        **ext16,
+    }
+    record["_passes_abs"] = passes_abs
+    if attach_periods:
+        raw_intervals = [period_bounds[d] for d in sorted_exact if d in (period_bounds or {})]
+        record["_intervals"] = _merge_intervals(raw_intervals)
+    return record
+
+
+def evaluate_group_finalize(
+    portfolios: list[dict],
+    raw_candidate_count: int,
+    top_n: Optional[int],
+    abs_filters: bool = True,
+) -> tuple[list[dict], int]:
+    """بخش سراسریِ دیگرِ evaluate_group: نرمال‌سازی percentile_rank و انتخاب
+    نهایی. ذاتاً سراسری است چون percentile_rank هر سبد را نسبت به کل
+    مجموعه‌ی سبدهای یافت‌شده رتبه‌بندی می‌کند — پس فقط باید یک‌بار، روی کل
+    `portfolios` (که می‌تواند حاصل ادغام چند matrix job باشد)، صدا زده
+    شود؛ هرگز روی زیرمجموعه‌ای از آن (وگرنه رتبه‌بندی نسبی غلط می‌شود)."""
     if not portfolios:
         return [], raw_candidate_count
 
@@ -2206,6 +2280,239 @@ def run_whole_time(
 
 
 # -----------------------------------------------------------------------------
+# حالت matrix-پذیرِ «کل بازه‌ی زمانی» — سه فاز build / score / merge
+#
+# طبق تحلیل بالا (evaluate_group_build/score_combo/evaluate_group_finalize):
+# تنها بخشی که واقعاً به‌ازای هر ترکیب مستقل و سبک است، امتیازدهیِ خودِ
+# ترکیب‌هاست (score_combo). ساختِ گراف/لیستِ ترکیبات (evaluate_group_build)
+# و نرمال‌سازیِ percentile نهایی (evaluate_group_finalize) هر دو ذاتاً
+# سراسری‌اند و فقط یک‌بار انجام می‌شوند. این سه تابع دقیقاً همین سه‌فازی را
+# با فایل روی دیسک پیاده می‌کنند تا فاز ۲ بشود یک matrix job روی GitHub
+# Actions:
+#   ۱) run_whole_time_build   → یک‌بار: دانلود/بارگذاری کامل شده، صف
+#      ترکیبات (بدون هیچ سقفی روی تعدادشان) + داده‌ی مشترک سبک را می‌سازد.
+#   ۲) run_whole_time_score   → به‌ازای هر matrix job: فقط برشی از صف را
+#      امتیازدهی می‌کند؛ هیچ دانلود/محاسبه‌ی تکراری‌ای ندارد.
+#   ۳) run_whole_time_merge   → یک‌بار: همه‌ی خروجی‌های جزئی را ادغام،
+#      نرمال‌سازی/انتخاب نهایی (که ذاتاً سراسری است) را انجام می‌دهد.
+# -----------------------------------------------------------------------------
+
+def _flatten_combo_queue(clique_members: dict) -> list[dict]:
+    """لیست تخت همه‌ی ترکیبات (هر اندازه‌ای که در PORTFOLIO_SIZES باشد) —
+    این همان صفی است که بین matrix jobها تقسیم می‌شود. عمداً هیچ سقفی روی
+    طولش اعمال نمی‌شود: بر خلاف صف archive/signature در analysis_portfolios.yml
+    (که می‌تواند مازادش را برای اجرای بعدی نگه دارد)، این‌جا همه‌ی ترکیبات
+    باید در همین اجرا امتیازدهی شوند — چون evaluate_group_finalize باید کل
+    مجموعه‌ی سبدهای یافت‌شده را ببیند تا percentile_rank/انتخاب نهایی درست
+    باشد؛ نادیده گرفتن بخشی از ترکیبات یعنی رتبه‌بندی نهایی ناقص/غلط."""
+    queue: list[dict] = []
+    for size in sorted(clique_members.keys()):
+        for members in clique_members[size]:
+            queue.append({"size": size, "members": list(members)})
+    return queue
+
+
+def run_whole_time_build(
+    signatures_dir: Path,
+    golden_scores_path: Optional[Path],
+    version_schema_path: Optional[Path],
+    output_dir: Path,
+    signatures_filter: Optional[Path] = None,
+) -> Path:
+    """فاز ۱ از ۳: تنها فازی که به دانلود/بارگذاری کامل تمام آرشیوها نیاز
+    دارد (چون تعیین کاندیدهای نهایی و اعتبارِ هر جفت (MIN_PAIR_OVERLAP) فقط
+    با دیدن همزمان همه‌ی داده ممکن است). خروجی این فاز: صف کامل ترکیبات
+    (combos.json) + جدول‌های سبکِ لازم برای امتیازدهی مستقل هر ترکیب در فاز
+    ۲ (بدون نیاز به دانلود مجدد هیچ آرشیوی)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write_empty() -> Path:
+        (output_dir / "combos.json").write_text("[]", encoding="utf-8")
+        (output_dir / "empty.flag").write_text("1", encoding="utf-8")
+        return output_dir / "combos.json"
+
+    signatures = load_signatures(signatures_dir, signatures_filter)
+    load_version_schema(version_schema_path)
+
+    if golden_scores_path is not None:
+        golden = load_golden_scores(golden_scores_path)
+        candidates = prefilter_candidates(signatures, golden)
+    else:
+        log.warning("golden_scores ارائه نشده — پیش‌فیلتر Golden رد می‌شود.")
+        candidates = signatures
+
+    if candidates.empty or candidates["strategy_id"].nunique() < 2:
+        log.warning("کمتر از ۲ strategy_id واجد شرایط Golden یافت شد — صف ترکیبات خالی خواهد بود.")
+        return _write_empty()
+
+    built = evaluate_group_build(candidates, attach_periods=False)
+    if built is None:
+        log.warning("پس از فیلتر هم‌پوشانی/سقف کاندیدها، هیچ ترکیبی باقی نماند.")
+        return _write_empty()
+
+    (_candidate_strategies, clique_members, monthly, corr_lookup, strategy_meta,
+     period_length_by_date, exact_valid_periods, _period_bounds) = built
+
+    queue = _flatten_combo_queue(clique_members)
+    log.info("تعداد کل ترکیبات کاندید (بدون هیچ سقفی): %d", len(queue))
+
+    monthly_out = monthly.copy()
+    monthly_out.index = monthly_out.index.astype(str)  # PeriodIndex → رشته برای parquet
+    monthly_out.to_parquet(output_dir / "monthly_returns.parquet")
+
+    corr_out = pd.DataFrame(
+        [{"a": a, "b": b, "correlation": c} for (a, b), c in corr_lookup.items()],
+        columns=["a", "b", "correlation"],
+    )
+    corr_out.to_parquet(output_dir / "corr_lookup.parquet")
+
+    meta_out = strategy_meta.copy()
+    meta_out["__sig"] = meta_out["__sig"].apply(json.dumps)
+    meta_out.to_parquet(output_dir / "strategy_meta.parquet")
+
+    evp_rows = [
+        {"strategy_id": s, "release_date": d}
+        for s, dates in exact_valid_periods.items() for d in dates
+    ]
+    pd.DataFrame(evp_rows, columns=["strategy_id", "release_date"]).to_parquet(
+        output_dir / "exact_valid_periods.parquet"
+    )
+
+    pld_rows = [
+        {"release_date": d, "period_length_days": v}
+        for d, v in period_length_by_date.items()
+    ]
+    pd.DataFrame(pld_rows, columns=["release_date", "period_length_days"]).to_parquet(
+        output_dir / "period_length_by_date.parquet"
+    )
+
+    combos_path = output_dir / "combos.json"
+    combos_path.write_text(json.dumps(queue, ensure_ascii=False), encoding="utf-8")
+    (output_dir / "empty.flag").write_text("0", encoding="utf-8")
+    log.info(
+        "✅ فاز build کامل شد: %d ترکیب در combos.json، داده‌ی مشترک در %s.",
+        len(queue), output_dir,
+    )
+    return combos_path
+
+
+def run_whole_time_score(shared_dir: Path, combos_file: Path, output_file: Path) -> Path:
+    """فاز ۲ از ۳ (matrix، به‌ازای هر chunk یک اجرا): فقط برشی از combos.json
+    را که فاز build ساخته امتیازدهی می‌کند. هیچ آرشیوی دوباره دانلود
+    نمی‌شود — فقط جدول‌های سبکِ فاز build خوانده می‌شوند. عمداً percentile_rank/
+    امتیاز نهایی این‌جا محاسبه نمی‌شود (نگاه کنید evaluate_group_finalize)."""
+    shared_dir = Path(shared_dir)
+
+    monthly = pd.read_parquet(shared_dir / "monthly_returns.parquet")
+    monthly.index = pd.PeriodIndex(monthly.index, freq="M")
+
+    corr_df = pd.read_parquet(shared_dir / "corr_lookup.parquet")
+    corr_lookup = {(r.a, r.b): r.correlation for r in corr_df.itertuples()}
+
+    strategy_meta = pd.read_parquet(shared_dir / "strategy_meta.parquet")
+    strategy_meta["__sig"] = strategy_meta["__sig"].apply(json.loads)
+
+    evp_df = pd.read_parquet(shared_dir / "exact_valid_periods.parquet")
+    evp_df["release_date"] = pd.to_datetime(evp_df["release_date"])
+    exact_valid_periods = {
+        s: set(sub["release_date"]) for s, sub in evp_df.groupby("strategy_id")
+    }
+
+    pld_df = pd.read_parquet(shared_dir / "period_length_by_date.parquet")
+    pld_df["release_date"] = pd.to_datetime(pld_df["release_date"])
+    period_length_by_date = dict(zip(pld_df["release_date"], pld_df["period_length_days"]))
+
+    combos = json.loads(Path(combos_file).read_text(encoding="utf-8"))
+
+    records = []
+    for item in combos:
+        rec = score_combo(
+            tuple(item["members"]), monthly, corr_lookup, strategy_meta,
+            period_length_by_date, exact_valid_periods,
+            coin_composition="", signature="",
+        )
+        if rec is not None:
+            records.append(rec)
+
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    out_df = pd.DataFrame(records)
+    if not out_df.empty:
+        # لیست‌ها (members/member_coin_compositions/member_signatures) برای
+        # ذخیره‌ی parquet باید به رشته‌ی JSON تبدیل شوند؛ در فاز merge برگردانده می‌شوند.
+        for col in ("members", "member_coin_compositions", "member_signatures"):
+            out_df[col] = out_df[col].apply(json.dumps)
+    out_df.to_parquet(output_file)
+    log.info(
+        "✅ این chunk: %d سبد معتبر از %d ترکیب امتیازدهی شد → %s",
+        len(out_df), len(combos), output_file,
+    )
+    return output_file
+
+
+def run_whole_time_merge(parts_dir: Path, output_dir: Path, top_n: Optional[int]) -> Path:
+    """فاز ۳ از ۳ (یک‌بار): همه‌ی part_*.parquet فاز ۲ را ادغام می‌کند و
+    دقیقاً همان evaluate_group_finalize (که evaluate_group یک‌شکلِ خودش هم
+    استفاده می‌کند) را یک‌بار روی کل مجموعه‌ی ادغام‌شده اجرا می‌کند — این‌طور
+    percentile_rank/انتخاب قطعی‌یا-fallback دقیقاً همان نتیجه‌ی حالت
+    تک‌جابی evaluate_group را می‌دهد، فقط ورودی‌اش از چند matrix job جمع
+    شده است."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # ========== باگ: sorted() روی نام فایل رشته‌ای است، نه عدد chunk —
+    # یعنی part_10 قبل از part_2 می‌آید. چون انتخاب نهایی (FALLBACK_TOP_N/
+    # top_n) روی تساوی‌های survival_rate/score با sort_values (ناپایدار در
+    # برابر ترتیب ورودی برای مقادیر مساوی) تصمیم می‌گیرد، ترتیب غلط ادغام
+    # می‌تواند باعث شود مجموعه‌ی سبدهای انتخاب‌شده (نه امتیاز هیچ‌کدام، فقط
+    # اینکه کدام‌ها داخل top_n قرار می‌گیرند) به‌طور غیرقطعی تغییر کند. مرتب‌سازی
+    # باید بر اساس عدد chunk باشد تا نتیجه با حالت تک‌جابی evaluate_group
+    # دقیقاً یکسان و قطعی بماند.
+    part_files = sorted(
+        Path(parts_dir).glob("part_*.parquet"),
+        key=lambda p: int(p.stem.split("_")[-1]),
+    )
+
+    dfs = []
+    for pf in part_files:
+        df = pd.read_parquet(pf)
+        if df.empty:
+            continue
+        for col in ("members", "member_coin_compositions", "member_signatures"):
+            if col in df.columns:
+                df[col] = df[col].apply(json.loads)
+        dfs.append(df)
+
+    columns = [
+        "members", "member_coin_compositions", "member_signatures",
+        "survival_rate", "compensation_ratio", "avg_return", "avg_correlation", "score",
+        "sample_count",
+        "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
+    ] + EXT_STATS_16_COLUMNS
+
+    if not dfs:
+        all_portfolios, total_raw = [], 0
+    else:
+        merged = pd.concat(dfs, ignore_index=True)
+        all_portfolios, total_raw = evaluate_group_finalize(
+            merged.to_dict("records"), len(merged), top_n, abs_filters=True,
+        )
+
+    if not all_portfolios:
+        out_df = pd.DataFrame(columns=columns)
+    else:
+        out_df = pd.DataFrame(all_portfolios)
+        out_df = out_df[[c for c in columns if c in out_df.columns]]
+
+    output_path = output_dir / "portfolios_whole_time"
+    final_path = _save_dataframe(out_df, output_path)
+    log.info(
+        "ذخیره شد: %s (%d سبد نهایی از %d سبد خامِ ادغام‌شده‌ی %d part)",
+        final_path, len(out_df), total_raw, len(part_files),
+    )
+    return final_path
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
@@ -2283,6 +2590,42 @@ def parse_args(argv=None) -> argparse.Namespace:
              "--whole-time). فقط با --timeline استفاده می‌شود و برای آن "
              "الزامی است — timeline دیگر کاندید مستقل نمی‌سازد.",
     )
+    parser.add_argument(
+        "--whole-time-build", action="store_true", default=False,
+        help="فاز ۱ از ۳ حالت matrix-پذیرِ whole-time: تمام آرشیوها را "
+             "می‌خواند و صف کامل ترکیبات (combos.json، بدون هیچ سقفی روی "
+             "تعدادشان) + داده‌ی مشترک لازم برای فاز ۲ را در --output-dir "
+             "می‌سازد.",
+    )
+    parser.add_argument(
+        "--whole-time-score", action="store_true", default=False,
+        help="فاز ۲ از ۳ (matrix): فقط یک برش از combos.json را امتیازدهی "
+             "می‌کند. نیازمند --shared-dir (خروجی فاز ۱)، --combos-file "
+             "(فایل chunk این job) و --output-file (مسیر part خروجی).",
+    )
+    parser.add_argument(
+        "--whole-time-merge", action="store_true", default=False,
+        help="فاز ۳ از ۳ (یک‌بار): همه‌ی part_*.parquet فاز ۲ را (از "
+             "--parts-dir) ادغام و نرمال‌سازی/انتخاب نهایی سراسری را انجام "
+             "می‌دهد؛ خروجی نهایی portfolios_whole_time.* در --output-dir.",
+    )
+    parser.add_argument(
+        "--shared-dir", required=False, type=Path, default=None,
+        help="مسیر خروجی فاز --whole-time-build (فقط برای --whole-time-score لازم است).",
+    )
+    parser.add_argument(
+        "--combos-file", required=False, type=Path, default=None,
+        help="مسیر فایل JSON شامل برشی از combos.json برای این matrix job "
+             "(فقط برای --whole-time-score لازم است).",
+    )
+    parser.add_argument(
+        "--output-file", required=False, type=Path, default=None,
+        help="مسیر فایل part خروجی این matrix job (فقط برای --whole-time-score لازم است).",
+    )
+    parser.add_argument(
+        "--parts-dir", required=False, type=Path, default=None,
+        help="مسیر پوشه‌ی حاوی part_*.parquet فاز ۲ (فقط برای --whole-time-merge لازم است).",
+    )
     return parser.parse_args(argv)
 
 
@@ -2299,7 +2642,36 @@ def main(argv=None) -> int:
     )
 
     try:
-        if args.timeline:
+        if args.whole_time_build:
+            run_whole_time_build(
+                signatures_dir=args.signatures_dir,
+                golden_scores_path=args.golden_scores,
+                version_schema_path=args.version_schema,
+                output_dir=output_dir,
+                signatures_filter=args.signatures_filter,
+            )
+        elif args.whole_time_score:
+            if args.shared_dir is None or args.combos_file is None or args.output_file is None:
+                log.error(
+                    "--whole-time-score نیازمند هر سه‌ی --shared-dir، --combos-file "
+                    "و --output-file است."
+                )
+                return 1
+            run_whole_time_score(
+                shared_dir=args.shared_dir,
+                combos_file=args.combos_file,
+                output_file=args.output_file,
+            )
+        elif args.whole_time_merge:
+            if args.parts_dir is None:
+                log.error("--whole-time-merge نیازمند --parts-dir است.")
+                return 1
+            run_whole_time_merge(
+                parts_dir=args.parts_dir,
+                output_dir=output_dir,
+                top_n=args.top_n,
+            )
+        elif args.timeline:
             if args.whole_time_csv is None:
                 log.error(
                     "--timeline بدون --whole-time-csv اجرا نمی‌شود (طبق طراحیِ "
