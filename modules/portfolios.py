@@ -57,6 +57,7 @@ import math
 import os
 import re
 import statistics
+import resource
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -72,6 +73,38 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("portfolios")
+
+
+def _log_mem(stage: str) -> None:
+    """[دیباگ کد ۱۴۳] لاگ حافظه‌ی peak این پروسس + حافظه‌ی سیستم، برای ردیابی
+    OOM. چون سیگنال SIGTERM/SIGKILL می‌تواند وسط اجرا پروسس را بکشد (بدون
+    traceback پایتون)، هر خط اینجا فوراً flush می‌شود تا حتی اگر لاگ بعدی
+    هرگز چاپ نشود، لاگ‌های GitHub Actions تا همین نقطه ثبت شده باشند."""
+    try:
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        peak_mb = -1
+    avail_mb = total_mb = -1
+    try:
+        with open("/proc/meminfo") as f:
+            info = {}
+            for line in f:
+                k, v = line.split(":", 1)
+                info[k] = int(v.strip().split()[0]) / 1024  # kB -> MB
+            total_mb = info.get("MemTotal", -1)
+            avail_mb = info.get("MemAvailable", -1)
+    except Exception:
+        pass
+    log.info(
+        "[MEM] %s | peak_rss=%.0fMB | سیستم: available=%.0fMB / total=%.0fMB",
+        stage, peak_mb, avail_mb, total_mb,
+    )
+    for h in log.handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    sys.stdout.flush()
 
 # -----------------------------------------------------------------------------
 # ثابت‌ها
@@ -2450,66 +2483,263 @@ def run_whole_time_score(shared_dir: Path, combos_file: Path, output_file: Path)
     return output_file
 
 
-def run_whole_time_merge(parts_dir: Path, output_dir: Path, top_n: Optional[int]) -> Path:
-    """فاز ۳ از ۳ (یک‌بار): همه‌ی part_*.parquet فاز ۲ را ادغام می‌کند و
-    دقیقاً همان evaluate_group_finalize (که evaluate_group یک‌شکلِ خودش هم
-    استفاده می‌کند) را یک‌بار روی کل مجموعه‌ی ادغام‌شده اجرا می‌کند — این‌طور
-    percentile_rank/انتخاب قطعی‌یا-fallback دقیقاً همان نتیجه‌ی حالت
-    تک‌جابی evaluate_group را می‌دهد، فقط ورودی‌اش از چند matrix job جمع
-    شده است."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # ========== باگ: sorted() روی نام فایل رشته‌ای است، نه عدد chunk —
-    # یعنی part_10 قبل از part_2 می‌آید. چون انتخاب نهایی (FALLBACK_TOP_N/
-    # top_n) روی تساوی‌های survival_rate/score با sort_values (ناپایدار در
-    # برابر ترتیب ورودی برای مقادیر مساوی) تصمیم می‌گیرد، ترتیب غلط ادغام
-    # می‌تواند باعث شود مجموعه‌ی سبدهای انتخاب‌شده (نه امتیاز هیچ‌کدام، فقط
-    # اینکه کدام‌ها داخل top_n قرار می‌گیرند) به‌طور غیرقطعی تغییر کند. مرتب‌سازی
-    # باید بر اساس عدد chunk باشد تا نتیجه با حالت تک‌جابی evaluate_group
-    # دقیقاً یکسان و قطعی بماند.
-    part_files = sorted(
-        Path(parts_dir).glob("part_*.parquet"),
-        key=lambda p: int(p.stem.split("_")[-1]),
-    )
+_WT_MERGE_HEAVY_COLUMNS = ["members", "member_coin_compositions", "member_signatures"]
+_WT_MERGE_OUTPUT_COLUMNS = [
+    "members", "member_coin_compositions", "member_signatures",
+    "survival_rate", "compensation_ratio", "avg_return", "avg_correlation", "score",
+    "sample_count",
+    "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
+] + EXT_STATS_16_COLUMNS
+_WT_MERGE_LIGHT_COLUMNS = [
+    c for c in _WT_MERGE_OUTPUT_COLUMNS if c not in _WT_MERGE_HEAVY_COLUMNS
+] + ["_passes_abs"]
 
+
+def _wt_merge_check_parts(parts_dir: Path) -> list[Path]:
+    """[دیباگ کد ۱۴۳ / سرنخ ۱] چک می‌کند فایل‌های part واقعاً رسیده‌اند، حجم
+    هرکدام را لاگ می‌کند، و لیست مرتب‌شده (بر اساس عدد chunk، نه رشته) را
+    برمی‌گرداند."""
+    all_glob_matches = sorted(Path(parts_dir).glob("part_*.parquet"))
+    log.info(
+        "[CHECK] پوشه‌ی parts-dir=%s | تعداد فایل part_*.parquet پیدا شده=%d",
+        parts_dir, len(all_glob_matches),
+    )
+    total_bytes_on_disk = 0
+    for pf in all_glob_matches:
+        try:
+            sz = pf.stat().st_size
+        except OSError as e:
+            log.warning("[CHECK] فایل %s قابل‌ استت نیست: %s", pf, e)
+            continue
+        total_bytes_on_disk += sz
+        log.info("[CHECK]   %s -> %.1fMB روی دیسک", pf.name, sz / (1024 * 1024))
+    log.info(
+        "[CHECK] مجموع حجم همه‌ی part ها روی دیسک: %.1fMB",
+        total_bytes_on_disk / (1024 * 1024),
+    )
+    # ========== باگ: sorted() روی نام فایل رشته‌ای است، نه عدد chunk — یعنی
+    # part_10 قبل از part_2 می‌آید. چون انتخاب نهایی (FALLBACK_TOP_N/top_n)
+    # روی تساوی‌های survival_rate/score با sort_values (ناپایدار در برابر
+    # ترتیب ورودی برای مقادیر مساوی) تصمیم می‌گیرد، ترتیب غلط ادغام می‌تواند
+    # باعث شود مجموعه‌ی سبدهای انتخاب‌شده به‌طور غیرقطعی تغییر کند. ==========
+    return sorted(all_glob_matches, key=lambda p: int(p.stem.split("_")[-1]))
+
+
+def _wt_merge_finalize_and_save(
+    all_portfolios: list[dict], total_raw: int, output_dir: Path, n_parts: int,
+) -> Path:
+    if not all_portfolios:
+        out_df = pd.DataFrame(columns=_WT_MERGE_OUTPUT_COLUMNS)
+    else:
+        out_df = pd.DataFrame(all_portfolios)
+        out_df = out_df[[c for c in _WT_MERGE_OUTPUT_COLUMNS if c in out_df.columns]]
+    output_path = Path(output_dir) / "portfolios_whole_time"
+    final_path = _save_dataframe(out_df, output_path)
+    _log_mem("بعد از ذخیره‌سازی خروجی نهایی")
+    log.info(
+        "ذخیره شد: %s (%d سبد نهایی از %d سبد خامِ ادغام‌شده‌ی %d part)",
+        final_path, len(out_df), total_raw, n_parts,
+    )
+    return final_path
+
+
+def _merge_strategy_full(part_files: list[Path], output_dir: Path, top_n: Optional[int]) -> Path:
+    """راهبرد ۱ (پیش‌فرض، پایه): دقیقاً همان منطق قبلی — همه‌ی ستون‌ها
+    (شامل members و بقیه‌ی ستون‌های تودرتو) برای *همه‌ی* ردیف‌ها بلافاصله
+    با json.loads باز می‌شوند، concat می‌شوند، و یک‌جا به evaluate_group_finalize
+    داده می‌شوند. بیشترین مصرف حافظه‌ی peak را دارد؛ اگر داده به اندازه‌ی
+    کافی کوچک باشد سریع‌ترین و ساده‌ترین حالت است."""
     dfs = []
+    total_rows = 0
     for pf in part_files:
         df = pd.read_parquet(pf)
+        _log_mem(f"[full] بعد از read_parquet({pf.name}) -> {len(df)} ردیف")
         if df.empty:
             continue
-        for col in ("members", "member_coin_compositions", "member_signatures"):
+        for col in _WT_MERGE_HEAVY_COLUMNS:
             if col in df.columns:
                 df[col] = df[col].apply(json.loads)
+        _log_mem(f"[full] بعد از json.loads ستون‌های تودرتوی {pf.name}")
+        total_rows += len(df)
         dfs.append(df)
 
-    columns = [
-        "members", "member_coin_compositions", "member_signatures",
-        "survival_rate", "compensation_ratio", "avg_return", "avg_correlation", "score",
-        "sample_count",
-        "بازه_زمانی_شروع", "بازه_زمانی_پایان", "تعداد_روز_فعال", "تعداد_روز_کل_بازه",
-    ] + EXT_STATS_16_COLUMNS
+    log.info("[CHECK] مجموع ردیف‌های همه‌ی %d part پیش از concat: %d", len(dfs), total_rows)
 
     if not dfs:
         all_portfolios, total_raw = [], 0
     else:
         merged = pd.concat(dfs, ignore_index=True)
+        dfs = None
+        _log_mem(f"[full] بعد از pd.concat -> shape={merged.shape}")
+        records = merged.to_dict("records")
+        _log_mem(f"[full] بعد از to_dict('records') -> {len(records)} رکورد")
+        merged = None
         all_portfolios, total_raw = evaluate_group_finalize(
-            merged.to_dict("records"), len(merged), top_n, abs_filters=True,
+            records, total_rows, top_n, abs_filters=True,
         )
+        _log_mem("[full] بعد از evaluate_group_finalize")
 
-    if not all_portfolios:
-        out_df = pd.DataFrame(columns=columns)
+    return _wt_merge_finalize_and_save(all_portfolios, total_raw, output_dir, len(part_files))
+
+
+def _merge_strategy_lazy_json(
+    part_files: list[Path], output_dir: Path, top_n: Optional[int],
+) -> Path:
+    """راهبرد ۲ (فالبک اول): همان مسیر قبلی، با یک تفاوت: رشته‌های JSON سه
+    ستون تودرتو (members/member_coin_compositions/member_signatures) تا
+    *بعد* از فیلتر/انتخاب نهایی هیچ‌وقت decode نمی‌شوند — یعنی در تمام مسیر
+    concat/to_dict/evaluate_group_finalize این ستون‌ها همچنان رشته‌ی فشرده‌ی
+    JSON هستند (بسیار کوچک‌تر از لیست/دیکشنری پایتونیِ expand‌شده). فقط
+    ردیف‌های نهایی برنده (top_n) در آخر decode می‌شوند. منطق/خروجی دقیقاً
+    همان full است؛ فقط peak memory کمتر است."""
+    dfs = []
+    total_rows = 0
+    for pf in part_files:
+        df = pd.read_parquet(pf)
+        _log_mem(f"[lazy-json] بعد از read_parquet({pf.name}) -> {len(df)} ردیف (بدون decode)")
+        if df.empty:
+            continue
+        total_rows += len(df)
+        dfs.append(df)
+
+    log.info("[CHECK] مجموع ردیف‌های همه‌ی %d part پیش از concat: %d", len(dfs), total_rows)
+
+    if not dfs:
+        all_portfolios, total_raw = [], 0
     else:
-        out_df = pd.DataFrame(all_portfolios)
-        out_df = out_df[[c for c in columns if c in out_df.columns]]
+        merged = pd.concat(dfs, ignore_index=True)
+        dfs = None
+        _log_mem(f"[lazy-json] بعد از pd.concat -> shape={merged.shape}")
+        records = merged.to_dict("records")
+        _log_mem(f"[lazy-json] بعد از to_dict('records') -> {len(records)} رکورد")
+        merged = None
+        all_portfolios, total_raw = evaluate_group_finalize(
+            records, total_rows, top_n, abs_filters=True,
+        )
+        _log_mem(f"[lazy-json] بعد از evaluate_group_finalize -> {len(all_portfolios)} برنده")
+        # فقط همین چند ردیف برنده را decode می‌کنیم
+        for rec in all_portfolios:
+            for col in _WT_MERGE_HEAVY_COLUMNS:
+                if col in rec and isinstance(rec[col], str):
+                    rec[col] = json.loads(rec[col])
+        _log_mem("[lazy-json] بعد از decode برندگان")
 
-    output_path = output_dir / "portfolios_whole_time"
-    final_path = _save_dataframe(out_df, output_path)
-    log.info(
-        "ذخیره شد: %s (%d سبد نهایی از %d سبد خامِ ادغام‌شده‌ی %d part)",
-        final_path, len(out_df), total_raw, len(part_files),
-    )
-    return final_path
+    return _wt_merge_finalize_and_save(all_portfolios, total_raw, output_dir, len(part_files))
+
+
+def _merge_strategy_columnar(
+    part_files: list[Path], output_dir: Path, top_n: Optional[int],
+) -> Path:
+    """راهبرد ۳ (فالبک دوم، سنگین‌ترین سناریو): سه ستون تودرتو اصلاً در
+    مرحله‌ی امتیازدهی/انتخاب خوانده نمی‌شوند — با column-projection پارکت
+    فقط ستون‌های سبک (اسکالر) برای *همه*‌ی part ها خوانده و concat می‌شوند
+    (حافظه‌ی این مرحله چند برابر کوچک‌تر از دو راهبرد قبلی است چون حتی
+    رشته‌ی JSON فشرده هم برای ردیف‌های غیربرنده هرگز به حافظه نمی‌آید).
+    evaluate_group_finalize روی همین ستون‌های سبک (که همان ستون‌های واقعی
+    مورد نیازش هستند: survival_rate/compensation_ratio/avg_return/
+    avg_correlation/_passes_abs) دقیقاً همان برندگان را انتخاب می‌کند.
+    فقط برای همان چند ردیف برنده، ستون‌های سنگین از فایل part اصلی‌شان
+    (با شناسه‌ی __part_idx/__row_idx که در پاس اول اضافه شده) مجدداً و
+    این‌بار *فقط برای آن ردیف‌ها* خوانده و decode می‌شوند."""
+    light_dfs = []
+    total_rows = 0
+    for part_idx, pf in enumerate(part_files):
+        try:
+            import pyarrow.parquet as pq
+            available = set(pq.ParquetFile(pf).schema.names)
+        except Exception:
+            available = None
+        cols = _WT_MERGE_LIGHT_COLUMNS
+        if available is not None:
+            cols = [c for c in _WT_MERGE_LIGHT_COLUMNS if c in available]
+        df = pd.read_parquet(pf, columns=cols)
+        _log_mem(f"[columnar] بعد از خواندن ستون‌های سبک {pf.name} -> {len(df)} ردیف")
+        if df.empty:
+            continue
+        df["__part_idx"] = part_idx
+        df["__row_idx"] = np.arange(len(df))
+        total_rows += len(df)
+        light_dfs.append(df)
+
+    log.info("[CHECK] مجموع ردیف‌های همه‌ی %d part پیش از concat (سبک): %d", len(light_dfs), total_rows)
+
+    if not light_dfs:
+        return _wt_merge_finalize_and_save([], 0, output_dir, len(part_files))
+
+    merged_light = pd.concat(light_dfs, ignore_index=True)
+    light_dfs = None
+    _log_mem(f"[columnar] بعد از concat سبک -> shape={merged_light.shape}")
+    light_records = merged_light.to_dict("records")
+    merged_light = None
+    _log_mem(f"[columnar] بعد از to_dict سبک -> {len(light_records)} رکورد")
+
+    winners, total_raw = evaluate_group_finalize(light_records, total_rows, top_n, abs_filters=True)
+    _log_mem(f"[columnar] بعد از evaluate_group_finalize -> {len(winners)} برنده")
+
+    # پاس دوم: فقط برای برندگان، ستون‌های سنگین را از part اصلی‌شان می‌خوانیم
+    winners_by_part: dict[int, list[dict]] = defaultdict(list)
+    for w in winners:
+        winners_by_part[w["__part_idx"]].append(w)
+
+    for part_idx, part_winners in winners_by_part.items():
+        pf = part_files[part_idx]
+        row_idxs = [w["__row_idx"] for w in part_winners]
+        heavy_df = pd.read_parquet(pf, columns=_WT_MERGE_HEAVY_COLUMNS)
+        heavy_rows = heavy_df.iloc[row_idxs]
+        for w, (_, hrow) in zip(part_winners, heavy_rows.iterrows()):
+            for col in _WT_MERGE_HEAVY_COLUMNS:
+                val = hrow[col]
+                w[col] = json.loads(val) if isinstance(val, str) else val
+        _log_mem(f"[columnar] بعد از خواندنِ هدفمندِ ستون‌های سنگین از {pf.name} برای {len(part_winners)} برنده")
+
+    for w in winners:
+        w.pop("__part_idx", None)
+        w.pop("__row_idx", None)
+
+    return _wt_merge_finalize_and_save(winners, total_raw, output_dir, len(part_files))
+
+
+def run_whole_time_merge(
+    parts_dir: Path, output_dir: Path, top_n: Optional[int], strategy: str = "full",
+) -> Path:
+    """فاز ۳ از ۳ (یک‌بار): همه‌ی part_*.parquet فاز ۲ را ادغام می‌کند و
+    دقیقاً همان evaluate_group_finalize (که evaluate_group یک‌شکلِ خودش هم
+    استفاده می‌کند) را یک‌بار روی کل مجموعه‌ی ادغام‌شده اجرا می‌کند — این‌طور
+    percentile_rank/انتخاب قطعی‌یا-fallback دقیقاً همان نتیجه‌ی حالت
+    تک‌جابی evaluate_group را می‌دهد، فقط ورودی‌اش از چند matrix job جمع
+    شده است.
+
+    [دیباگ کد ۱۴۳ / ایده‌ی همکار] سه راهبرد فالبک، از سبک‌ترین کد تا
+    کم‌مصرف‌ترین حافظه — هر سه دقیقاً همان evaluate_group_finalize را روی
+    همان مجموعه‌ی کامل صدا می‌زنند، پس خروجی هر سه از نظر ریاضی یکسان است؛
+    فقط الگوی مصرف I/O و حافظه فرق می‌کند:
+      - "full":       راهبرد قبلی/پیش‌فرض (بیشترین مصرف حافظه).
+      - "lazy-json":  decode ستون‌های تودرتو را تا بعد از انتخاب نهایی
+                       عقب می‌اندازد (مصرف حافظه‌ی خیلی کمتر، هزینه‌ی
+                       اضافه‌ی ناچیز).
+      - "columnar":   ستون‌های تودرتو را اصلاً برای ردیف‌های غیربرنده در
+                       حافظه نمی‌آورد (کمترین مصرف حافظه، دو پاس I/O).
+    اگر یک راهبرد به هر دلیلی (از جمله OOM/kill خودِ runner) کل جاب را
+    ببرد، در سطح workflow جاب بعدی با راهبرد بعدی دوباره تلاش می‌کند —
+    چون یک SIGTERM/SIGKILL واقعی از سمت سیستم‌عامل/زیرساخت runner را
+    نمی‌شود از *داخل* همان پروسسِ در حال مرگ گرفت و ادامه داد؛ فقط جاب/
+    پروسس بعدی می‌تواند دوباره تلاش کند."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _log_mem(f"شروع run_whole_time_merge (strategy={strategy})")
+
+    part_files = _wt_merge_check_parts(parts_dir)
+
+    strategies = {
+        "full": _merge_strategy_full,
+        "lazy-json": _merge_strategy_lazy_json,
+        "columnar": _merge_strategy_columnar,
+    }
+    if strategy not in strategies:
+        raise ValueError(
+            f"strategy نامعتبر: {strategy!r} — باید یکی از {sorted(strategies)} باشد."
+        )
+    return strategies[strategy](part_files, output_dir, top_n)
 
 
 # -----------------------------------------------------------------------------
@@ -2626,6 +2856,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--parts-dir", required=False, type=Path, default=None,
         help="مسیر پوشه‌ی حاوی part_*.parquet فاز ۲ (فقط برای --whole-time-merge لازم است).",
     )
+    parser.add_argument(
+        "--whole-time-merge-strategy", required=False, type=str, default="full",
+        choices=["full", "lazy-json", "columnar"],
+        help="[دیباگ کد ۱۴۳ / فالبک] راهبرد ادغام فاز ۳: full (پیش‌فرض قبلی)، "
+             "lazy-json (decode ستون‌های تودرتو را تا بعد از انتخاب نهایی "
+             "عقب می‌اندازد)، یا columnar (ستون‌های تودرتو را اصلاً برای "
+             "ردیف‌های غیربرنده نمی‌خواند). هر سه از نظر ریاضی خروجی یکسان "
+             "تولید می‌کنند؛ فقط مصرف حافظه فرق می‌کند. فقط برای "
+             "--whole-time-merge کاربرد دارد.",
+    )
     return parser.parse_args(argv)
 
 
@@ -2670,6 +2910,7 @@ def main(argv=None) -> int:
                 parts_dir=args.parts_dir,
                 output_dir=output_dir,
                 top_n=args.top_n,
+                strategy=args.whole_time_merge_strategy,
             )
         elif args.timeline:
             if args.whole_time_csv is None:
