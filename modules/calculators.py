@@ -1162,12 +1162,41 @@ def cmd_report(args):
     previous_results = _load_previous_results(previous_report_path, password) if previous_report_path else []
 
     if previous_results:
-        previous_folders = {r["period_name"] for r in previous_results}
-        new_strategies = [s for s in strategies if s["folder"] not in previous_folders]
-        log.info("📈 گزارش‌گیری افزایشی: %d استراتژی در گزارش قبلی، %d استراتژی جدید برای محاسبه",
+        # باگ ۱۶: previous_folders قبلاً فقط اسم پوشه را چک می‌کرد — یعنی همین
+        # که یک استراتژی یک‌بار در اسنپ‌شات قبلی ثبت شده بود، برای همیشه از
+        # محاسبه‌ی مجدد معاف می‌شد، حتی اگر فیلدی مثل monthly_breakdown بعداً
+        # به _compute_stats_block اضافه شده باشد (آن رکوردهای قدیمی هیچ‌وقت
+        # این فیلد را نمی‌گرفتند و پوشه‌ی ترکیبشان هم هیچ‌وقت ساخته نمی‌شد).
+        # این‌جا هر پوشه‌ای که حداقل یک رکورد «ناقص» دارد (معامله واقعی داشته
+        # ولی monthly_breakdown خالی است) را هم جزو استراتژی‌های نیازمند
+        # محاسبه‌ی مجدد در نظر می‌گیریم — نه کل اسنپ‌شات، فقط همان پوشه‌ها.
+        previous_by_folder = defaultdict(list)
+        for r in previous_results:
+            previous_by_folder[r["period_name"]].append(r)
+
+        def _is_stale_record(r):
+            return (r.get("total_trades", 0) or 0) > 0 and not r.get("monthly_breakdown")
+
+        stale_folders = {
+            folder for folder, recs in previous_by_folder.items()
+            if any(_is_stale_record(r) for r in recs)
+        }
+        if stale_folders:
+            log.info("♻️ %d پوشه با رکورد ناقص (monthly_breakdown خالی) شناسایی شد؛ دوباره محاسبه می‌شوند.",
+                      len(stale_folders))
+
+        previous_folders = set(previous_by_folder.keys())
+        new_strategies = [
+            s for s in strategies
+            if s["folder"] not in previous_folders or s["folder"] in stale_folders
+        ]
+        kept_previous_results = [
+            r for r in previous_results if r["period_name"] not in stale_folders
+        ]
+        log.info("📈 گزارش‌گیری افزایشی: %d استراتژی در گزارش قبلی، %d استراتژی جدید/ناقص برای محاسبه",
                  len(previous_folders), len(new_strategies))
         new_results = _compute_results(new_strategies, returns_cache, risk_cache, inv_cache, args, password)
-        all_results = previous_results + new_results
+        all_results = kept_previous_results + new_results
         all_results.sort(key=lambda r: r["score"], reverse=True)
     else:
         if previous_report_path:
