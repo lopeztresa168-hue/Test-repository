@@ -2627,6 +2627,36 @@ def _merge_strategy_lazy_json(
     return _wt_merge_finalize_and_save(all_portfolios, total_raw, output_dir, len(part_files))
 
 
+def _read_heavy_rows_streaming(
+    pf: Path, row_idxs: list[int], batch_size: int = 20_000,
+) -> dict[int, dict]:
+    """فقط ستون‌های سنگین (_WT_MERGE_HEAVY_COLUMNS) همون چند ردیف
+    row_idxs رو از فایل pf می‌خونه — بدون اینکه کل فایل یا حتی یک
+    row-group کامل یک‌جا در حافظه بیاد. با iter_batches جلو می‌ریم؛ هر
+    batch بعد از پردازش (و پیدا کردن تقاطعش با row_idxs) دور ریخته
+    می‌شه، پس peak memory این تابع مستقل از تعداد کل ردیف‌های part و
+    فقط تابعی از batch_size است. کلید dict خروجی همون __row_idx اصلیه."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    wanted = set(row_idxs)
+    result: dict[int, dict] = {}
+    pf_obj = pq.ParquetFile(pf)
+    offset = 0
+    for batch in pf_obj.iter_batches(batch_size=batch_size, columns=_WT_MERGE_HEAVY_COLUMNS):
+        batch_len = batch.num_rows
+        local_idxs = sorted(i - offset for i in wanted if offset <= i < offset + batch_len)
+        if local_idxs:
+            sub = pc.take(batch, pa.array(local_idxs, type=pa.int64())).to_pandas()
+            for local_i, (_, row) in zip(local_idxs, sub.iterrows()):
+                result[local_i + offset] = {col: row[col] for col in _WT_MERGE_HEAVY_COLUMNS}
+        offset += batch_len
+        if len(result) == len(wanted):
+            break  # همه‌ی ردیف‌های موردنیاز این part پیدا شدن، ادامه نده
+    return result
+
+
 def _merge_strategy_columnar(
     part_files: list[Path], output_dir: Path, top_n: Optional[int],
 ) -> Path:
@@ -2684,12 +2714,22 @@ def _merge_strategy_columnar(
     for part_idx, part_winners in winners_by_part.items():
         pf = part_files[part_idx]
         row_idxs = [w["__row_idx"] for w in part_winners]
-        heavy_df = pd.read_parquet(pf, columns=_WT_MERGE_HEAVY_COLUMNS)
-        heavy_rows = heavy_df.iloc[row_idxs]
-        for w, (_, hrow) in zip(part_winners, heavy_rows.iterrows()):
+        # [فیکس ریشه‌ای OOM] چون part_*.parquet با تنظیمات پیش‌فرض pandas
+        # نوشته شده، هر part فقط یک row-group داره — یعنی حتی
+        # pq.ParquetFile(pf).read(columns=...).take(row_idxs) هم قبل از
+        # take() مجبوره کل ستون سنگین رو برای هر ۱۰۸هزار ردیف decode کنه
+        # (فقط جلوی تبدیل pandas/Python object رو می‌گیره، نه خودِ اصل
+        # مشکل رو). راه‌حل قطعی: با iter_batches به‌صورت stream و batch به
+        # batch جلو می‌ریم؛ در هر لحظه فقط یک batch (نه کل part) در حافظه‌ست،
+        # پس مصرف حافظه‌ی این مرحله دیگر به تعداد ردیف‌های part بستگی ندارد
+        # و فقط به batch_size (اینجا ۲۰هزار ردیف) محدود می‌شود.
+        heavy_by_row = _read_heavy_rows_streaming(pf, row_idxs)
+        for w in part_winners:
+            hrow = heavy_by_row[w["__row_idx"]]
             for col in _WT_MERGE_HEAVY_COLUMNS:
                 val = hrow[col]
                 w[col] = json.loads(val) if isinstance(val, str) else val
+        heavy_by_row = None
         _log_mem(f"[columnar] بعد از خواندنِ هدفمندِ ستون‌های سنگین از {pf.name} برای {len(part_winners)} برنده")
 
     for w in winners:
