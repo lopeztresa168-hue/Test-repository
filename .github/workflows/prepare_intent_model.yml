@@ -1,0 +1,64 @@
+name: Prepare Intent Model
+
+# اجرای دستی از تب Actions، یا خودکار هروقت این دو فایل تغییر کنن
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - 'intents.json'
+      - 'prepare_intent_model.py'
+      - '.github/workflows/prepare_intent_model.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: چک‌اوت مخزن
+        uses: actions/checkout@v4
+
+      - name: نصب پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: نصب پیش‌نیازها
+        run: |
+          python -m pip install --upgrade pip
+          pip install "optimum[onnxruntime]" onnxruntime onnxruntime-extensions transformers numpy
+
+      - name: اجرای اسکریپت آماده‌سازی مدل
+        run: python prepare_intent_model.py
+
+      - name: بررسی حجم خروجی‌ها
+        run: |
+          echo "### حجم فایل‌های تولیدشده" >> $GITHUB_STEP_SUMMARY
+          du -h onnx_export/model_int8.onnx onnx_export/tokenizer.onnx onnx_export/intent_embeddings.json >> $GITHUB_STEP_SUMMARY
+          SIZE_BYTES=$(stat -c%s onnx_export/model_int8.onnx)
+          if [ "$SIZE_BYTES" -gt 95000000 ]; then
+            echo "⚠️ فایل مدل نزدیک یا بالای ۱۰۰ مگابایته — GitHub بدون Git LFS اجازه‌ی فایل بالای ۱۰۰MB رو نمی‌ده." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: کپی خروجی‌ها به پوشه assets اندروید (اگه این پوشه تو مخزن باشه)
+        run: |
+          if [ -d "app/src/main/assets" ]; then
+            cp onnx_export/model_int8.onnx app/src/main/assets/
+            cp onnx_export/tokenizer.onnx app/src/main/assets/
+            cp onnx_export/intent_embeddings.json app/src/main/assets/
+            echo "کپی شد به app/src/main/assets/"
+          else
+            echo "پوشه app/src/main/assets پیدا نشد — فایل‌ها فقط داخل onnx_export/ کامیت می‌شن؛ خودت جابه‌جاشون کن."
+          fi
+
+      - name: کامیت و پوش خروجی‌ها به مخزن
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: بازسازی مدل embedding intent [auto]"
+          file_pattern: |
+            onnx_export/**
+            app/src/main/assets/model_int8.onnx
+            app/src/main/assets/tokenizer.onnx
+            app/src/main/assets/intent_embeddings.json

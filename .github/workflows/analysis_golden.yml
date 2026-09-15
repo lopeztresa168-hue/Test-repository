@@ -678,6 +678,36 @@ jobs:
             exit 1
           fi
 
+      - name: دانلود golden_scores.csv قبلی از مخزن سوم (برای ادغام با تاریخچه)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD }}
+        run: |
+          mkdir -p /tmp/golden_scores_parts/_previous
+          API_RESP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/golden_scores.csv.tar.gz.enc")
+          DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+          if [ -n "$DL_URL" ]; then
+            curl -s -H "Authorization: token $GH_TOKEN" -L "$DL_URL" -o /tmp/golden_scores_prev.enc
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('/tmp/golden_scores_prev.enc');
+              const iv=data.subarray(0,16), ct=data.subarray(16);
+              const key=crypto.scryptSync(pass,'salt',32);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+              fs.writeFileSync('/tmp/golden_scores_prev.tar.gz', dec);
+            "
+            tar -xzf /tmp/golden_scores_prev.tar.gz -C /tmp/golden_scores_parts/_previous 2>/dev/null \
+              && echo "✅ golden_scores.csv قبلی اضافه شد به لیست ادغام." \
+              || echo "⚠️ استخراج نسخه‌ی قبلی ناموفق بود — رد می‌شویم."
+          else
+            echo "ℹ️ نسخه‌ی قبلی golden_scores.csv یافت نشد — این اولین ران است."
+          fi
+          rm -f /tmp/golden_scores_prev.enc /tmp/golden_scores_prev.tar.gz
+
       - name: دانلود و ادغام golden_scores از همه چانک‌ها + رمزنگاری و آپلود
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -687,7 +717,7 @@ jobs:
         run: |
           mkdir -p /tmp/golden_scores_parts
 
-          echo "[DEBUG] ساختار دایرکتوری golden_scores_parts:"
+          echo "[DEBUG] ساختار دایرکتوری golden_scores_parts (شامل _previous در صورت وجود):"
           find /tmp/golden_scores_parts -type f | head -30 || echo "(خالی)"
 
           CSV_COUNT=$(find /tmp/golden_scores_parts -name 'golden_scores.csv' | wc -l)
@@ -880,16 +910,50 @@ jobs:
             rm -f "/tmp/$FILE_NAME" /tmp/reco_list.txt /tmp/merged_reco.csv
           }
 
+          # نکته: نام واقعی فایل روی مخزن سوم "<FILE_NAME>.tar.gz.enc" است
+          # (همان الگوی golden_scores.csv.tar.gz.enc در loop_analysis.yml)،
+          # نه پارامتر DEST_ENC_NAME بالا که فقط برچسب مستنداتیه.
+          download_previous_reco () {
+            SRC_DIR="$1"; FILE_NAME="$2"
+            ENC_NAME="${FILE_NAME}.tar.gz.enc"
+            API_RESP=$(curl -s -H "Authorization: token $CROSS_REPO_TOKEN" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/$ENC_NAME")
+            DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+            if [ -n "$DL_URL" ]; then
+              curl -s -H "Authorization: token $CROSS_REPO_TOKEN" -L "$DL_URL" -o /tmp/prev_reco.enc
+              node -e "
+                const crypto=require('crypto'),fs=require('fs');
+                const pass=process.env.RESULTS_PASSWORD;
+                const data=fs.readFileSync('/tmp/prev_reco.enc');
+                const iv=data.subarray(0,16), ct=data.subarray(16);
+                const key=crypto.scryptSync(pass,'salt',32);
+                const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+                const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+                fs.writeFileSync('/tmp/prev_reco.tar.gz', dec);
+              "
+              mkdir -p "$SRC_DIR/_previous"
+              tar -xzf /tmp/prev_reco.tar.gz -C "$SRC_DIR/_previous" 2>/dev/null \
+                && echo "✅ [$FILE_NAME] نسخه‌ی قبلی اضافه شد به لیست ادغام." \
+                || echo "⚠️ [$FILE_NAME] استخراج نسخه‌ی قبلی ناموفق بود — رد می‌شویم."
+            else
+              echo "ℹ️ [$FILE_NAME] نسخه‌ی قبلی یافت نشد — این اولین ران است."
+            fi
+            rm -f /tmp/prev_reco.enc /tmp/prev_reco.tar.gz
+          }
+
+          download_previous_reco "/tmp/reco_news_parts" "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv"
           upload_reco_file "/tmp/reco_news_parts" \
             "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv" \
             "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری.csv.enc" \
             "الگوی خبری"
 
+          download_previous_reco "/tmp/reco_news_no_regime_parts" "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv"
           upload_reco_file "/tmp/reco_news_no_regime_parts" \
             "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv" \
             "پیشنهاد_استراتژی_بر_اساس_الگوی_خبری_بدون_رژیم.csv.enc" \
             "الگوی خبری بدون رژیم"
 
+          download_previous_reco "/tmp/reco_regime_parts" "پیشنهاد_استراتژی_بر_اساس_رژیم_بازار.csv"
           upload_reco_file "/tmp/reco_regime_parts" \
             "پیشنهاد_استراتژی_بر_اساس_رژیم_بازار.csv" \
             "پیشنهاد_استراتژی_بر_اساس_رژیم_بازار.csv.enc" \
