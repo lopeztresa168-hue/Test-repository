@@ -654,32 +654,53 @@ def filter_low_sample(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 # گام ۴: نرمال‌سازی با Percentile Rank
 # ---------------------------------------------------------------------------
 
-def percentile_rank(series: pd.Series) -> pd.Series:
-    """محاسبه Percentile Rank برای یک سری."""
-    ranks = series.rank(method="average", pct=True) * 100
-    return ranks
+# [فیکس نرمال‌سازی مطلق] قبلاً همه‌ی معیارها با percentile_rank (رتبه‌ی نسبی
+# داخل همون batch/coin_composition) نرمال می‌شدند — یعنی امتیاز هر signature
+# به این بستگی داشت که چه signatureهای دیگه‌ای در همون اجرا پردازش شدن، نه
+# فقط به مقدار خودش. این باعث می‌شد پردازش تکه‌تکه (چانک به چانک، یا در
+# چرخه‌های مختلف) نتیجه‌ی متفاوتی از پردازش یک‌جا بدهد و آستانه‌ی
+# min_score هم بین چرخه‌ها consistent نباشد.
+#
+# جایگزین: هر معیار با یک فرمول مطلق و ثابت (نه رتبه‌بندی نسبت به بقیه) به
+# بازه‌ی ۰-۱۰۰ نگاشت می‌شود، طوری که فقط به مقدار خودِ همان signature وابسته
+# باشد. ثابت‌های کالیبراسیون زیر یک‌بار، بر اساس دانش دامنه تعیین شده‌اند و
+# هرگز نباید از توزیع داده‌ی فعلی استخراج شوند — وگرنه دوباره batch-dependent
+# می‌شود.
+DAILY_RETURN_K = 300              # شیب سیگموید: ۰.۵٪ بازده روزانه ≈ ۹۰ امتیاز
+INDICATOR_IMPORTANCE_REF = 0.02   # مرجع «تعجب خبری معمولاً‌قوی» برای منحنی اشباع
 
 
 def normalize_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """نرمال‌سازی معیارها به تفکیک coin_composition."""
+    """نرمال‌سازی مطلق معیارها (بدون رتبه‌بندی نسبت به سایر ردیف‌ها).
+
+    ۵۰ امتیاز یعنی «سربه‌سر/بدون مزیت واقعی» برای هر معیار (profit_factor=1،
+    avg_daily_return=0، max_loss_ratio=0.5، avg_indicator_importance=REF) —
+    نه «رتبه‌ی وسط جمعیت» مثل نسخه‌ی قبلی.
+    """
     df = df.copy()
 
-    for metric in ["win_rate", "profit_factor", "avg_daily_return"]:
-        norm_col = f"{metric}_norm"
-        df[norm_col] = df.groupby("coin_composition")[metric].transform(percentile_rank)
+    df["win_rate_norm"] = df["win_rate"].clip(0, 100)
 
-    # max_loss_ratio: هر چه کمتر، بهتر – قبل از نرمال‌سازی معکوس می‌شود
-    df["max_loss_inv"] = 100 - (df["max_loss_ratio"] * 100)
-    df["max_loss_ratio_norm"] = df.groupby("coin_composition")["max_loss_inv"].transform(percentile_rank)
-    df.drop(columns=["max_loss_inv"], inplace=True)
+    df["profit_factor_norm"] = 100 * df["profit_factor"] / (df["profit_factor"] + 1)
+
+    # max_loss_ratio: هر چه کمتر، بهتر – مستقیم و مطلق معکوس می‌شود
+    df["max_loss_ratio_norm"] = (1 - df["max_loss_ratio"].clip(0, 1)) * 100
+
+    df["avg_daily_return_norm"] = 100 / (
+        1 + np.exp(-DAILY_RETURN_K * df["avg_daily_return"].fillna(0))
+    )
 
     # شدت شاخص خبری: هر چه تعجب (|actual-forecast|) بزرگ‌تر، سیگنال قوی‌تر
     # فرض می‌شود. ردیف‌هایی که مقدار معتبر ندارند (مثلاً چون رویداد anchor
     # هنوز منتشر نشده) با ۵۰ (خنثی، نه امتیاز مثبت نه منفی) پر می‌شوند تا
     # امتیاز نهایی‌شان به‌ناحق پایین/بالا نیاید.
     if "avg_indicator_importance" in df.columns:
-        df["indicator_importance_norm"] = df.groupby("coin_composition")["avg_indicator_importance"].transform(percentile_rank)
-        df["indicator_importance_norm"] = df["indicator_importance_norm"].fillna(50.0)
+        imp = pd.to_numeric(df["avg_indicator_importance"], errors="coerce")
+        df["indicator_importance_norm"] = np.where(
+            imp.notna(),
+            100 * imp.fillna(0) / (imp.fillna(0) + INDICATOR_IMPORTANCE_REF),
+            50.0,
+        )
     else:
         df["indicator_importance_norm"] = 50.0
 
@@ -691,16 +712,19 @@ def normalize_metrics(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def compute_score(row: pd.Series) -> float:
-    """محاسبه امتیاز نهایی با وزن‌های ثابت.
+    """محاسبه امتیاز نهایی با وزن‌های ثابت، از روی معیارهای مطلق (نه رتبه‌ی نسبی).
 
     وزن جدید indicator_importance_norm (شدت تعجب خبری شاخص غالب) اضافه شد؛
     بقیه‌ی وزن‌ها متناسب کم شدند تا مجموع همچنان ۱.۰ بماند
     (۰.۳۰→۰.۲۸، ۰.۳۰→۰.۲۸، ۰.۲۰→۰.۱۸، ۰.۲۰→۰.۱۶، + ۰.۱۰ برای شدت شاخص).
+
+    [فیکس نرمال‌سازی مطلق] max_loss_ratio_norm در normalize_metrics دیگر
+    نیازی به (100 - ...) اینجا ندارد — چون خودش از قبل درست‌جهته (بالاتر=بهتر).
     """
     score = (
         0.28 * row["win_rate_norm"]
         + 0.28 * row["profit_factor_norm"]
-        + 0.18 * (100 - row["max_loss_ratio_norm"])
+        + 0.18 * row["max_loss_ratio_norm"]
         + 0.16 * row["avg_daily_return_norm"]
         + 0.10 * row.get("indicator_importance_norm", 50.0)
     )
