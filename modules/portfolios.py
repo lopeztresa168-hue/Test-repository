@@ -2533,6 +2533,85 @@ _WT_MERGE_LIGHT_COLUMNS = [
 ] + ["_passes_abs"]
 
 
+def _load_previous_winners_as_part(previous_csv: Optional[Path], parts_dir: Path) -> Optional[Path]:
+    """[فیکس ادغام با تاریخچه] برندگان چرخه‌ی قبل (portfolios_whole_time.csv
+    قبلی، دانلودشده از مخزن سوم توسط workflow) را به‌صورت یک part_*.parquet
+    دیگر در parts_dir قرار می‌دهد تا evaluate_group_finalize آن‌ها را همراه
+    با کاندیدهای تازه‌ی همین چرخه، یک‌جا و سراسری دوباره رتبه‌بندی/انتخاب کند.
+
+    بدون این تابع، هر چرخه فقط combo های تازه (طبق completed_portfolios.json)
+    را می‌بیند و portfolios_whole_time.csv قبلی کامل overwrite می‌شود — یعنی
+    برندگان چرخه‌های قبل برای همیشه از دست می‌روند.
+
+    محدودیت صادقانه: چون فقط برندگانِ نهاییِ هر چرخه (نه کل استخر خامِ آن
+    چرخه) نگه داشته می‌شوند، این دقیقاً معادل ریاضیِ «همه از اول با هم
+    پردازش شوند» نیست — یک combo که در یک چرخه‌ی کوچک/کم‌رقابت از cutoff
+    جا مانده، با این ادغام هم برنمی‌گردد. ولی مشکل اصلی (گم‌شدن کامل
+    تاریخچه) را حل می‌کند.
+    """
+    if previous_csv is None:
+        return None
+    previous_csv = Path(previous_csv)
+    if not previous_csv.exists():
+        log.info("[ادغام تاریخچه] فایل %s یافت نشد — این اولین چرخه است.", previous_csv)
+        return None
+
+    df = pd.read_csv(previous_csv)
+    if df.empty:
+        log.info("[ادغام تاریخچه] %s خالی است — چیزی برای ادغام نیست.", previous_csv)
+        return None
+
+    # ستون‌های تودرتو با to_csv به‌صورت repr پایتونی (نه JSON) ذخیره شده‌اند
+    # (کوتیشن تکی) — پس با ast.literal_eval می‌خوانیم، نه json.loads.
+    for col in _WT_MERGE_HEAVY_COLUMNS:
+        if col not in df.columns:
+            log.warning(
+                "[ادغام تاریخچه] ستون %s در %s نیست — از ادغام صرف‌نظر می‌شود.",
+                col, previous_csv,
+            )
+            return None
+
+        def _parse_cell(val):
+            if isinstance(val, (list, dict)):
+                return val
+            if not isinstance(val, str):
+                return val
+            try:
+                return ast.literal_eval(val)
+            except (ValueError, SyntaxError):
+                return json.loads(val)
+
+        df[col] = df[col].apply(_parse_cell)
+
+    # score قبلی روی جمعیت قدیمی محاسبه شده — دور ریخته می‌شود تا
+    # evaluate_group_finalize آن را از نو، روی کل جمعیتِ ادغام‌شده بسازد.
+    df = df.drop(columns=["score"], errors="ignore")
+
+    # _passes_abs در خروجی نهایی ذخیره نمی‌شود (فقط برچسب داخلی مرحله‌ی
+    # امتیازدهی است) — از همان دو ستون خامی که در CSV باقی مانده بازسازی می‌شود.
+    df["_passes_abs"] = (
+        (df["survival_rate"] >= ABS_MIN_SURVIVAL_RATE)
+        & (df["avg_return"] >= ABS_MIN_AVG_RETURN)
+    )
+
+    # برای سازگاری با همان قرارداد part_*.parquet تازه (run_whole_time_score):
+    # ستون‌های تودرتو دوباره به رشته‌ی JSON تبدیل می‌شوند.
+    for col in _WT_MERGE_HEAVY_COLUMNS:
+        df[col] = df[col].apply(json.dumps)
+
+    parts_dir = Path(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    # نام باید با الگوی عددیِ sort در _wt_merge_check_parts سازگار باشد
+    # (int(p.stem.split("_")[-1])) — "-1" یعنی «قدیمی‌تر از همه‌ی چانک‌های تازه».
+    out_path = parts_dir / "part_-1.parquet"
+    df.to_parquet(out_path)
+    log.info(
+        "[ادغام تاریخچه] ✅ %d برنده‌ی چرخه‌ی قبل از %s به‌عنوان part_-1.parquet اضافه شد.",
+        len(df), previous_csv,
+    )
+    return out_path
+
+
 def _wt_merge_check_parts(parts_dir: Path) -> list[Path]:
     """[دیباگ کد ۱۴۳ / سرنخ ۱] چک می‌کند فایل‌های part واقعاً رسیده‌اند، حجم
     هرکدام را لاگ می‌کند، و لیست مرتب‌شده (بر اساس عدد chunk، نه رشته) را
@@ -2779,6 +2858,7 @@ def _merge_strategy_columnar(
 
 def run_whole_time_merge(
     parts_dir: Path, output_dir: Path, top_n: Optional[int], strategy: str = "full",
+    previous_csv: Optional[Path] = None,
 ) -> Path:
     """فاز ۳ از ۳ (یک‌بار): همه‌ی part_*.parquet فاز ۲ را ادغام می‌کند و
     دقیقاً همان evaluate_group_finalize (که evaluate_group یک‌شکلِ خودش هم
@@ -2805,6 +2885,11 @@ def run_whole_time_merge(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _log_mem(f"شروع run_whole_time_merge (strategy={strategy})")
+
+    # [فیکس ادغام با تاریخچه] برندگان چرخه‌ی قبل را (اگر داده شده) قبل از
+    # شمارش part ها اضافه می‌کنیم تا evaluate_group_finalize آن‌ها را هم
+    # جزو همین یک اجرای سراسری ببیند — نه این‌که بعداً جدا concat شوند.
+    _load_previous_winners_as_part(previous_csv, parts_dir)
 
     part_files = _wt_merge_check_parts(parts_dir)
 
@@ -2935,6 +3020,15 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="مسیر پوشه‌ی حاوی part_*.parquet فاز ۲ (فقط برای --whole-time-merge لازم است).",
     )
     parser.add_argument(
+        "--previous-whole-time-csv", required=False, type=Path, default=None,
+        help="[فیکس ادغام با تاریخچه] مسیر portfolios_whole_time.csv چرخه‌ی "
+             "قبل (دانلود/دیکریپت‌شده توسط workflow از مخزن سوم، اختیاری). "
+             "اگر داده شود، برندگان آن قبل از evaluate_group_finalize به‌عنوان "
+             "part اضافه اضافه می‌شوند تا با کاندیدهای تازه یک‌جا رتبه‌بندی "
+             "شوند — در غیر این صورت این فایل کامل overwrite می‌شود. فقط "
+             "برای --whole-time-merge کاربرد دارد.",
+    )
+    parser.add_argument(
         "--whole-time-merge-strategy", required=False, type=str, default="full",
         choices=["full", "lazy-json", "columnar"],
         help="[دیباگ کد ۱۴۳ / فالبک] راهبرد ادغام فاز ۳: full (پیش‌فرض قبلی)، "
@@ -2989,6 +3083,7 @@ def main(argv=None) -> int:
                 output_dir=output_dir,
                 top_n=args.top_n,
                 strategy=args.whole_time_merge_strategy,
+                previous_csv=args.previous_whole_time_csv,
             )
         elif args.timeline:
             if args.whole_time_csv is None:
