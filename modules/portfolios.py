@@ -597,6 +597,19 @@ def load_signatures(signatures_dir: Path, signatures_filter: Optional[Path] = No
         # signature ساخته‌شده استفاده می‌کنیم (فقط برای گزارش‌دهی، نه cleanup صف).
         data["queue_key"] = data["signature"]
 
+    # ========== فیکس معماری: واحد اتمیِ سبد باید (strategy_id, signature) ==========
+    # قبلاً همه‌جای پایین‌دستی (همبستگی، ساخت کلیک/سبد، monthly returns) فقط
+    # روی strategy_id گروه‌بندی می‌شد — یعنی اگر یک strategy_id چند signature
+    # داشت (مثلاً همان استراتژی با فیلترهای زمانیِ مختلف: pre/post رویداد،
+    # سشن، رژیم بازار، شاخص خبری)، بازده‌ی همه‌ی آن نسخه‌ها با هم جمع/قاطی
+    # می‌شد و یک سری زمانیِ غیرقابل‌معامله تولید می‌کرد. چون signature عملاً
+    # یک فیلتر معاملاتی مجزاست (و می‌تواند سودآوری را کاملاً عوض کند)، هر
+    # (strategy_id, signature) باید یک «عضو» مستقل و قابل‌اجرا در نظر گرفته
+    # شود، نه یک variant که در strategy_id خلاصه/قاطی شود. member_id همین
+    # ترکیب یکتا را می‌سازد و از این‌جا به بعد در همبستگی/کلیک/monthly
+    # returns/strategy_meta به‌جای strategy_id استفاده می‌شود.
+    data["member_id"] = data["strategy_id"].astype(str) + "‖" + data["signature"].astype(str)
+
     log.info("مجموع رکوردهای signatures بارگذاری‌شده: %d", len(data))
     return data
 
@@ -748,16 +761,24 @@ def build_release_dates(group: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_monthly_returns(group: pd.DataFrame) -> pd.DataFrame:
-    """تجمیع بازده هر strategy_id بر اساس ماه تقویمیِ release_date (نه دوره‌ی
-    خام). این محور زمانیِ مشترک است که بازده‌ی استراتژی‌های با شاخص خبری/
-    کوین متفاوت (که release_date دقیقشان هیچ‌وقت برابر نیست) را قابل‌مقایسه
-    می‌کند — پایه‌ی رفع باگ ۲ (آینده‌نگری در تقاطع دوره‌ها)."""
+    """تجمیع بازده هر عضو (member_id = strategy_id + signature) بر اساس ماه
+    تقویمیِ release_date (نه دوره‌ی خام). این محور زمانیِ مشترک است که
+    بازده‌ی استراتژی‌های با شاخص خبری/کوین متفاوت (که release_date دقیقشان
+    هیچ‌وقت برابر نیست) را قابل‌مقایسه می‌کند — پایه‌ی رفع باگ ۲ (آینده‌نگری
+    در تقاطع دوره‌ها).
+
+    ========== فیکس معماری (member_id به‌جای strategy_id) ==========
+    قبلاً اینجا روی strategy_id گروه‌بندی می‌شد. اگر یک strategy_id چند
+    signature داشت (چند فیلتر زمانیِ مختلف روی همان استراتژی خام)، بازده‌ی
+    همه‌شان در یک ماه با هم جمع می‌شد و یک سری زمانیِ ترکیبی/غیرقابل‌معامله
+    می‌ساخت. حالا واحد گروه‌بندی member_id است — یعنی هر (strategy_id,
+    signature) سری زمانیِ ماهانه‌ی مستقل خودش را دارد."""
     g = group.copy()
     g["__month"] = g["release_date"].dt.to_period("M")
     monthly = (
-        g.groupby(["__month", "strategy_id"])["total_return"]
+        g.groupby(["__month", "member_id"])["total_return"]
         .sum()
-        .unstack("strategy_id")
+        .unstack("member_id")
         .sort_index()
     )
     return monthly
@@ -765,7 +786,8 @@ def build_monthly_returns(group: pd.DataFrame) -> pd.DataFrame:
 
 def compute_monthly_correlation_matrix(group: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    محاسبه ماتریس همبستگی Spearman روی بازده‌ی ماهانه‌ی تجمیعی هر strategy_id.
+    محاسبه ماتریس همبستگی Spearman روی بازده‌ی ماهانه‌ی تجمیعی هر عضو
+    (member_id = strategy_id + signature).
 
     ========== رفع باگ ۲ (آینده‌نگری در تقاطع دوره‌ها) ==========
     قبلاً همبستگی فقط روی release_dateهایی حساب می‌شد که هر دو عضو *هم‌زمان*
@@ -779,15 +801,16 @@ def compute_monthly_correlation_matrix(group: pd.DataFrame) -> tuple[pd.DataFram
 
     خروجی:
         corr_df: ستون‌های [a, b, correlation, n] — n = تعداد ماه‌هایی که هر دو
-            عضو در آن‌ها فعال بوده‌اند (نه تعداد دوره‌ی خام مشترک).
-        monthly: pivot ماهانه [ماه × strategy_id] از بازده‌ی تجمیعی هر ماه —
+            عضو در آن‌ها فعال بوده‌اند (نه تعداد دوره‌ی خام مشترک). a/b اکنون
+            مقادیر member_id هستند (strategy_id + signature)، نه strategy_id تنها.
+        monthly: pivot ماهانه [ماه × member_id] از بازده‌ی تجمیعی هر ماه —
             برای استفاده‌ی مجدد در ساخت و ارزیابی سبد.
-        exact_valid_periods: دیکشنری {strategy_id: set(release_date دقیق)} —
+        exact_valid_periods: دیکشنری {member_id: set(release_date دقیق)} —
             فقط برای بازسازیِ بازه‌ی واقعیِ روزانه‌ی فعال‌بودن (زمان‌بندی اجرا)،
             نه برای محاسبه‌ی همبستگی/جبران‌سازی/بقا.
     """
     exact_valid_periods = {
-        strat: set(sub["release_date"]) for strat, sub in group.groupby("strategy_id")
+        strat: set(sub["release_date"]) for strat, sub in group.groupby("member_id")
     }
 
     monthly = build_monthly_returns(group)
@@ -1307,11 +1330,22 @@ def evaluate_group_build(group: pd.DataFrame, attach_periods: bool = False):
     adj = _build_adjacency(candidate_strategies, kept_pairs)
     clique_members = _enumerate_clique_members(candidate_strategies, adj, PORTFOLIO_SIZES)
 
-    # اطلاعات هر strategy_id (کوین/امضا) — چون اعضای یک سبد دیگر لزوماً
-    # هم‌کوین/هم‌امضا نیستند، این‌ها را به‌ازای هر عضو (نه هر سبد) نگه می‌داریم.
-    strategy_meta = group.groupby("strategy_id").agg(
+    # اطلاعات هر عضو (کوین/امضا) — چون اعضای یک سبد دیگر لزوماً هم‌کوین/
+    # هم‌امضا نیستند، این‌ها را به‌ازای هر عضو (نه هر سبد) نگه می‌داریم.
+    #
+    # ========== فیکس معماری (member_id به‌جای strategy_id) ==========
+    # قبلاً اینجا روی strategy_id گروه‌بندی می‌شد و __sig همه‌ی signatureهای
+    # متمایزی که آن strategy_id در کل استخر داشت را در یک لیست جمع می‌کرد
+    # (می‌توانست ده‌ها/صدها مورد باشد چون یک استراتژی با فیلترهای زمانیِ
+    # مختلف/pre-post رویداد/سشن/رژیم چند signature دارد) — یعنی
+    # member_signatures در خروجی نهایی انفجاری و بی‌معنی می‌شد (لیستی از
+    # signatureهای نامرتبط به همین سبد خاص). حالا که واحد گروه‌بندی
+    # member_id است (که خودش دقیقاً یک strategy_id + یک signature را کد
+    # می‌کند)، هر گروه ذاتاً فقط یک مقدار signature دارد؛ پس __sig یک رشته‌ی
+    # تکی است (نه لیست) و «هر عضو دقیقاً یک امضا» تضمین می‌شود.
+    strategy_meta = group.groupby("member_id").agg(
         __coin=("coin_composition", "first"),
-        __sig=("signature", lambda s: sorted(set(s))),
+        __sig=("signature", "first"),
     )
 
     # [فیکس ۱۳] برای هر دوره (release_date)، طول واقعی آن دوره (period_length_days)
@@ -1422,8 +1456,10 @@ def score_combo(
     member_coins = [
         strategy_meta.loc[m, "__coin"] if m in strategy_meta.index else "" for m in members
     ]
+    # هر عضو (member_id) دقیقاً یک امضا دارد — این لیست حالا طولش همیشه با
+    # len(members) برابر است (نه یک لیست‌تودرلیست از ده‌ها امضای نامرتبط).
     member_sigs = [
-        strategy_meta.loc[m, "__sig"] if m in strategy_meta.index else [] for m in members
+        strategy_meta.loc[m, "__sig"] if m in strategy_meta.index else "" for m in members
     ]
 
     record = {
@@ -1664,12 +1700,12 @@ def run(
     all_portfolios: list[dict] = []
     total_raw_portfolios = 0
 
-    if candidates.empty or candidates["strategy_id"].nunique() < 2:
-        log.warning("کمتر از ۲ strategy_id واجد شرایط Golden یافت شد — سبدی ساخته نمی‌شود.")
+    if candidates.empty or candidates["member_id"].nunique() < 2:
+        log.warning("کمتر از ۲ عضو (strategy_id+signature) واجد شرایط Golden یافت شد — سبدی ساخته نمی‌شود.")
     else:
         log.info(
-            "ساخت سبد به‌صورت سراسری روی %d strategy_id واجد شرایط Golden (فارغ از کوین/امضا)...",
-            candidates["strategy_id"].nunique(),
+            "ساخت سبد به‌صورت سراسری روی %d عضو (strategy_id+signature) واجد شرایط Golden (فارغ از کوین)...",
+            candidates["member_id"].nunique(),
         )
         all_portfolios, total_raw_portfolios = evaluate_group(
             coin_composition="", signature="", group=candidates, top_n=top_n,
@@ -1879,12 +1915,12 @@ def _evaluate_merge(
         return None
 
     df = sub.reset_index()
-    df.columns = ["strategy_id", "release_date", "total_return"]
+    df.columns = ["member_id", "release_date", "total_return"]
     df = df[(df["release_date"] >= seg_start) & (df["release_date"] <= seg_end)]
     if df.empty:
         return None
 
-    pivot = df.pivot_table(index="release_date", columns="strategy_id", values="total_return", aggfunc="mean")
+    pivot = df.pivot_table(index="release_date", columns="member_id", values="total_return", aggfunc="mean")
     pivot = pivot.reindex(columns=members)
     pivot = pivot.dropna(how="any")
     if len(pivot) < MIN_PORTFOLIO_SAMPLES:
@@ -2075,8 +2111,10 @@ def _load_whole_time_pool(
         log.warning("portfolios_whole_time.csv خالی است — جدول زمانی خالی خواهد بود.")
         return []
 
+    # members داخل portfolios_whole_time.csv اکنون مقادیر member_id هستند
+    # (strategy_id+signature)، پس این دیکشنری هم باید با همان کلید ساخته شود.
     exact_valid_periods = {
-        strat: set(sub["release_date"]) for strat, sub in candidates.groupby("strategy_id")
+        strat: set(sub["release_date"]) for strat, sub in candidates.groupby("member_id")
     }
     period_bounds = _period_bounds_by_date(candidates)
 
@@ -2194,9 +2232,9 @@ def run_timeline(
     for record in pool:
         record["quality_score"] = _quality_score(record, global_arrays)
 
-    # ---- نمایه‌ی بازده‌ی خام هر strategy_id در هر release_date، برای محاسبه‌ی دقیق سبدهای ادغام‌شده ----
+    # ---- نمایه‌ی بازده‌ی خام هر عضو (member_id) در هر release_date، برای محاسبه‌ی دقیق سبدهای ادغام‌شده ----
     returns_lookup = (
-        candidates.groupby(["strategy_id", "release_date"])["total_return"].mean()
+        candidates.groupby(["member_id", "release_date"])["total_return"].mean()
     )
 
     segments = _build_timeline_segments(pool, returns_lookup, global_arrays)
@@ -2272,13 +2310,13 @@ def run_whole_time(
     # منطق تجاری «سبد چند استراتژی با همبستگی پایین» به کوین یا شاخص خبری
     # هیچ‌کدام کاری ندارد. حالا evaluate_group یک‌بار روی کل استخر
     # Golden-qualified صدا زده می‌شود، بدون هیچ گروه‌بندی‌ای.
-    if candidates.empty or candidates["strategy_id"].nunique() < 2:
-        log.warning("کمتر از ۲ strategy_id واجد شرایط Golden یافت شد — سبدی ساخته نمی‌شود.")
+    if candidates.empty or candidates["member_id"].nunique() < 2:
+        log.warning("کمتر از ۲ عضو (strategy_id+signature) واجد شرایط Golden یافت شد — سبدی ساخته نمی‌شود.")
         all_portfolios, total_raw = [], 0
     else:
         log.info(
-            "حالت کل بازه‌ی زمانی: ساخت سبد به‌صورت سراسری روی %d strategy_id واجد شرایط Golden (فارغ از کوین/امضا)...",
-            candidates["strategy_id"].nunique(),
+            "حالت کل بازه‌ی زمانی: ساخت سبد به‌صورت سراسری روی %d عضو (strategy_id+signature) واجد شرایط Golden (فارغ از کوین)...",
+            candidates["member_id"].nunique(),
         )
         all_portfolios, total_raw = evaluate_group(
             coin_composition="", signature="", group=candidates, top_n=top_n,
@@ -2374,8 +2412,8 @@ def run_whole_time_build(
         log.warning("golden_scores ارائه نشده — پیش‌فیلتر Golden رد می‌شود.")
         candidates = signatures
 
-    if candidates.empty or candidates["strategy_id"].nunique() < 2:
-        log.warning("کمتر از ۲ strategy_id واجد شرایط Golden یافت شد — صف ترکیبات خالی خواهد بود.")
+    if candidates.empty or candidates["member_id"].nunique() < 2:
+        log.warning("کمتر از ۲ عضو (strategy_id+signature) واجد شرایط Golden یافت شد — صف ترکیبات خالی خواهد بود.")
         return _write_empty()
 
     built = evaluate_group_build(candidates, attach_periods=False)
@@ -2404,10 +2442,10 @@ def run_whole_time_build(
     meta_out.to_parquet(output_dir / "strategy_meta.parquet")
 
     evp_rows = [
-        {"strategy_id": s, "release_date": d}
+        {"member_id": s, "release_date": d}
         for s, dates in exact_valid_periods.items() for d in dates
     ]
-    pd.DataFrame(evp_rows, columns=["strategy_id", "release_date"]).to_parquet(
+    pd.DataFrame(evp_rows, columns=["member_id", "release_date"]).to_parquet(
         output_dir / "exact_valid_periods.parquet"
     )
 
@@ -2448,7 +2486,7 @@ def run_whole_time_score(shared_dir: Path, combos_file: Path, output_file: Path)
     evp_df = pd.read_parquet(shared_dir / "exact_valid_periods.parquet")
     evp_df["release_date"] = pd.to_datetime(evp_df["release_date"])
     exact_valid_periods = {
-        s: set(sub["release_date"]) for s, sub in evp_df.groupby("strategy_id")
+        s: set(sub["release_date"]) for s, sub in evp_df.groupby("member_id")
     }
 
     pld_df = pd.read_parquet(shared_dir / "period_length_by_date.parquet")
