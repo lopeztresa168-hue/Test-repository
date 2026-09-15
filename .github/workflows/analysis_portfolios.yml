@@ -1167,6 +1167,33 @@ jobs:
           echo "حافظه‌ی آزاد runner قبل از شروع merge:"
           free -h
 
+      - name: دانلود portfolios_whole_time.csv قبلی از مخزن سوم (برای ادغام با تاریخچه)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          API_RESP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/analysis_results/portfolios_whole_time.csv.enc")
+          DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+          if [ -n "$DL_URL" ]; then
+            curl -s -H "Authorization: token $GH_TOKEN" -L "$DL_URL" -o /tmp/portfolios_wt_prev.enc
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('/tmp/portfolios_wt_prev.enc');
+              const iv=data.subarray(0,16), ct=data.subarray(16);
+              const key=crypto.scryptSync(pass,'salt',32);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+              fs.writeFileSync('/tmp/portfolios_whole_time_previous.csv', dec);
+            "
+            echo "✅ نسخه‌ی قبلی portfolios_whole_time.csv دانلود شد."
+          else
+            echo "ℹ️ نسخه‌ی قبلی یافت نشد — این اولین چرخه است."
+          fi
+          rm -f /tmp/portfolios_wt_prev.enc
+
       - name: ادغام نهایی + نرمال‌سازی/انتخاب سراسری (فاز ۳)
         run: |
           mkdir -p /tmp/portfolios_whole_time_out
@@ -1204,6 +1231,7 @@ jobs:
             --whole-time-merge \
             --whole-time-merge-strategy columnar \
             --parts-dir /tmp/portfolios_wt_parts \
+            --previous-whole-time-csv /tmp/portfolios_whole_time_previous.csv \
             --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
           PY_EXIT=${PIPESTATUS[0]}
           set -e
@@ -1305,6 +1333,33 @@ jobs:
           du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
           free -h
 
+      - name: دانلود portfolios_whole_time.csv قبلی از مخزن سوم (برای ادغام با تاریخچه)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          API_RESP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/analysis_results/portfolios_whole_time.csv.enc")
+          DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+          if [ -n "$DL_URL" ]; then
+            curl -s -H "Authorization: token $GH_TOKEN" -L "$DL_URL" -o /tmp/portfolios_wt_prev.enc
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('/tmp/portfolios_wt_prev.enc');
+              const iv=data.subarray(0,16), ct=data.subarray(16);
+              const key=crypto.scryptSync(pass,'salt',32);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+              fs.writeFileSync('/tmp/portfolios_whole_time_previous.csv', dec);
+            "
+            echo "✅ نسخه‌ی قبلی portfolios_whole_time.csv دانلود شد."
+          else
+            echo "ℹ️ نسخه‌ی قبلی یافت نشد — این اولین چرخه است."
+          fi
+          rm -f /tmp/portfolios_wt_prev.enc
+
       - name: "تلاش دوم: تلاش مجدد با همون راهبرد امن columnar (retry ساده، برای preemption موقت)"
         run: |
           mkdir -p /tmp/portfolios_whole_time_out
@@ -1328,6 +1383,7 @@ jobs:
             --whole-time-merge \
             --whole-time-merge-strategy columnar \
             --parts-dir /tmp/portfolios_wt_parts \
+            --previous-whole-time-csv /tmp/portfolios_whole_time_previous.csv \
             --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
           PY_EXIT=${PIPESTATUS[0]}
           set -e
@@ -1422,6 +1478,33 @@ jobs:
           du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
           free -h
 
+      - name: دانلود portfolios_whole_time.csv قبلی از مخزن سوم (برای ادغام با تاریخچه)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          API_RESP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/analysis_results/portfolios_whole_time.csv.enc")
+          DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+          if [ -n "$DL_URL" ]; then
+            curl -s -H "Authorization: token $GH_TOKEN" -L "$DL_URL" -o /tmp/portfolios_wt_prev.enc
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('/tmp/portfolios_wt_prev.enc');
+              const iv=data.subarray(0,16), ct=data.subarray(16);
+              const key=crypto.scryptSync(pass,'salt',32);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+              fs.writeFileSync('/tmp/portfolios_whole_time_previous.csv', dec);
+            "
+            echo "✅ نسخه‌ی قبلی portfolios_whole_time.csv دانلود شد."
+          else
+            echo "ℹ️ نسخه‌ی قبلی یافت نشد — این اولین چرخه است."
+          fi
+          rm -f /tmp/portfolios_wt_prev.enc
+
       - name: "تلاش سوم: ادغام با راهبرد columnar (فالبک ۲، کم‌مصرف‌ترین)"
         run: |
           mkdir -p /tmp/portfolios_whole_time_out
@@ -1445,6 +1528,7 @@ jobs:
             --whole-time-merge \
             --whole-time-merge-strategy columnar \
             --parts-dir /tmp/portfolios_wt_parts \
+            --previous-whole-time-csv /tmp/portfolios_whole_time_previous.csv \
             --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
           PY_EXIT=${PIPESTATUS[0]}
           set -e
