@@ -1327,7 +1327,7 @@ def _install_pandas():
     log("  pandas و pyarrow نصب شدند ✅")
     return True
 
-def _get_qualified_signatures(csv_path, min_score=45):
+def _get_qualified_signatures(csv_path, min_score=50):
     """
     خواندن golden_scores.csv و فیلتر score >= min_score
 
@@ -1441,7 +1441,7 @@ def _get_qualified_signatures(csv_path, min_score=45):
         log(f"  خطا در پردازش CSV: {e}", 'ERROR')
         return []
 
-def build_portfolios_queue(repo, token, password, min_score=45.0):
+def build_portfolios_queue(repo, token, password, min_score=50.0):
     log("=" * 60)
     log("🔄 مرحله ۳: ساخت صف portfolios")
     log("=" * 60)
