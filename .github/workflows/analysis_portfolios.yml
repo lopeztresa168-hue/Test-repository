@@ -1255,6 +1255,22 @@ jobs:
             done
           fi
 
+      # [فیکس ریشه‌ای کد ۱ در timeline] علاوه بر commit/push به main، فایل رو
+      # به‌عنوان آرتیفکت هم آپلود می‌کنیم. جاب‌های بعدی (مثل timeline) با
+      # actions/checkout بدون ref: مشخص، کامیتی که هنگام trigger شدن
+      # workflow ثابت شده رو می‌گیرن — نه لزوماً آخرین HEAD شاخه‌ی main.
+      # پس اگه این جاب بعد از اون لحظه یه کامیت جدید push کنه، جاب بعدی
+      # ممکنه اون فایل رو تو checkoutِ خودش نبینه (race condition).
+      # آرتیفکت به این race وابسته نیست.
+      - name: آپلود portfolios_whole_time.csv به‌عنوان آرتیفکت (مستقل از race با checkout)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: portfolios_outputs/portfolios_whole_time.csv
+          if-no-files-found: warn
+          retention-days: 7
+
   portfolios-whole-time-merge-retry1:
     needs: [portfolios-whole-time-merge]
     runs-on: ubuntu-latest
@@ -1363,6 +1379,17 @@ jobs:
             done
           fi
 
+      # [فیکس ریشه‌ای کد ۱ در timeline] همون دلیل بالا: آرتیفکت مستقل از
+      # race بین commit/push این جاب و checkout جاب timeline است.
+      - name: آپلود portfolios_whole_time.csv به‌عنوان آرتیفکت (مستقل از race با checkout)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: portfolios_outputs/portfolios_whole_time.csv
+          if-no-files-found: warn
+          retention-days: 7
+
   portfolios-whole-time-merge-retry2:
     needs: [portfolios-whole-time-merge-retry1]
     runs-on: ubuntu-latest
@@ -1469,6 +1496,17 @@ jobs:
             done
           fi
 
+      # [فیکس ریشه‌ای کد ۱ در timeline] همون دلیل بالا: آرتیفکت مستقل از
+      # race بین commit/push این جاب و checkout جاب timeline است.
+      - name: آپلود portfolios_whole_time.csv به‌عنوان آرتیفکت (مستقل از race با checkout)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: portfolios_outputs/portfolios_whole_time.csv
+          if-no-files-found: warn
+          retention-days: 7
+
   portfolios-whole-time-merge-final:
     needs: [portfolios-whole-time-merge, portfolios-whole-time-merge-retry1, portfolios-whole-time-merge-retry2]
     runs-on: ubuntu-latest
@@ -1496,9 +1534,17 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ always() && needs.portfolios-batch.result != 'skipped' && needs.portfolios-generate-matrix.outputs.empty != 'true' && needs.portfolios-whole-time-merge-final.outputs.result == 'success' }}
     steps:
+      # [فیکس کد ۱] قبلاً بدون ref، چک‌اوت روی کامیتِ ثابتِ لحظه‌ی trigger
+      # شدنِ workflow انجام می‌شد، نه آخرین HEAD شاخه‌ی main. چون جاب‌های
+      # portfolios-whole-time-merge/retry1/retry2 بعد از اون لحظه یه کامیت
+      # جدید (شامل portfolios_outputs/portfolios_whole_time.csv) به main
+      # push می‌کنن، این جاب اون فایل رو تو checkout خودش نمی‌دید.
+      # ref: main رو صریح می‌کنیم تا آخرین HEAD گرفته بشه (دفاع دوم؛
+      # دفاع اصلی دانلود از آرتیفکت در ادامه‌ست).
       - uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
 
       - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
         uses: actions/setup-python@v5
@@ -1639,11 +1685,31 @@ jobs:
             echo "❌ هیچ فایل .jsonl استخراج نشد."; exit 1
           fi
 
+      # [فیکس ریشه‌ای کد ۱] دانلود مستقیم از آرتیفکتی که جاب merge/retry1/retry2
+      # (هرکدوم موفق شده) آپلود کرده. این راه به race بین commit/push و
+      # checkout وابسته نیست، چون از طریق GitHub Actions artifacts منتقل
+      # می‌شه، نه از طریق git history.
+      - name: "3.5. دانلود portfolios_whole_time.csv از آرتیفکت جاب merge (مطمئن، بدون race با checkout)"
+        id: download_whole_time
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: /tmp/portfolios_whole_time_csv
+        continue-on-error: true
+
       - name: 4. اجرای portfolios.py --timeline
         if: steps.queue_full.outputs.queue_empty != 'true'
         run: |
-          if [ ! -s portfolios_outputs/portfolios_whole_time.csv ]; then
-            echo "❌ portfolios_outputs/portfolios_whole_time.csv یافت نشد یا خالی است."
+          WHOLE_TIME_CSV=""
+          if [ -s /tmp/portfolios_whole_time_csv/portfolios_whole_time.csv ]; then
+            WHOLE_TIME_CSV="/tmp/portfolios_whole_time_csv/portfolios_whole_time.csv"
+            echo "ℹ️ portfolios_whole_time.csv از آرتیفکت جاب merge گرفته شد."
+          elif [ -s portfolios_outputs/portfolios_whole_time.csv ]; then
+            WHOLE_TIME_CSV="portfolios_outputs/portfolios_whole_time.csv"
+            echo "ℹ️ آرتیفکت پیدا نشد — به‌جاش از نسخه‌ی چک‌اوت‌شده از مخزن استفاده شد (فالبک)."
+          else
+            echo "❌ portfolios_whole_time.csv نه در آرتیفکت و نه در چک‌اوت مخزن یافت نشد یا خالی است."
             echo "   طبق طراحیِ جدید، timeline بدون آن هیچ سبدی نمی‌سازد."
             exit 1
           fi
@@ -1660,7 +1726,7 @@ jobs:
             --signatures-dir /tmp/archives_extracted_tl \
             $GOLDEN_ARG \
             --output-dir /tmp/portfolios_timeline_out \
-            --whole-time-csv portfolios_outputs/portfolios_whole_time.csv \
+            --whole-time-csv "$WHOLE_TIME_CSV" \
             --timeline
           echo "✅ portfolios.py --timeline اجرا شد."
 
