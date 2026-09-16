@@ -885,29 +885,39 @@ def _enumerate_clique_members(
 
 
 # -----------------------------------------------------------------------------
-# گام ۴: تعیین آستانه همبستگی (داده‌محور) و فیلتر جفت‌ها
+# گام ۴: تعیین آستانه همبستگی (مطلق و ثابت) و فیلتر جفت‌ها
 # -----------------------------------------------------------------------------
 
-def filter_pairs_by_correlation(corr_df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
-    """
-    ========== باگ ۷ رفع شد ==========
-    قبلاً این تابع جفت‌هایی با همبستگی بالاتر از صدک ۲۵ام *همان گروهی که
-    فراخوانی شده* را حذف می‌کرد. مشکل این بود که این آستانه مطلق نبود،
-    نسبت‌به‌اندازه‌/ترکیبِ گروه بود: همان جفتِ استراتژی، بسته به این‌که
-    evaluate_group با یک گروه کوچک (مثل run_timeline، یک کوین+امضا) صدا
-    زده شده یا با کل استخر (run_whole_time)، ممکن بود یک‌بار قبول و یک‌بار
-    رد شود — بدون هیچ ربطی به survival_rate/avg_return واقعی آن جفت. در
-    عمل یعنی سبدهایی با نرخ بقای بالاتر می‌توانستند پیش از رسیدن به مرحله‌ی
-    امتیازدهی، فقط به‌خاطر رتبه‌ی نسبیِ همبستگی‌شان در همان اجرا، کلاً حذف
-    شوند و هیچ‌وقت دیده نشوند.
+# [فیکس کارایی enumerate] وقتی این فیلتر کاملاً غیرفعال بود (باگ ۷ رفع‌شده
+# قبلی)، گراف مجاورت کاندیدها کاملاً متصل (complete graph) می‌شد. روی
+# MAX_GLOBAL_CANDIDATES=200 کاندید، این یعنی _enumerate_clique_members باید
+# عملاً تمام C(200,4)~65 میلیون چهارتایی را تولید کند — که در پایتون خالص
+# می‌تواند ساعت‌ها طول بکشد یا عملاً هیچ‌وقت تمام نشود (دقیقاً چیزی که در
+# چانک‌های portfolios-batch دیده شد: ۵ ساعت و ۳۸ دقیقه سکوت کامل در لاگ،
+# چون حتی فاز enumerate هم تمام نشده بود، چه برسد به امتیازدهی).
+#
+# این آستانه با آستانه‌ی حذف‌شده‌ی قبلی («باگ ۷») فرق بنیادی دارد: آن یکی
+# صدکی و *نسبت‌به‌همین‌اجرا* بود (همان جفت، بسته به اینکه چه گروه دیگری در
+# استخر بود، گاهی قبول گاهی رد می‌شد). این‌جا یک عدد مطلق و ثابت است —
+# صرف‌نظر از اینکه چند کاندید دیگر در استخر باشند، دقیقاً همین آستانه اعمال
+# می‌شود؛ پس آن سوگیریِ «حذف بر اساس رتبه‌ی نسبی» دیگر رخ نمی‌دهد. توجیه
+# دامنه‌ای: دو استراتژی با همبستگی بازدهی بالا (>0.5) عملاً تنوعِ چندانی به
+# سبد اضافه نمی‌کنند، پس حذف این جفت‌ها از نظر کیفیت سبد هم توجیه دارد، نه
+# فقط کارایی.
+MAX_PAIR_CORRELATION_ABS = 0.5
 
-    حالا این فیلتر دیگر چیزی را حذف نمی‌کند — همه‌ی جفت‌های معتبر (با هر
-    همبستگی) وارد مرحله‌ی ساخت سبد می‌شوند و انتخاب نهایی صرفاً بر اساس
-    survival_rate/avg_return واقعی هر سبد انجام می‌شود (دقیقاً معیارهایی که
-    هدف واقعی است)؛ همبستگی هم‌چنان محاسبه و در ستون avg_correlation خروجی
-    گزارش می‌شود، فقط دیگر پیش از دیده‌شدن هیچ سبدی را رد نمی‌کند.
+
+def filter_pairs_by_correlation(corr_df: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    """جفت‌هایی با |correlation| > MAX_PAIR_CORRELATION_ABS را حذف می‌کند —
+    یک آستانه‌ی مطلق و ثابت (نه صدکی/نسبت‌به‌اجرا مثل نسخه‌ی قبلیِ حذف‌شده‌ی
+    «باگ ۷»). هدف اصلی، جلوگیری از انفجار ترکیبی در
+    _enumerate_clique_members است: بدون این فیلتر، گراف مجاورت کاملاً متصل
+    می‌شود و enumerate عملاً معادل شمارش خامِ C(n,4) می‌شود.
     """
-    return corr_df.copy(), float("nan")
+    if corr_df.empty or "correlation" not in corr_df.columns:
+        return corr_df.copy(), MAX_PAIR_CORRELATION_ABS
+    kept = corr_df[corr_df["correlation"].abs() <= MAX_PAIR_CORRELATION_ABS].copy()
+    return kept, MAX_PAIR_CORRELATION_ABS
 
 
 # -----------------------------------------------------------------------------
@@ -1185,10 +1195,25 @@ EXT_STATS_16_COLUMNS = [
 
 
 def percentile_rank(series: pd.Series) -> pd.Series:
-    """رتبه‌بندی صدکی بین ۰ تا ۱۰۰ (مقدار بزرگ‌تر => رتبه بالاتر)."""
+    """رتبه‌بندی صدکی بین ۰ تا ۱۰۰ (مقدار بزرگ‌تر => رتبه بالاتر).
+
+    [فیکس نرمال‌سازی مطلق] دیگر در evaluate_group_finalize استفاده نمی‌شود
+    (چون رتبه‌بندی نسبی باعث می‌شد امتیاز هر سبد به این بستگی داشته باشد که
+    چه سبدهای دیگری همان لحظه در استخر حضور دارند — همان مشکلی که در
+    golden.py هم بود). فقط برای سازگاری با کد/فراخوانی‌های قدیمی‌تر نگه
+    داشته شده است.
+    """
     if len(series) <= 1:
         return pd.Series(100.0, index=series.index)
     return series.rank(pct=True) * 100.0
+
+
+# [فیکس نرمال‌سازی مطلق] ثابت کالیبراسیونِ سیگموید avg_return — واحدش
+# «درصد» است (avg_return=0.5 یعنی ۰.۵٪، همان مقیاسی که ABS_MIN_AVG_RETURN
+# بالا هم با آن مقایسه می‌شود)، نه کسر اعشاری مثل avg_daily_return در
+# golden.py — پس نباید با DAILY_RETURN_K آن‌جا اشتباه گرفته شود. با
+# RETURN_SIGMOID_K=1.0: avg_return=0 -> 50 (خنثی)، 0.5 -> ~62، 2 -> ~88.
+RETURN_SIGMOID_K = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -1493,24 +1518,56 @@ def evaluate_group_finalize(
     raw_candidate_count: int,
     top_n: Optional[int],
     abs_filters: bool = True,
+    min_score: Optional[float] = None,
 ) -> tuple[list[dict], int]:
-    """بخش سراسریِ دیگرِ evaluate_group: نرمال‌سازی percentile_rank و انتخاب
-    نهایی. ذاتاً سراسری است چون percentile_rank هر سبد را نسبت به کل
-    مجموعه‌ی سبدهای یافت‌شده رتبه‌بندی می‌کند — پس فقط باید یک‌بار، روی کل
-    `portfolios` (که می‌تواند حاصل ادغام چند matrix job باشد)، صدا زده
-    شود؛ هرگز روی زیرمجموعه‌ای از آن (وگرنه رتبه‌بندی نسبی غلط می‌شود)."""
+    """بخش سراسریِ دیگرِ evaluate_group: نرمال‌سازی مطلق (نه percentile_rank)
+    و انتخاب نهایی. علی‌رغم اینکه دیگر رتبه‌بندی نسبی نیست، همچنان باید فقط
+    یک‌بار روی کل `portfolios` (که می‌تواند حاصل ادغام چند matrix job باشد)
+    صدا زده شود، نه روی زیرمجموعه‌ای از آن — چون top_n/MIN_QUALIFIED_ROWS/
+    min_score باید روی کل جمعیتِ نهاییِ کاندیدها اعمال شوند، نه جداگانه
+    روی هر بخش (وگرنه انتخاب نهایی جزئی/ناقص می‌شود).
+
+    min_score: [فیکس محدودیت top_n سخت‌گیرانه] اگر داده شود، cutoff فقط
+    یک کف تعداد است، نه سقف: هر سبدی که score‌اش >= min_score باشد نگه
+    داشته می‌شود، حتی اگر رتبه‌اش از top_n پایین‌تر باشد یعنی
+    n_keep = max(top_n, تعداد سبدهای با score>=min_score). بدون این، وقتی
+    یک چرخه خیلی کاندید خوب دارد (مثلاً ۵۰ تا با score نزدیک به هم)، فقط
+    top_n تای اول‌شان نجات پیدا می‌کنند و بقیه با اینکه واقعاً خوب بودند
+    قبل از این‌که فرصت مقایسه با چرخه‌های دیگر را پیدا کنند دور ریخته می‌شوند.
+
+    چون score حالا مطلق است (نه رتبه‌ی نسبی)، min_score یک استاندارد
+    ثابت است — دقیقاً مثل min_score در golden.py — و معنایش بین اجراها/
+    چرخه‌های مختلف عوض نمی‌شود.
+    """
     if not portfolios:
         return [], raw_candidate_count
 
     pf_df = pd.DataFrame(portfolios)
 
     # گام ۹: نرمال‌سازی و امتیازدهی
-    # ========== باگ ۴ رفع شد: survival_rate نیز با percentile_rank نرمال شود تا
-    # هم‌مقیاس با سه مؤلفه‌ی دیگر باشد و وزن‌دهی واقعی با SCORE_WEIGHTS مطابقت داشته باشد ==========
-    pf_df["survival_norm"] = percentile_rank(pf_df["survival_rate"])
-    pf_df["comp_norm"] = percentile_rank(pf_df["compensation_ratio"])
-    pf_df["return_norm"] = percentile_rank(pf_df["avg_return"])
-    pf_df["corr_norm"] = percentile_rank(-pf_df["avg_correlation"])  # کمتر=بهتر
+    # [فیکس نرمال‌سازی مطلق] هر ۴ معیار حالا با یک فرمول مطلق و ثابت (نه
+    # رتبه‌بندی نسبت به بقیه‌ی سبدهای همین اجرا) به بازه‌ی ۰-۱۰۰ می‌روند —
+    # یعنی امتیاز هر سبد فقط تابع مقادیر خودش است، نه اینکه چه سبدهای دیگری
+    # همان لحظه در استخر حضور دارند (دقیقاً همان فیکسی که روی golden.py
+    # انجام شد). ۵۰ برای هر ۴ معیار یعنی «سربه‌سر/خنثی»:
+    #   - survival_rate: از قبل ۰-۱۰۰٪ است، مستقیم استفاده می‌شود
+    #     (۵۰٪ یعنی نیمی از دوره‌ها مثبت — دقیقاً حد خنثی).
+    #   - compensation_ratio: نسبت سود‌جبران‌کننده/زیان، ۰ تا ∞ — با منحنی
+    #     اشباع (cr=1 یعنی جبران کامل = ۵۰، cr->∞ -> ۱۰۰).
+    #   - avg_correlation: از قبل ۱- تا ۱ است؛ هرچه منفی‌تر (تنوع بیشتر)
+    #     بهتر — مستقیم و خطی معکوس می‌شود (۱-=۱۰۰، ۰=۵۰، ۱=۰).
+    #   - avg_return: درصد بازده، می‌تواند منفی باشد — با سیگموید حول صفر.
+    pf_df["survival_norm"] = pf_df["survival_rate"].clip(0, 100)
+
+    comp = pf_df["compensation_ratio"].fillna(0)
+    pf_df["comp_norm"] = 100 * comp / (comp + 1)
+
+    corr = pf_df["avg_correlation"].clip(-1, 1)
+    pf_df["corr_norm"] = ((1 - corr) / 2 * 100).fillna(50.0)
+
+    pf_df["return_norm"] = 100 / (
+        1 + np.exp(-RETURN_SIGMOID_K * pf_df["avg_return"].fillna(0))
+    )
 
     pf_df["score"] = (
         SCORE_WEIGHTS["survival"] * pf_df["survival_norm"]
@@ -1518,6 +1575,17 @@ def evaluate_group_finalize(
         + SCORE_WEIGHTS["correlation"] * pf_df["corr_norm"]
         + SCORE_WEIGHTS["return"] * pf_df["return_norm"]
     )
+
+
+    def _apply_cutoff(df: pd.DataFrame) -> pd.DataFrame:
+        """df باید از قبل نزولی بر اساس score مرتب شده باشد."""
+        if top_n is None or top_n <= 0:
+            return df
+        n_keep = top_n
+        if min_score is not None:
+            n_by_score = int((df["score"] >= min_score).sum())
+            n_keep = max(n_keep, n_by_score)
+        return df.head(n_keep)
 
     # ========== باگ ۱ رفع شد + فیکس درخواستی کاربر: به‌جای رد کردن سخت‌گیرانه،
     # این‌جا تصمیم می‌گیریم. اگر تعداد کاندیدهای واجدشرایط (survival_rate/
@@ -1530,8 +1598,7 @@ def evaluate_group_finalize(
         qualified_df = pf_df[pf_df["_passes_abs"]]
         if len(qualified_df) >= MIN_QUALIFIED_ROWS:
             pf_df = qualified_df.sort_values("score", ascending=False)
-            if top_n is not None and top_n > 0:
-                pf_df = pf_df.head(top_n)
+            pf_df = _apply_cutoff(pf_df)
         else:
             log.warning(
                 "فقط %d سبد آستانه‌های survival_rate>=%.1f/avg_return>=%.2f را رعایت کردند "
@@ -1544,8 +1611,7 @@ def evaluate_group_finalize(
         pf_df = pf_df.drop(columns=["_passes_abs"])
     else:
         pf_df = pf_df.sort_values("score", ascending=False)
-        if top_n is not None and top_n > 0:
-            pf_df = pf_df.head(top_n)
+        pf_df = _apply_cutoff(pf_df)
     pf_df = pf_df.drop(columns=["survival_norm", "comp_norm", "corr_norm", "return_norm"])
 
     return pf_df.to_dict("records"), raw_candidate_count
@@ -2389,12 +2455,21 @@ def run_whole_time_build(
     version_schema_path: Optional[Path],
     output_dir: Path,
     signatures_filter: Optional[Path] = None,
+    dump_queue_metadata: bool = False,
 ) -> Path:
     """فاز ۱ از ۳: تنها فازی که به دانلود/بارگذاری کامل تمام آرشیوها نیاز
     دارد (چون تعیین کاندیدهای نهایی و اعتبارِ هر جفت (MIN_PAIR_OVERLAP) فقط
     با دیدن همزمان همه‌ی داده ممکن است). خروجی این فاز: صف کامل ترکیبات
     (combos.json) + جدول‌های سبکِ لازم برای امتیازدهی مستقل هر ترکیب در فاز
-    ۲ (بدون نیاز به دانلود مجدد هیچ آرشیوی)."""
+    ۲ (بدون نیاز به دانلود مجدد هیچ آرشیوی).
+
+    dump_queue_metadata: [فیکس معماری regular/whole-time مشترک] وقتی
+    True باشد، دو فایل اضافه هم می‌نویسد — all_sig_keys.json (تمام
+    (coin_composition, signature) دیده‌شده) و group_queue_keys.json
+    (نگاشت هرکدام به queue_key هایش) — دقیقاً همان دو ساختاری که قبلاً
+    فقط داخل run() برای مرحله‌ی cleanup صف (all_combinations_portfolios.json)
+    ساخته می‌شدند. چون این فاز build جایگزین همان بخش از run() می‌شود، باید
+    این متادیتا را هم اینجا تولید کند تا cleanup همچنان کار کند."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def _write_empty() -> Path:
@@ -2404,6 +2479,34 @@ def run_whole_time_build(
 
     signatures = load_signatures(signatures_dir, signatures_filter)
     load_version_schema(version_schema_path)
+
+    if dump_queue_metadata:
+        all_sig_keys = (
+            signatures
+            .groupby(["coin_composition", "signature"])
+            .size()
+            .reset_index()[["coin_composition", "signature"]]
+            .apply(list, axis=1)
+            .tolist()
+        )
+        (output_dir / "all_sig_keys.json").write_text(
+            json.dumps(all_sig_keys, ensure_ascii=False), encoding="utf-8"
+        )
+        group_queue_keys = (
+            signatures
+            .groupby(["coin_composition", "signature"])["queue_key"]
+            .apply(lambda s: sorted(set(s.dropna().astype(str))))
+            .to_dict()
+        )
+        gqk_out = {f"{k[0]}\u241f{k[1]}": v for k, v in group_queue_keys.items()}
+        (output_dir / "group_queue_keys.json").write_text(
+            json.dumps(gqk_out, ensure_ascii=False), encoding="utf-8"
+        )
+        log.info(
+            "[متادیتای صف] %d گروه (coin_composition, signature) در "
+            "all_sig_keys.json/group_queue_keys.json نوشته شد.",
+            len(all_sig_keys),
+        )
 
     if golden_scores_path is not None:
         golden = load_golden_scores(golden_scores_path)
@@ -2644,13 +2747,14 @@ def _wt_merge_check_parts(parts_dir: Path) -> list[Path]:
 
 def _wt_merge_finalize_and_save(
     all_portfolios: list[dict], total_raw: int, output_dir: Path, n_parts: int,
+    output_basename: str = "portfolios_whole_time",
 ) -> Path:
     if not all_portfolios:
         out_df = pd.DataFrame(columns=_WT_MERGE_OUTPUT_COLUMNS)
     else:
         out_df = pd.DataFrame(all_portfolios)
         out_df = out_df[[c for c in _WT_MERGE_OUTPUT_COLUMNS if c in out_df.columns]]
-    output_path = Path(output_dir) / "portfolios_whole_time"
+    output_path = Path(output_dir) / output_basename
     final_path = _save_dataframe(out_df, output_path)
     _log_mem("بعد از ذخیره‌سازی خروجی نهایی")
     log.info(
@@ -2660,7 +2764,10 @@ def _wt_merge_finalize_and_save(
     return final_path
 
 
-def _merge_strategy_full(part_files: list[Path], output_dir: Path, top_n: Optional[int]) -> Path:
+def _merge_strategy_full(
+    part_files: list[Path], output_dir: Path, top_n: Optional[int],
+    min_score: Optional[float] = None, output_basename: str = "portfolios_whole_time",
+) -> Path:
     """راهبرد ۱ (پیش‌فرض، پایه): دقیقاً همان منطق قبلی — همه‌ی ستون‌ها
     (شامل members و بقیه‌ی ستون‌های تودرتو) برای *همه‌ی* ردیف‌ها بلافاصله
     با json.loads باز می‌شوند، concat می‌شوند، و یک‌جا به evaluate_group_finalize
@@ -2692,15 +2799,18 @@ def _merge_strategy_full(part_files: list[Path], output_dir: Path, top_n: Option
         _log_mem(f"[full] بعد از to_dict('records') -> {len(records)} رکورد")
         merged = None
         all_portfolios, total_raw = evaluate_group_finalize(
-            records, total_rows, top_n, abs_filters=True,
+            records, total_rows, top_n, abs_filters=True, min_score=min_score,
         )
         _log_mem("[full] بعد از evaluate_group_finalize")
 
-    return _wt_merge_finalize_and_save(all_portfolios, total_raw, output_dir, len(part_files))
+    return _wt_merge_finalize_and_save(
+        all_portfolios, total_raw, output_dir, len(part_files), output_basename=output_basename,
+    )
 
 
 def _merge_strategy_lazy_json(
     part_files: list[Path], output_dir: Path, top_n: Optional[int],
+    min_score: Optional[float] = None, output_basename: str = "portfolios_whole_time",
 ) -> Path:
     """راهبرد ۲ (فالبک اول): همان مسیر قبلی، با یک تفاوت: رشته‌های JSON سه
     ستون تودرتو (members/member_coin_compositions/member_signatures) تا
@@ -2731,7 +2841,7 @@ def _merge_strategy_lazy_json(
         _log_mem(f"[lazy-json] بعد از to_dict('records') -> {len(records)} رکورد")
         merged = None
         all_portfolios, total_raw = evaluate_group_finalize(
-            records, total_rows, top_n, abs_filters=True,
+            records, total_rows, top_n, abs_filters=True, min_score=min_score,
         )
         _log_mem(f"[lazy-json] بعد از evaluate_group_finalize -> {len(all_portfolios)} برنده")
         # فقط همین چند ردیف برنده را decode می‌کنیم
@@ -2741,7 +2851,9 @@ def _merge_strategy_lazy_json(
                     rec[col] = json.loads(rec[col])
         _log_mem("[lazy-json] بعد از decode برندگان")
 
-    return _wt_merge_finalize_and_save(all_portfolios, total_raw, output_dir, len(part_files))
+    return _wt_merge_finalize_and_save(
+        all_portfolios, total_raw, output_dir, len(part_files), output_basename=output_basename,
+    )
 
 
 def _read_heavy_rows_streaming(
@@ -2776,6 +2888,7 @@ def _read_heavy_rows_streaming(
 
 def _merge_strategy_columnar(
     part_files: list[Path], output_dir: Path, top_n: Optional[int],
+    min_score: Optional[float] = None, output_basename: str = "portfolios_whole_time",
 ) -> Path:
     """راهبرد ۳ (فالبک دوم، سنگین‌ترین سناریو): سه ستون تودرتو اصلاً در
     مرحله‌ی امتیازدهی/انتخاب خوانده نمی‌شوند — با column-projection پارکت
@@ -2811,7 +2924,9 @@ def _merge_strategy_columnar(
     log.info("[CHECK] مجموع ردیف‌های همه‌ی %d part پیش از concat (سبک): %d", len(light_dfs), total_rows)
 
     if not light_dfs:
-        return _wt_merge_finalize_and_save([], 0, output_dir, len(part_files))
+        return _wt_merge_finalize_and_save(
+            [], 0, output_dir, len(part_files), output_basename=output_basename,
+        )
 
     merged_light = pd.concat(light_dfs, ignore_index=True)
     light_dfs = None
@@ -2820,7 +2935,9 @@ def _merge_strategy_columnar(
     merged_light = None
     _log_mem(f"[columnar] بعد از to_dict سبک -> {len(light_records)} رکورد")
 
-    winners, total_raw = evaluate_group_finalize(light_records, total_rows, top_n, abs_filters=True)
+    winners, total_raw = evaluate_group_finalize(
+        light_records, total_rows, top_n, abs_filters=True, min_score=min_score,
+    )
     _log_mem(f"[columnar] بعد از evaluate_group_finalize -> {len(winners)} برنده")
 
     # پاس دوم: فقط برای برندگان، ستون‌های سنگین را از part اصلی‌شان می‌خوانیم
@@ -2853,12 +2970,15 @@ def _merge_strategy_columnar(
         w.pop("__part_idx", None)
         w.pop("__row_idx", None)
 
-    return _wt_merge_finalize_and_save(winners, total_raw, output_dir, len(part_files))
+    return _wt_merge_finalize_and_save(
+        winners, total_raw, output_dir, len(part_files), output_basename=output_basename,
+    )
 
 
 def run_whole_time_merge(
     parts_dir: Path, output_dir: Path, top_n: Optional[int], strategy: str = "full",
-    previous_csv: Optional[Path] = None,
+    previous_csv: Optional[Path] = None, min_score: Optional[float] = None,
+    output_basename: str = "portfolios_whole_time",
 ) -> Path:
     """فاز ۳ از ۳ (یک‌بار): همه‌ی part_*.parquet فاز ۲ را ادغام می‌کند و
     دقیقاً همان evaluate_group_finalize (که evaluate_group یک‌شکلِ خودش هم
@@ -2902,7 +3022,9 @@ def run_whole_time_merge(
         raise ValueError(
             f"strategy نامعتبر: {strategy!r} — باید یکی از {sorted(strategies)} باشد."
         )
-    return strategies[strategy](part_files, output_dir, top_n)
+    return strategies[strategy](
+        part_files, output_dir, top_n, min_score=min_score, output_basename=output_basename,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -2991,6 +3113,13 @@ def parse_args(argv=None) -> argparse.Namespace:
              "می‌سازد.",
     )
     parser.add_argument(
+        "--dump-queue-metadata", action="store_true", default=False,
+        help="[فیکس معماری regular/whole-time مشترک] فقط با --whole-time-build: "
+             "علاوه بر combos.json، all_sig_keys.json و group_queue_keys.json "
+             "را هم می‌نویسد — برای جایگزینی cleanup صف all_combinations_"
+             "portfolios.json که قبلاً فقط داخل run() ساخته می‌شد.",
+    )
+    parser.add_argument(
         "--whole-time-score", action="store_true", default=False,
         help="فاز ۲ از ۳ (matrix): فقط یک برش از combos.json را امتیازدهی "
              "می‌کند. نیازمند --shared-dir (خروجی فاز ۱)، --combos-file "
@@ -3029,6 +3158,24 @@ def parse_args(argv=None) -> argparse.Namespace:
              "برای --whole-time-merge کاربرد دارد.",
     )
     parser.add_argument(
+        "--min-score", required=False, type=float, default=None,
+        help="[فیکس top_n سخت‌گیرانه] کف امتیاز (0-100) برای انتخاب نهایی در "
+             "--whole-time-merge: هر سبدی با score>=این عدد نگه داشته می‌شود، "
+             "حتی اگر رتبه‌اش از --top-n پایین‌تر باشد "
+             "(n_keep = max(top_n, تعداد سبدهای واجد این آستانه)). "
+             "score یک نرمال‌سازی مطلق است (نه رتبه‌ی نسبی)، پس این آستانه "
+             "بین اجراها/چرخه‌های مختلف معنای ثابتی دارد.",
+    )
+    parser.add_argument(
+        "--output-basename", required=False, type=str, default="portfolios_whole_time",
+        help="[فیکس معماری regular/whole-time مشترک] نام پایه‌ی فایل خروجی "
+             "--whole-time-merge (بدون پسوند). pipeline معمولیِ portfolios "
+             "(غیر-whole-time) از همین --whole-time-build/--whole-time-score/"
+             "--whole-time-merge استفاده می‌کند چون evaluate_group_build عیناً "
+             "همان است — فقط با --output-basename portfolios به‌جای "
+             "portfolios_whole_time، تا دو خروجی با هم قاطی نشوند.",
+    )
+    parser.add_argument(
         "--whole-time-merge-strategy", required=False, type=str, default="full",
         choices=["full", "lazy-json", "columnar"],
         help="[دیباگ کد ۱۴۳ / فالبک] راهبرد ادغام فاز ۳: full (پیش‌فرض قبلی)، "
@@ -3061,6 +3208,7 @@ def main(argv=None) -> int:
                 version_schema_path=args.version_schema,
                 output_dir=output_dir,
                 signatures_filter=args.signatures_filter,
+                dump_queue_metadata=args.dump_queue_metadata,
             )
         elif args.whole_time_score:
             if args.shared_dir is None or args.combos_file is None or args.output_file is None:
@@ -3084,6 +3232,8 @@ def main(argv=None) -> int:
                 top_n=args.top_n,
                 strategy=args.whole_time_merge_strategy,
                 previous_csv=args.previous_whole_time_csv,
+                min_score=args.min_score,
+                output_basename=args.output_basename,
             )
         elif args.timeline:
             if args.whole_time_csv is None:
