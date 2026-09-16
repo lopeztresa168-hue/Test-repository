@@ -113,7 +113,7 @@ GOLDEN_SCORE_THRESHOLD = 45.0
 MIN_PAIR_OVERLAP = 10
 MIN_PORTFOLIO_SAMPLES = 10
 CORR_PERCENTILE_THRESHOLD = 25
-PORTFOLIO_SIZES = (2, 3, 4)
+PORTFOLIO_SIZES = (2, 3)
 ABS_MIN_SURVIVAL_RATE = 70.0
 ABS_MIN_AVG_RETURN = 0.5
 # [فیکس درخواستی کاربر] فیلترهای بالا دیگر هیچ سبدی را رد نمی‌کنند؛ فقط برای
@@ -1300,38 +1300,31 @@ def evaluate_group_build(group: pd.DataFrame, attach_periods: bool = False):
     group = build_release_dates(group)
     period_bounds = _period_bounds_by_date(group) if attach_periods else {}
 
-    corr_df, monthly, exact_valid_periods = compute_monthly_correlation_matrix(group)
-    if corr_df.empty:
+    # ========== فیکس کارایی (بند ۲ کاربر): همبستگی سراسری قبل از محدودسازی
+    # به سقف کاندید محاسبه نشود ==========
+    # قبلاً compute_monthly_correlation_matrix (شامل ماتریس corr + حلقه‌ی
+    # itertools.combinations برای شمارشِ هم‌پوشانیِ هر جفت) روی *کل* استخر
+    # کاندیدهای واجد شرایط Golden اجرا می‌شد — که می‌توانست ده‌ها هزار
+    # member_id باشد (نه فقط ۲۰۰ تای نهایی). یعنی برای هر سبدِ بالقوه
+    # {c, j}، همبستگی‌اش عملاً وسط محاسبه‌ی هم‌زمانِ C(k,2) جفتِ کاملاً
+    # نامرتبط (از جمله جفت‌هایی مثل سبد دیگر {o, t}) گم می‌شد — دقیقاً همان
+    # گلوگاهی که باعث ۱ ساعت و ۵۰ دقیقه سکوت در لاگ و کنسل‌شدن اجرا شد.
+    # حالا معیارهای فردی (بازده/بقا) — که به هیچ همبستگی‌ای نیاز ندارند —
+    # همین‌جا و زودتر محاسبه می‌شوند تا استخر به سقف MAX_GLOBAL_CANDIDATES
+    # محدود شود، و فقط *بعد از آن* همبستگی محاسبه می‌شود؛ یعنی برای هر جفت
+    # نهایی، محاسبه‌ی هم‌بستگی واقعاً فقط بین همان دو عضو انجام می‌شود، نه
+    # به بهانه‌ی یک ماتریس سراسریِ چند-ده-هزار-ستونی. منطقِ انتخاب (۱۰ تای
+    # برتر بر اساس بقا + ۱۰ تای برتر بر اساس بازده + پرکردن باقی ظرفیت با
+    # بازده) دقیقاً همان منطق قبلی «باگ ۸» است، فقط زودتر اجرا می‌شود.
+    monthly_all = build_monthly_returns(group)
+    strategies_all = list(monthly_all.columns)
+    if len(strategies_all) < 2:
         return None
 
-    kept_pairs, _threshold = filter_pairs_by_correlation(corr_df)
-    if kept_pairs.empty:
-        return None
-
-    corr_lookup = {(r.a, r.b): r.correlation for r in kept_pairs.itertuples()}
-    candidate_strategies = sorted(set(kept_pairs["a"]) | set(kept_pairs["b"]))
-    if len(candidate_strategies) < 2:
-        return None
-
-    # ========== محافظ کارایی برای رفع باگ ۱ (حذف قید هم‌گروهی) ==========
-    #
-    # ========== باگ ۸ رفع شد ==========
-    # قبلاً این محدودسازی فقط بر پایه‌ی یک معیار بود: میانگین بازده ماهانه‌ی
-    # هر strategy_id به‌تنهایی. یعنی استراتژی‌هایی با نرخ بقای فردی بسیار
-    # بالا ولی بازده متوسط، همیشه اولین قربانی‌های این cutoff بودند — حتی
-    # اگر هدف اصلی (طبق درخواست کاربر) پیدا کردن بالاترین survival_rate هم
-    # باشد. حالا این cutoff دو دسته را همیشه تضمین‌شده نگه می‌دارد: ۱۰ تای
-    # برتر بر اساس نرخ بقای فردی + ۱۰ تای برتر بر اساس بازده فردی؛ باقی
-    # ظرفیت (تا سقف MAX_GLOBAL_CANDIDATES) طبق روال قبلی با بازده پر می‌شود.
-    # توجه: این هنوز تضمین نمی‌کند بهترین *ترکیب* (سبد) لزوماً از استراتژی‌های
-    # با معیار فردیِ بالا ساخته می‌شود — دو عضو با معیار فردیِ متوسط اما
-    # هم‌بستگیِ خیلی پایین می‌توانند سبدی برتر از هرکدام به‌تنهایی بسازند؛
-    # این محدودیت ذاتیِ هر پیش‌فیلترِ مبتنی‌بر-معیارِ-فردی است، نه چیزی که
-    # صرفاً با افزودن یک معیار دوم کامل رفع شود.
     TOP_GUARANTEED_PER_METRIC = 10
-    if MAX_GLOBAL_CANDIDATES and len(candidate_strategies) > MAX_GLOBAL_CANDIDATES:
-        indiv_return = monthly[candidate_strategies].mean(skipna=True)
-        indiv_survival = (monthly[candidate_strategies] > 0).mean(skipna=True) * 100.0
+    if MAX_GLOBAL_CANDIDATES and len(strategies_all) > MAX_GLOBAL_CANDIDATES:
+        indiv_return = monthly_all.mean(skipna=True)
+        indiv_survival = (monthly_all > 0).mean(skipna=True) * 100.0
 
         top_survival = set(
             indiv_survival.sort_values(ascending=False).head(TOP_GUARANTEED_PER_METRIC).index
@@ -1345,12 +1338,23 @@ def evaluate_group_build(group: pd.DataFrame, attach_periods: bool = False):
         fill_pool = indiv_return.drop(index=guaranteed, errors="ignore")
         fill = set(fill_pool.sort_values(ascending=False).head(remaining_slots).index)
 
-        candidate_strategies = sorted(guaranteed | fill)
-        cs_set = set(candidate_strategies)
-        kept_pairs = kept_pairs[kept_pairs["a"].isin(cs_set) & kept_pairs["b"].isin(cs_set)]
-        corr_lookup = {(r.a, r.b): r.correlation for r in kept_pairs.itertuples()}
-        if len(candidate_strategies) < 2 or kept_pairs.empty:
+        candidate_pool = guaranteed | fill
+        if len(candidate_pool) < 2:
             return None
+        group = group[group["member_id"].isin(candidate_pool)]
+
+    corr_df, monthly, exact_valid_periods = compute_monthly_correlation_matrix(group)
+    if corr_df.empty:
+        return None
+
+    kept_pairs, _threshold = filter_pairs_by_correlation(corr_df)
+    if kept_pairs.empty:
+        return None
+
+    corr_lookup = {(r.a, r.b): r.correlation for r in kept_pairs.itertuples()}
+    candidate_strategies = sorted(set(kept_pairs["a"]) | set(kept_pairs["b"]))
+    if len(candidate_strategies) < 2:
+        return None
 
     adj = _build_adjacency(candidate_strategies, kept_pairs)
     clique_members = _enumerate_clique_members(candidate_strategies, adj, PORTFOLIO_SIZES)
