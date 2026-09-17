@@ -243,23 +243,62 @@ def main():
 
     results = []
     for coin, (dates_list, close_arr, high_arr, low_arr) in sorted(coin_index.items()):
-        if not dates_list:
+        n = len(dates_list)
+        if n < 200:
+            # کمتر از ۲۰۰ روز → هیچ روزی قابل‌محاسبه نیست (MA200 ندارد)
             continue
-        # رژیم "الان" یعنی رژیم محاسبه‌شده با استفاده از تمام داده‌ی موجود
-        # تا آخرین روز — دقیقاً همان چیزی که compute_market_regime برای
-        # start_date = (آخرین‌روز + ۱روز) برمی‌گرداند (چون فرمول عمداً
-        # قیمت *قبل* از start_date را می‌بیند، نه خودِ آن روز را).
-        last_date = dates_list[-1]
-        as_of_start = last_date + timedelta(days=1)
-        regime, diag = compute_market_regime(coin_index, coin, as_of_start)
-        row = {"coin": coin, "regime": regime}
-        row.update(diag)
-        results.append(row)
-        print(f"   → {coin}: {regime} ({diag.get('as_of_date', '-')})")
+
+        coin_days = 0
+        # برای هر روزی که حداقل ۲۰۰ روز قبل از آن (شامل خودش) داده وجود دارد،
+        # دقیقاً همان فرمول compute_market_regime را با idx متناظر همان روز
+        # اجرا می‌کنیم (idx چنان انتخاب می‌شود که close_arr[idx-1] == قیمت
+        # همان روز باشد — بدون آینده‌نگری، چون MA/ATR فقط از idx-200..idx-1
+        # و idx-50..idx-1 و idx-14..idx-1 ساخته می‌شوند).
+        for idx in range(200, n + 1):
+            close_200 = close_arr[idx - 200:idx]
+            close_50 = close_arr[idx - 50:idx]
+            high_14 = high_arr[idx - 14:idx]
+            low_14 = low_arr[idx - 14:idx]
+
+            ma50 = np.nanmean(close_50)
+            ma200 = np.nanmean(close_200)
+            atr = np.nanmean(high_14 - low_14)
+            price = close_arr[idx - 1]
+            as_of_date = dates_list[idx - 1]
+
+            diag = {
+                "as_of_date": as_of_date.strftime("%Y-%m-%d"),
+                "close": float(price) if price is not None and not pd.isna(price) else None,
+                "ma50": float(ma50) if not pd.isna(ma50) else None,
+                "ma200": float(ma200) if not pd.isna(ma200) else None,
+                "atr14": float(atr) if not pd.isna(atr) else None,
+            }
+
+            if price is None or pd.isna(price) or price == 0 or pd.isna(ma50) or pd.isna(ma200) or pd.isna(atr):
+                regime = "unknown"
+            elif (atr / price) > 0.02:
+                regime = "volatile"
+            elif ma50 > ma200:
+                regime = "trending_up"
+            elif ma50 < ma200:
+                regime = "trending_down"
+            elif abs(ma50 - ma200) / price < 0.05:
+                regime = "ranging"
+            else:
+                regime = "unknown"
+
+            row = {"coin": coin, "regime": regime}
+            row.update(diag)
+            results.append(row)
+            coin_days += 1
+
+        print(f"   → {coin}: {coin_days} روز محاسبه شد "
+              f"(از {dates_list[199].strftime('%Y-%m-%d')} تا {dates_list[-1].strftime('%Y-%m-%d')})")
 
     output = {
         "generated_at_utc": datetime.utcnow().isoformat() + "Z",
-        "coin_count": len(results),
+        "coin_count": len(coin_index),
+        "record_count": len(results),
         "regimes": results,
     }
 
@@ -267,7 +306,7 @@ def main():
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ رژیم {len(results)} کوین در {args.output} ذخیره شد.")
+    print(f"✅ رژیم {len(results)} رکورد روزانه برای {len(coin_index)} کوین در {args.output} ذخیره شد.")
 
 
 if __name__ == "__main__":
