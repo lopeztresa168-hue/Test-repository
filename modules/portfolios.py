@@ -2663,7 +2663,15 @@ def _load_previous_winners_as_part(previous_csv: Optional[Path], parts_dir: Path
         log.info("[ادغام تاریخچه] فایل %s یافت نشد — این اولین چرخه است.", previous_csv)
         return None
 
-    df = pd.read_csv(previous_csv)
+    # [فیکس ارور ادغام] فایل رمزگشایی‌شده از مخزن سوم گاهی واقعاً gzip است
+    # (امضای بایت 0x1f 0x8b) ولی با پسوند .csv نوشته می‌شود، پس تشخیص
+    # pandas بر پایه‌ی پسوند (compression="infer") آن را gzip نمی‌بیند و
+    # با UnicodeDecodeError کرش می‌کند. اینجا خودِ بایت‌های اول فایل را
+    # می‌خوانیم تا مستقل از پسوند، هر دو حالت (gzip یا CSV خام) کار کند.
+    with open(previous_csv, "rb") as fh:
+        magic = fh.read(2)
+    compression = "gzip" if magic == b"\x1f\x8b" else None
+    df = pd.read_csv(previous_csv, compression=compression)
     if df.empty:
         log.info("[ادغام تاریخچه] %s خالی است — چیزی برای ادغام نیست.", previous_csv)
         return None
