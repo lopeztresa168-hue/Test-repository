@@ -405,7 +405,7 @@ jobs:
       - name: دانلود portfolios_scores (روش اول)
         uses: actions/download-artifact@v4
         with:
-          pattern: portfolios-scores-*-${{ github.run_id }}
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
           path: /tmp/portfolios_scores_parts
           merge-multiple: false
         continue-on-error: true
@@ -437,7 +437,7 @@ jobs:
         run: |
           mkdir -p /tmp/portfolios_scores_parts
           gh run download ${{ github.run_id }} \
-            --pattern "portfolios-scores-*-${{ github.run_id }}" \
+            --pattern "portfolios-wt-part-*-${{ github.run_id }}" \
             --dir /tmp/portfolios_scores_parts
           COUNT=$(find /tmp/portfolios_scores_parts \( -name 'portfolios*.parquet' -o -name 'portfolios*.csv' \) 2>/dev/null | wc -l)
           if [ "$COUNT" -eq 0 ]; then
@@ -455,7 +455,7 @@ jobs:
           mkdir -p /tmp/portfolios_scores_parts
           ARTIFACTS=$(curl -s -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts")
-          echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name | startswith("portfolios-scores-")) | .archive_download_url' | while read -r url; do
+          echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name | startswith("portfolios-wt-part-")) | .archive_download_url' | while read -r url; do
             curl -L -H "Authorization: token $GH_TOKEN" -o /tmp/artifact.zip "$url"
             unzip -o -d /tmp/portfolios_scores_parts /tmp/artifact.zip
             rm -f /tmp/artifact.zip
