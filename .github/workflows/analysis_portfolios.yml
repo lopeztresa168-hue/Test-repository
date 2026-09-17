@@ -415,7 +415,7 @@ jobs:
         id: dl1_report
         run: |
           if [ "${{ steps.dl1.outcome }}" = "success" ]; then
-            COUNT=$(find /tmp/portfolios_scores_parts \( -name 'portfolios*.parquet' -o -name 'portfolios*.csv' \) 2>/dev/null | wc -l)
+            COUNT=$(find /tmp/portfolios_scores_parts \( -name 'part_*.parquet' -o -name 'part_*.csv' \) 2>/dev/null | wc -l)
             if [ "$COUNT" -gt 0 ]; then
               echo "✅ روش اول موفق بود — $COUNT فایل دریافت شد."
               echo "found=true" >> $GITHUB_OUTPUT
@@ -439,7 +439,7 @@ jobs:
           gh run download ${{ github.run_id }} \
             --pattern "portfolios-wt-part-*-${{ github.run_id }}" \
             --dir /tmp/portfolios_scores_parts
-          COUNT=$(find /tmp/portfolios_scores_parts \( -name 'portfolios*.parquet' -o -name 'portfolios*.csv' \) 2>/dev/null | wc -l)
+          COUNT=$(find /tmp/portfolios_scores_parts \( -name 'part_*.parquet' -o -name 'part_*.csv' \) 2>/dev/null | wc -l)
           if [ "$COUNT" -eq 0 ]; then
             echo "⚠️ روش دوم (gh run download) هیچ فایلی پیدا نکرد."
             exit 1
@@ -460,7 +460,7 @@ jobs:
             unzip -o -d /tmp/portfolios_scores_parts /tmp/artifact.zip
             rm -f /tmp/artifact.zip
           done
-          COUNT=$(find /tmp/portfolios_scores_parts \( -name 'portfolios*.parquet' -o -name 'portfolios*.csv' \) 2>/dev/null | wc -l)
+          COUNT=$(find /tmp/portfolios_scores_parts \( -name 'part_*.parquet' -o -name 'part_*.csv' \) 2>/dev/null | wc -l)
           if [ "$COUNT" -eq 0 ]; then
             echo "❌ روش سوم (GitHub API + curl) نیز هیچ فایلی پیدا نکرد."
             echo "ERROR: هر سه روش دانلود portfolios_scores ناموفق بودند."
