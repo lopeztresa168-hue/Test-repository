@@ -1,0 +1,777 @@
+name: Repro Verbose — بازسازی run 34950738285 با لاگ کامل
+
+# ============================================================================
+# این ورکفلو کاملاً جدید است و هیچ فایل موجودی (analysis_fixed_batch.yml،
+# modules/combo_10day.py، modules/combo_monthly.py) را تغییر نمی‌دهد.
+# هدف: بازسازی دقیق ۲۹۰ ترکیبِ اجرای run 34950738285 با همان کد و همان
+# منطق، ولی با لاگ‌گیری کامل از منشأ هر ورودی و هر محاسبه — برای پیدا کردن
+# منشأ اختلاف در داده‌ی ورودی.
+#
+# نکته‌ی مهم عملیاتی (README را هم ببین): modules/combo_10day.py و
+# data/news همیشه از commit قفل‌شده‌ی مرجع (main_ref) خوانده می‌شوند.
+# modules_verbose/combo_10day_verbose.py و repro_tools/* که تازه اضافه
+# شده‌اند، طبیعتاً در آن commit تاریخی وجود ندارند؛ این‌ها همیشه از رفِ
+# جاری (همان رفی که این ورکفلو را dispatch کرده) چک‌اوت می‌شوند. به همین
+# دلیل هر job دو چک‌اوت جدا دارد: ref_repo (قفل‌شده) و verbose_repo (جاری).
+#
+# این ورکفلو هیچ‌چیز را در هیچ مخزنی نمی‌نویسد: بدون commit به main، بدون
+# تغییر all_combinations.json/completed_*.json/batch_outputs، بدون نوشتن
+# در analysis_errors/ مخزن سوم، بدون فراخوانی loop_analysis.yml و بدون
+# cleanup. مخزن سوم (THIRD_REPO) فقط با درخواست‌های GET خوانده می‌شود.
+# ============================================================================
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      main_ref:
+        description: "commit/ref مخزن اصلی برای modules/ و data/news (پیش‌فرض: همان commit اجرای مرجع)"
+        required: false
+        default: "8a79f702ab10bf90fd5cbccb55cea8989e8bd479"
+      ohlc_ref:
+        description: "ref مخزن OHLC_REPO (خالی = شاخه پیش‌فرض/HEAD، مثل اجرای مرجع)"
+        required: false
+        default: ""
+      third_repo_ref:
+        description: "ref مخزن سوم (THIRD_REPO) برای trades.enc و strategies/ (خالی = شاخه پیش‌فرض/HEAD)"
+        required: false
+        default: ""
+
+concurrency:
+  group: repro-verbose-runner
+  cancel-in-progress: false
+
+jobs:
+  # ==========================================================================
+  # prepare: چک‌اوت دوگانه، بررسی هش ماژول‌ها، حل و لاگ رفرنس‌ها، دامپ کامل
+  # اخبار، دانلود یک‌باره‌ی OHLC و trades (مشترک بین witness و verbose)،
+  # و تقسیم صف ۲۹۰تایی به ۱۰ چانک.
+  # ==========================================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      strat: ${{ steps.queue.outputs.strat }}
+      hash_mismatch: ${{ steps.hashcheck.outputs.hash_mismatch }}
+    steps:
+      - name: چک‌اوت verbose_repo (ref جاری) — repro_tools/ و repro_data/
+        uses: actions/checkout@v5
+        with:
+          path: verbose_repo
+
+      - name: چک‌اوت ref_repo (main_ref قفل‌شده) — modules/ و data/news/
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.main_ref }}
+          path: ref_repo
+          fetch-depth: 1
+
+      - name: حل و لاگ main_ref → commit sha واقعی
+        id: resolve_main
+        run: |
+          cd ref_repo
+          RESOLVED=$(git rev-parse HEAD)
+          echo "::group::[VERBOSE][منشأ] main_ref"
+          echo "درخواست‌شده (workflow_dispatch input): ${{ github.event.inputs.main_ref }}"
+          echo "commit sha حل‌شده: $RESOLVED"
+          echo "تاریخ commit: $(git show -s --format=%cI HEAD)"
+          echo "::endgroup::"
+          echo "resolved=$RESOLVED" >> "$GITHUB_OUTPUT"
+
+      - name: حل و لاگ third_repo_ref → commit sha واقعی (فقط خواندنی)
+        id: resolve_third
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          REF_INPUT="${{ github.event.inputs.third_repo_ref }}"
+          API_REF="${REF_INPUT:-HEAD}"
+          RESOLVED=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/commits/$API_REF" | jq -r '.sha // empty')
+          echo "::group::[VERBOSE][منشأ] third_repo_ref (THIRD_REPO — فقط خواندنی)"
+          echo "درخواست‌شده: '${REF_INPUT}' (خالی یعنی شاخه پیش‌فرض/HEAD)"
+          echo "commit sha حل‌شده: ${RESOLVED:-<نامشخص - بررسی کن>}"
+          echo "::endgroup::"
+          echo "resolved=$RESOLVED" >> "$GITHUB_OUTPUT"
+
+      - name: بررسی SHA-256 ماژول‌های استفاده‌شده در برابر هش‌های مرجع
+        id: hashcheck
+        run: |
+          set +e
+          python3 verbose_repo/repro_tools/hash_check.py \
+            ref_repo/modules/combo_10day.py ref_repo/modules/combo_monthly.py \
+            | tee /tmp/hashcheck.log
+          if grep -q "HASH_MISMATCH=true" /tmp/hashcheck.log; then
+            echo "hash_mismatch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hash_mismatch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: بررسی خودکار AST — verbose باید فقط لاگ اضافه کرده باشد
+        run: |
+          python3 verbose_repo/repro_tools/ast_diff_check.py \
+            ref_repo/modules/combo_10day.py \
+            verbose_repo/modules_verbose/combo_10day_verbose.py
+
+      - name: اعتبارسنجی صف ۲۹۰تایی و استخراج STRAT
+        id: queue
+        run: |
+          Q=verbose_repo/repro_data/rerun_queue_290.json
+          COUNT=$(jq length "$Q")
+          echo "[DEBUG] تعداد آیتم‌های صف: $COUNT"
+          if [ "$COUNT" -ne 290 ]; then
+            echo "❌ صف باید دقیقاً ۲۹۰ آیتم داشته باشد، ولی $COUNT است."
+            exit 1
+          fi
+          STRAT=$(jq -r '.[0].strat' "$Q")
+          # همه‌ی ۲۹۰ آیتم باید همین یک strat را داشته باشند — بررسی صریح
+          OTHER=$(jq --arg s "$STRAT" '[.[] | select(.strat != $s)] | length' "$Q")
+          if [ "$OTHER" -ne 0 ]; then
+            echo "❌ $OTHER آیتم strat متفاوتی دارند — فرض «یک STRAT برای کل صف» نقض شده."
+            exit 1
+          fi
+          echo "✅ همه‌ی ۲۹۰ آیتم strat یکسان دارند: $STRAT"
+          echo "strat=$STRAT" >> "$GITHUB_OUTPUT"
+
+      - name: تقسیم صف به ۱۰ چانک (هر چانک = یک مجموعه‌کوین، ۲۹ interval)
+        run: |
+          mkdir -p /tmp/chunks
+          Q=verbose_repo/repro_data/rerun_queue_290.json
+          for i in $(seq 0 9); do
+            START=$(( 290 * i / 10 ))
+            END=$(( 290 * (i + 1) / 10 ))
+            jq ".[$START:$END]" "$Q" > /tmp/chunks/chunk_${i}.json
+            echo "chunk_${i}: [$START:$END) = $(jq length /tmp/chunks/chunk_${i}.json) آیتم، coin=$(jq -r '.[0].coin' /tmp/chunks/chunk_${i}.json)"
+          done
+
+      - name: آپلود چانک‌ها به‌عنوان artifact مشترک
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-chunks-${{ github.run_id }}
+          path: /tmp/chunks/
+          retention-days: 90
+          compression-level: 9
+
+      # ------------------------------------------------------------------
+      # دامپ کامل data/news (از ref_repo، یعنی commit قفل‌شده)
+      # ------------------------------------------------------------------
+      - name: دامپ کامل محتوای data/news (نام، حجم، sha256، blob sha، ترتیب sorted)
+        run: |
+          cd ref_repo
+          mkdir -p /tmp/news_dump
+          FOLDER_HASH_INPUT=/tmp/news_dump/_folder_concat.tmp
+          : > "$FOLDER_HASH_INPUT"
+          echo "::group::[VERBOSE][اخبار] فهرست فایل‌های data/news (ترتیب sorted(os.listdir))"
+          for f in $(python3 -c "import os; [print(x) for x in sorted(os.listdir('data/news'))]"); do
+            PATH_F="data/news/$f"
+            SIZE=$(stat -c%s "$PATH_F")
+            SHA=$(sha256sum "$PATH_F" | cut -d' ' -f1)
+            BLOB_SHA=$(git hash-object "$PATH_F")
+            echo "  $f  size=$SIZE  sha256=$SHA  git_blob_sha=$BLOB_SHA"
+            cat "$PATH_F" >> "$FOLDER_HASH_INPUT"
+            cp "$PATH_F" "/tmp/news_dump/$f"
+          done
+          echo "::endgroup::"
+          FOLDER_SHA=$(sha256sum "$FOLDER_HASH_INPUT" | cut -d' ' -f1)
+          echo "[VERBOSE][اخبار] sha256 کل پوشه (concat به ترتیب sorted): $FOLDER_SHA"
+          echo "::group::[VERBOSE][اخبار] محتوای کامل هر فایل"
+          for f in $(python3 -c "import os; [print(x) for x in sorted(os.listdir('data/news'))]"); do
+            echo "----- شروع $f -----"
+            cat "data/news/$f"
+            echo "----- پایان $f -----"
+          done
+          echo "::endgroup::"
+          rm -f /tmp/news_dump/_folder_concat.tmp
+          tar czf /tmp/news_dump.tar.gz -C /tmp/news_dump .
+          echo "[VERBOSE][اخبار] artifact فشرده: /tmp/news_dump.tar.gz  حجم=$(stat -c%s /tmp/news_dump.tar.gz)  sha256=$(sha256sum /tmp/news_dump.tar.gz | cut -d' ' -f1)"
+
+      - name: آپلود دامپ کامل data/news به‌عنوان artifact (فشرده، tar.gz)
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-dump-${{ github.run_id }}
+          path: /tmp/news_dump.tar.gz
+          retention-days: 90
+          compression-level: 9
+
+      # ------------------------------------------------------------------
+      # OHLC — دانلود یک‌باره (مثل اجرای مرجع)، محتوا چاپ نمی‌شود، فقط
+      # فهرست/حجم/sha256/commit — مطابق قاعده «ث»
+      # ------------------------------------------------------------------
+      - name: دانلود یک‌باره OHLC (git clone روی ohlc_ref یا HEAD)
+        id: ohlc
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          OHLC_REPO: ${{ secrets.OHLC_REPO }}
+        run: |
+          set -e
+          if [ -z "$OHLC_REPO" ]; then
+            echo "❌ [OHLC اجباری] secret OHLC_REPO تنظیم نشده."
+            exit 1
+          fi
+          mkdir -p /tmp/ohlc_master
+          echo "📦 git clone (depth=1) از مخزن OHLC ..."
+          git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${OHLC_REPO}.git" /tmp/ohlc_clone
+          cd /tmp/ohlc_clone
+          REF_INPUT="${{ github.event.inputs.ohlc_ref }}"
+          if [ -n "$REF_INPUT" ]; then
+            echo "🔀 checkout روی ohlc_ref مشخص‌شده: $REF_INPUT"
+            git fetch --depth=1 origin "$REF_INPUT" 2>/dev/null || git fetch origin "$REF_INPUT"
+            git checkout FETCH_HEAD
+          fi
+          RESOLVED=$(git rev-parse HEAD)
+          COMMIT_DATE=$(git show -s --format=%cI HEAD)
+          echo "::group::[VERBOSE][منشأ] OHLC_REPO"
+          echo "درخواست‌شده (ohlc_ref): '${REF_INPUT:-<خالی = HEAD>}'"
+          echo "commit sha حل‌شده: $RESOLVED"
+          echo "تاریخ commit: $COMMIT_DATE"
+          echo "::endgroup::"
+
+          OHLC_PATH="/tmp/ohlc_clone/data/All_Coins_Combined"
+          if [ ! -d "$OHLC_PATH" ]; then
+            echo "❌ پوشه data/All_Coins_Combined یافت نشد."
+            exit 1
+          fi
+          echo "::group::[VERBOSE][OHLC] فهرست فایل‌ها (نام/حجم/sha256)"
+          TOTAL=0
+          for f in "$OHLC_PATH"/*.csv; do
+            SIZE=$(stat -c%s "$f")
+            SHA=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "  $(basename "$f")  size=$SIZE  sha256=$SHA"
+            TOTAL=$((TOTAL+1))
+          done
+          echo "::endgroup::"
+          echo "[VERBOSE][OHLC] تعداد کل فایل CSV: $TOTAL (مبنای کاربر: 1314)"
+          if [ "$TOTAL" -ne 1314 ]; then
+            echo "‼️‼️‼️ [اختلاف OHLC] تعداد فایل ($TOTAL) با مبنای کاربر (1314) فرق دارد!"
+          fi
+          cp "$OHLC_PATH"/*.csv /tmp/ohlc_master/
+          tar czf /tmp/ohlc_master.tar.gz -C /tmp/ohlc_master .
+          echo "[VERBOSE][OHLC] artifact فشرده: /tmp/ohlc_master.tar.gz  حجم=$(stat -c%s /tmp/ohlc_master.tar.gz)  sha256=$(sha256sum /tmp/ohlc_master.tar.gz | cut -d' ' -f1)"
+          echo "ohlc_ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: آپلود OHLC master به‌عنوان artifact مشترک (فشرده، tar.gz — یک فایل به‌جای ۱۳۱۴ CSV جدا)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ohlc-master-${{ github.run_id }}
+          path: /tmp/ohlc_master.tar.gz
+          retention-days: 90
+          compression-level: 9
+
+      # ------------------------------------------------------------------
+      # trades.enc — دانلود، رمزگشایی، تزریق متادیتا — یک‌بار برای کل اجرا
+      # (چون هر ۲۹۰ آیتم دقیقاً یک STRAT مشترک دارند). منطق این بخش کلمه‌به‌کلمه
+      # همان بخش مربوطه در analysis_fixed_batch.yml است.
+      # ------------------------------------------------------------------
+      - name: دانلود trades.enc (فقط خواندنی از THIRD_REPO)
+        id: trades_dl
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          STRAT: ${{ steps.queue.outputs.strat }}
+        run: |
+          set -e
+          AGG_FILE="aggregated/${STRAT}/${STRAT}_trades.enc"
+          echo "::group::[VERBOSE][منشأ] trades.enc"
+          echo "مخزن: $THIRD_REPO"
+          echo "مسیر: $AGG_FILE"
+          echo "ref درخواستی: '${{ github.event.inputs.third_repo_ref }}' (خالی = HEAD)"
+          META=$(curl -s -w '\n%{http_code}' -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/$AGG_FILE${{ github.event.inputs.third_repo_ref && format('?ref={0}', github.event.inputs.third_repo_ref) || '' }}")
+          HTTP_CODE=$(echo "$META" | tail -n1)
+          BODY=$(echo "$META" | sed '$d')
+          echo "کد HTTP متادیتای فایل: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ دریافت متادیتای $AGG_FILE ناموفق بود."
+            exit 1
+          fi
+          BLOB_SHA=$(echo "$BODY" | jq -r '.sha')
+          DOWNLOAD_URL=$(echo "$BODY" | jq -r '.download_url')
+          echo "blob sha: $BLOB_SHA"
+          echo "download_url: $DOWNLOAD_URL"
+          T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          DL_CODE=$(curl -sL -o /tmp/trades.enc -w '%{http_code}' "$DOWNLOAD_URL")
+          T1=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "کد HTTP دانلود فایل: $DL_CODE"
+          echo "زمان دانلود: $T0 تا $T1"
+          if [ "$DL_CODE" != "200" ] || [ ! -s /tmp/trades.enc ]; then
+            echo "❌ دانلود trades.enc ناموفق یا خالی بود."
+            exit 1
+          fi
+          SIZE=$(stat -c%s /tmp/trades.enc)
+          SHA=$(sha256sum /tmp/trades.enc | cut -d' ' -f1)
+          echo "حجم فایل رمزشده: $SIZE بایت"
+          echo "sha256 فایل رمزشده: $SHA"
+          echo "::endgroup::"
+
+      - name: رمزگشایی AES-256-CBC (scrypt) — دقیقاً مثل ورکفلوی مرجع
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const data=fs.readFileSync('/tmp/trades.enc');
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=data.slice(0,16),enc=data.slice(16);
+            const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+            const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+            fs.writeFileSync('/tmp/all_trades_raw.json',dec);
+          "
+          SIZE=$(stat -c%s /tmp/all_trades_raw.json)
+          SHA=$(sha256sum /tmp/all_trades_raw.json | cut -d' ' -f1)
+          LINES=$(python3 -c "import json;print(len(json.load(open('/tmp/all_trades_raw.json')).get('trades', json.load(open('/tmp/all_trades_raw.json')))))" 2>/dev/null || echo "نامشخص")
+          echo "[VERBOSE][trades خام رمزگشایی‌شده] حجم=$SIZE بایت، sha256=$SHA"
+
+      - name: نکته درباره‌ی trades خام قبل از تزریق متادیتا
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/all_trades_raw.json'))
+          trades = d if isinstance(d, list) else d.get('trades', [])
+          print(f'[VERBOSE][trades خام، قبل از تزریق متادیتا] تعداد کل رکورد: {len(trades)}')
+          "
+          echo "ℹ️ محتوای کامل (~۶۰هزار رکورد) این‌جا چاپ نمی‌شود (سقف حجم لاگ) — فقط در artifact فشرده trades-injected-${{ github.run_id }} (فایل trades_before_metadata_injection.json داخل tar.gz) با sha256 بالا موجود است."
+
+      - name: تعیین متادیتا (.js با fallback به 1.json) — دقیقاً مثل ورکفلوی مرجع
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          STRAT: ${{ steps.queue.outputs.strat }}
+        run: |
+          set -e
+          META_SOURCE=""
+          META_CONTENT=""
+          JS_FILE_REMOTE="strategies/${STRAT}.js"
+          JS_CONTENT=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/$JS_FILE_REMOTE${{ github.event.inputs.third_repo_ref && format('?ref={0}', github.event.inputs.third_repo_ref) || '' }}" 2>/dev/null || echo "")
+
+          if [ -n "$JS_CONTENT" ] && ! echo "$JS_CONTENT" | grep -q '"message": "Not Found"'; then
+            echo "$JS_CONTENT" > /tmp/strat.js
+            echo "::group::[VERBOSE][متادیتا] محتوای کامل $JS_FILE_REMOTE"
+            cat /tmp/strat.js
+            echo "::endgroup::"
+            META_CONTENT=$(node -e "
+              const fs=require('fs');
+              const js=fs.readFileSync('/tmp/strat.js','utf8');
+              let mp=[]; let mpSource='none';
+              const sm=js.match(/stopLossStages\s*[:=]\s*\[([\s\S]*?)\]/);
+              if(sm){ for(const m of sm[1].matchAll(/movePercent\s*:\s*([\d.]+)/g)) mp.push(parseFloat(m[1])); if(mp.length>0) mpSource='stopLossStages'; }
+              if(mp.length===0){ let mm=js.match(/movePercent\s*[:=]\s*\[(.*?)\]/s); if(mm){let n=mm[1].match(/[\d.]+/g); if(n){mp=n.map(Number); mpSource='movePercent_direct';}} }
+              let sl=js.match(/stopLossInitial\s*[:=]\s*(-?[\d.]+)/);
+              if(!sl){ console.error('__NO_STOP_LOSS_INITIAL__'); process.exit(1); }
+              let stop=parseFloat(sl[1]);
+              let max=mp.length?mp[mp.length-1]:null;
+              console.error('منبع move_percents: ' + mpSource);
+              console.error('move_percents (' + mp.length + '): ' + JSON.stringify(mp));
+              console.error('stop_loss_initial: ' + stop);
+              console.log(JSON.stringify({move_percents:mp,stop_loss_initial:stop,max_move_percent:max}));
+            " 2>&1 1>/tmp/meta_stdout.json || true)
+            if [ -s /tmp/meta_stdout.json ] && jq empty /tmp/meta_stdout.json 2>/dev/null; then
+              META_SOURCE=".js"
+              META_CONTENT=$(cat /tmp/meta_stdout.json)
+            fi
+          fi
+
+          if [ -z "$META_CONTENT" ]; then
+            echo "ℹ️ fallback به strategies/${STRAT}/1.json"
+            META_FILE_REMOTE="strategies/${STRAT}/1.json"
+            META_CONTENT=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/$META_FILE_REMOTE${{ github.event.inputs.third_repo_ref && format('?ref={0}', github.event.inputs.third_repo_ref) || '' }}" 2>/dev/null || echo "")
+            if [ -z "$META_CONTENT" ]; then
+              echo "❌ نه .js و نه 1.json یافت شد."
+              exit 1
+            fi
+            META_SOURCE="1.json"
+            echo "::group::[VERBOSE][متادیتا] محتوای کامل $META_FILE_REMOTE"
+            echo "$META_CONTENT"
+            echo "::endgroup::"
+          fi
+
+          echo "$META_CONTENT" > /tmp/meta.json
+          echo "✅ منبع نهایی متادیتا: $META_SOURCE"
+          echo "[VERBOSE][متادیتا] move_percents: $(jq -c '.move_percents' /tmp/meta.json)"
+          echo "[VERBOSE][متادیتا] stop_loss_initial: $(jq -c '.stop_loss_initial' /tmp/meta.json)"
+          echo "[VERBOSE][متادیتا] max_move_percent: $(jq -c '.max_move_percent // null' /tmp/meta.json)"
+          echo "source=$META_SOURCE" >> "$GITHUB_OUTPUT"
+
+      - name: تزریق متادیتا در فایل معاملات — دقیقاً مثل ورکفلوی مرجع
+        run: |
+          node -e "
+            const fs=require('fs');
+            const trades=JSON.parse(fs.readFileSync('/tmp/all_trades_raw.json','utf8'));
+            const meta=JSON.parse(fs.readFileSync('/tmp/meta.json','utf8'));
+            const tradeList=Array.isArray(trades)?trades:trades.trades;
+            if(meta.stop_loss_initial===undefined || meta.stop_loss_initial===null){
+              console.error('__NO_STOP_LOSS_INITIAL__'); process.exit(1);
+            }
+            fs.writeFileSync('/tmp/all_trades_injected.json',JSON.stringify({
+              trades:tradeList,
+              metadata:{
+                move_percents:meta.move_percents||[],
+                stop_loss_initial:meta.stop_loss_initial,
+                max_move_percent:(meta.max_move_percent!==undefined?meta.max_move_percent:null)
+              }
+            }));
+          "
+          SIZE=$(stat -c%s /tmp/all_trades_injected.json)
+          SHA=$(sha256sum /tmp/all_trades_injected.json | cut -d' ' -f1)
+          echo "[VERBOSE][trades بعد از تزریق متادیتا] حجم=$SIZE بایت، sha256=$SHA"
+          echo "ℹ️ محتوای کامل این‌جا چاپ نمی‌شود (سقف حجم لاگ) — فایل کامل (trades_after_metadata_injection.json) با sha256 بالا در artifact فشرده زیر موجود است."
+          mkdir -p /tmp/trades_artifact
+          cp /tmp/all_trades_raw.json /tmp/trades_artifact/trades_before_metadata_injection.json
+          cp /tmp/all_trades_injected.json /tmp/trades_artifact/trades_after_metadata_injection.json
+          cp /tmp/meta.json /tmp/trades_artifact/strategy_metadata_used.json
+          tar czf /tmp/trades_artifact.tar.gz -C /tmp/trades_artifact .
+          echo "[VERBOSE][trades artifact فشرده] /tmp/trades_artifact.tar.gz  حجم=$(stat -c%s /tmp/trades_artifact.tar.gz)  sha256=$(sha256sum /tmp/trades_artifact.tar.gz | cut -d' ' -f1)"
+
+      - name: آپلود فایل‌های trades (قبل/بعد تزریق) + متادیتا به‌عنوان artifact مشترک (فشرده، tar.gz)
+        uses: actions/upload-artifact@v4
+        with:
+          name: trades-injected-${{ github.run_id }}
+          path: /tmp/trades_artifact.tar.gz
+          retention-days: 90
+          compression-level: 9
+
+  # ==========================================================================
+  # witness: اجرای modules/combo_10day.py (اصلی، دست‌نخورده) روی همان ۲۹۰
+  # ترکیب — برای مقایسه‌ی بایت‌به‌بایت با verbose (قاعده سخت اعتبارسنجی #3)
+  # ==========================================================================
+  witness:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        chunk_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - name: چک‌اوت ref_repo (main_ref قفل‌شده)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.main_ref }}
+          path: ref_repo
+
+      - name: چک‌اوت verbose_repo (ref جاری) — فقط برای repro_tools
+        uses: actions/checkout@v5
+        with:
+          path: verbose_repo
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: repro-chunks-${{ github.run_id }}
+          path: /tmp/chunks
+      - uses: actions/download-artifact@v4
+        with:
+          name: trades-injected-${{ github.run_id }}
+          path: /tmp/trades_artifact_gz
+      - name: استخراج artifact فشرده‌ی trades (tar.gz)
+        run: |
+          mkdir -p /tmp/trades_artifact
+          tar xzf /tmp/trades_artifact_gz/trades_artifact.tar.gz -C /tmp/trades_artifact
+      - uses: actions/download-artifact@v4
+        with:
+          name: ohlc-master-${{ github.run_id }}
+          path: /tmp/ohlc_gz
+      - name: استخراج artifact فشرده‌ی OHLC (tar.gz)
+        run: |
+          mkdir -p /tmp/ohlc
+          tar xzf /tmp/ohlc_gz/ohlc_master.tar.gz -C /tmp/ohlc
+
+      - name: اجرای این چانک با ماژول اصلیِ دست‌نخورده (job شاهد)
+        run: |
+          set -o pipefail
+          CHUNK_INDEX="${{ matrix.chunk_index }}"
+          CHUNK="/tmp/chunks/chunk_${CHUNK_INDEX}.json"
+          mkdir -p /tmp/results/witness/chunk_${CHUNK_INDEX} /tmp/logs
+          echo "[]" > /tmp/done_items.json
+          echo "[]" > /tmp/failed_items.json
+          T0=$(date +%s)
+          LENGTH=$(jq length "$CHUNK")
+          for i in $(seq 0 $((LENGTH-1))); do
+            ITEM=$(jq -c ".[$i]" "$CHUNK")
+            STRAT_I=$(echo "$ITEM" | jq -r '.strat')
+            COIN=$(echo "$ITEM" | jq -r '.coin'); SAFE_COIN=$(echo "$COIN" | tr '+' '_')
+            INTERVAL=$(echo "$ITEM" | jq -r '.interval')
+            MODEL=$(echo "$ITEM" | jq -r '.model')
+            SESSION=$(echo "$ITEM" | jq -r '.session // empty')
+            SESSION_SUFFIX=""; SESSION_ARG=""
+            if [ -n "$SESSION" ]; then SESSION_SUFFIX="_${SESSION}"; SESSION_ARG="--session $SESSION"; fi
+            SIG_OUT="/tmp/results/witness/chunk_${CHUNK_INDEX}/signatures/${STRAT_I}/${SAFE_COIN}/${INTERVAL}_${MODEL}${SESSION_SUFFIX}.jsonl"
+            mkdir -p "$(dirname "$SIG_OUT")"
+            echo "🚦 [witness][chunk ${CHUNK_INDEX}] ($((i+1))/$LENGTH) $COIN / $INTERVAL${SESSION:+ / سشن=$SESSION}"
+            pushd /tmp >/dev/null
+            python3 "$GITHUB_WORKSPACE/ref_repo/modules/combo_10day.py" \
+              --trades-json /tmp/trades_artifact/trades_after_metadata_injection.json \
+              --news-dir "$GITHUB_WORKSPACE/ref_repo/data/news" \
+              --strategy-folder "$STRAT_I" --coin "$COIN" --interval "$INTERVAL" --model "$MODEL" \
+              $SESSION_ARG --ohlc-dir /tmp/ohlc \
+              --jsonl-out "$SIG_OUT" --min-sample-count 2 > /tmp/logs/witness_${CHUNK_INDEX}_${i}.log 2>&1
+            EXIT_CODE=$?
+            OUTPUT_FILE="/tmp/${STRAT_I}_${COIN}_${INTERVAL}_${MODEL}${SESSION_SUFFIX}.csv"
+            popd >/dev/null
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "   ❌ خطا (exit=$EXIT_CODE) — لاگ: /tmp/logs/witness_${CHUNK_INDEX}_${i}.log"
+              jq --arg m combo_10day --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se=="" then null else $se end)}]' \
+                /tmp/failed_items.json > /tmp/f.tmp && mv /tmp/f.tmp /tmp/failed_items.json
+              continue
+            fi
+            if [ -f "$OUTPUT_FILE" ]; then
+              PDIR="/tmp/results/witness/chunk_${CHUNK_INDEX}/combo_10day_patterns/${STRAT_I}/${SAFE_COIN}"
+              mkdir -p "$PDIR"
+              mv "$OUTPUT_FILE" "$PDIR/${INTERVAL}_${MODEL}${SESSION_SUFFIX}.csv"
+            fi
+            jq --arg m combo_10day --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+              '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se=="" then null else $se end)}]' \
+              /tmp/done_items.json > /tmp/d.tmp && mv /tmp/d.tmp /tmp/done_items.json
+          done
+          find /tmp/results/witness -name '*.jsonl' -empty -delete 2>/dev/null || true
+          T1=$(date +%s)
+          echo "ELAPSED=$((T1-T0))" >> "$GITHUB_ENV"
+          echo "✅ chunk ${CHUNK_INDEX} (witness) پردازش شد. موفق=$(jq length /tmp/done_items.json) ناموفق=$(jq length /tmp/failed_items.json)"
+
+      - name: ساخت manifest این چانک
+        run: |
+          python3 verbose_repo/repro_tools/build_manifest.py \
+            /tmp/results/witness/chunk_${{ matrix.chunk_index }} \
+            /tmp/done_items.json /tmp/failed_items.json \
+            "${{ matrix.chunk_index }}" "${{ env.ELAPSED }}" \
+            /tmp/results/witness/chunk_${{ matrix.chunk_index }}/manifest.json
+
+      - name: فشرده‌سازی خروجی‌های این چانک (یک tar.gz به‌جای چند صد فایل جدا)
+        run: |
+          mkdir -p /tmp/witness_pack
+          cp -r /tmp/results/witness /tmp/witness_pack/results
+          cp -r /tmp/logs /tmp/witness_pack/logs
+          tar czf /tmp/witness-outputs-${{ matrix.chunk_index }}.tar.gz -C /tmp/witness_pack .
+          echo "حجم=$(stat -c%s /tmp/witness-outputs-${{ matrix.chunk_index }}.tar.gz)  sha256=$(sha256sum /tmp/witness-outputs-${{ matrix.chunk_index }}.tar.gz | cut -d' ' -f1)"
+
+      - name: آپلود خروجی‌های witness این چانک (فشرده، tar.gz)
+        uses: actions/upload-artifact@v4
+        with:
+          name: witness-outputs-${{ github.run_id }}-${{ matrix.chunk_index }}
+          path: /tmp/witness-outputs-${{ matrix.chunk_index }}.tar.gz
+          retention-days: 90
+          compression-level: 9
+
+  # ==========================================================================
+  # verbose: اجرای modules_verbose/combo_10day_verbose.py با لاگ کامل — روی
+  # همان ۲۹۰ ترکیب، با همان آرگومان‌های خط فرمان مرجع
+  # ==========================================================================
+  verbose:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        chunk_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - name: چک‌اوت ref_repo (main_ref قفل‌شده) — فقط data/news مصرف می‌شود
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.main_ref }}
+          path: ref_repo
+
+      - name: چک‌اوت verbose_repo (ref جاری) — modules_verbose/ و repro_tools/
+        uses: actions/checkout@v5
+        with:
+          path: verbose_repo
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: repro-chunks-${{ github.run_id }}
+          path: /tmp/chunks
+      - uses: actions/download-artifact@v4
+        with:
+          name: trades-injected-${{ github.run_id }}
+          path: /tmp/trades_artifact_gz
+      - name: استخراج artifact فشرده‌ی trades (tar.gz)
+        run: |
+          mkdir -p /tmp/trades_artifact
+          tar xzf /tmp/trades_artifact_gz/trades_artifact.tar.gz -C /tmp/trades_artifact
+      - uses: actions/download-artifact@v4
+        with:
+          name: ohlc-master-${{ github.run_id }}
+          path: /tmp/ohlc_gz
+      - name: استخراج artifact فشرده‌ی OHLC (tar.gz)
+        run: |
+          mkdir -p /tmp/ohlc
+          tar xzf /tmp/ohlc_gz/ohlc_master.tar.gz -C /tmp/ohlc
+
+      - name: بررسی مجدد AST-equivalence برای همین چک‌اوت (دفاع در برابر drift)
+        run: |
+          python3 verbose_repo/repro_tools/ast_diff_check.py \
+            ref_repo/modules/combo_10day.py \
+            verbose_repo/modules_verbose/combo_10day_verbose.py
+
+      - name: اجرای این چانک با ماژول verbose (لاگ کامل هر مرحله)
+        env:
+          RESULTS_SESSIONS: "x"
+        run: |
+          set -o pipefail
+          CHUNK_INDEX="${{ matrix.chunk_index }}"
+          CHUNK="/tmp/chunks/chunk_${CHUNK_INDEX}.json"
+          mkdir -p /tmp/results/verbose/chunk_${CHUNK_INDEX} /tmp/vlogs /tmp/regime_debug
+          echo "[]" > /tmp/done_items.json
+          echo "[]" > /tmp/failed_items.json
+          T0=$(date +%s)
+          LENGTH=$(jq length "$CHUNK")
+          for i in $(seq 0 $((LENGTH-1))); do
+            ITEM=$(jq -c ".[$i]" "$CHUNK")
+            STRAT_I=$(echo "$ITEM" | jq -r '.strat')
+            COIN=$(echo "$ITEM" | jq -r '.coin'); SAFE_COIN=$(echo "$COIN" | tr '+' '_')
+            INTERVAL=$(echo "$ITEM" | jq -r '.interval')
+            MODEL=$(echo "$ITEM" | jq -r '.model')
+            SESSION=$(echo "$ITEM" | jq -r '.session // empty')
+            SESSION_SUFFIX=""; SESSION_ARG=""
+            if [ -n "$SESSION" ]; then SESSION_SUFFIX="_${SESSION}"; SESSION_ARG="--session $SESSION"; fi
+            SIG_OUT="/tmp/results/verbose/chunk_${CHUNK_INDEX}/signatures/${STRAT_I}/${SAFE_COIN}/${INTERVAL}_${MODEL}${SESSION_SUFFIX}.jsonl"
+            mkdir -p "$(dirname "$SIG_OUT")"
+
+            # [VERBOSE کنترل] فقط اولین ترکیب هر job/chunk: دامپ کامل اخبار
+            # parse‌شده. فقط اولین ترکیب کل اجرا (chunk 0, i=0): CSV سری رژیم.
+            export VERBOSE_FULL_NEWS_DUMP="0"
+            export VERBOSE_REGIME_CSV_DIR=""
+            if [ "$i" -eq 0 ]; then
+              export VERBOSE_FULL_NEWS_DUMP="1"
+            fi
+            if [ "$CHUNK_INDEX" -eq 0 ] && [ "$i" -eq 0 ]; then
+              export VERBOSE_REGIME_CSV_DIR="/tmp/regime_debug"
+            fi
+
+            LOGFILE="/tmp/vlogs/verbose_${CHUNK_INDEX}_${i}.log"
+            echo "📊 [verbose][chunk ${CHUNK_INDEX}] ($((i+1))/$LENGTH) $COIN / $INTERVAL${SESSION:+ / سشن=$SESSION} → لاگ کامل: $LOGFILE"
+            pushd /tmp >/dev/null
+            python3 "$GITHUB_WORKSPACE/verbose_repo/modules_verbose/combo_10day_verbose.py" \
+              --trades-json /tmp/trades_artifact/trades_after_metadata_injection.json \
+              --news-dir "$GITHUB_WORKSPACE/ref_repo/data/news" \
+              --strategy-folder "$STRAT_I" --coin "$COIN" --interval "$INTERVAL" --model "$MODEL" \
+              $SESSION_ARG --ohlc-dir /tmp/ohlc \
+              --jsonl-out "$SIG_OUT" --min-sample-count 2 > "$LOGFILE" 2>&1
+            EXIT_CODE=$?
+            OUTPUT_FILE="/tmp/${STRAT_I}_${COIN}_${INTERVAL}_${MODEL}${SESSION_SUFFIX}.csv"
+            popd >/dev/null
+
+            LOG_LINES=$(wc -l < "$LOGFILE")
+            LOG_SHA=$(sha256sum "$LOGFILE" | cut -d' ' -f1)
+            # خلاصه‌ی فشرده در لاگ اصلی (خودِ لاگ کامل در artifact است)
+            echo "   → exit=$EXIT_CODE, خطوط لاگ کامل=$LOG_LINES, sha256=$LOG_SHA"
+
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "   ❌ خطا — انتهای لاگ:"; tail -n 30 "$LOGFILE"
+              jq --arg m combo_10day --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+                '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se=="" then null else $se end)}]' \
+                /tmp/failed_items.json > /tmp/f.tmp && mv /tmp/f.tmp /tmp/failed_items.json
+              continue
+            fi
+            if [ -f "$OUTPUT_FILE" ]; then
+              PDIR="/tmp/results/verbose/chunk_${CHUNK_INDEX}/combo_10day_patterns/${STRAT_I}/${SAFE_COIN}"
+              mkdir -p "$PDIR"
+              mv "$OUTPUT_FILE" "$PDIR/${INTERVAL}_${MODEL}${SESSION_SUFFIX}.csv"
+            fi
+            jq --arg m combo_10day --arg s "$STRAT_I" --arg c "$COIN" --arg iv "$INTERVAL" --arg mo "$MODEL" --arg se "$SESSION" \
+              '. + [{"module":$m,"strat":$s,"coin":$c,"interval":$iv,"model":$mo,"session":(if $se=="" then null else $se end)}]' \
+              /tmp/done_items.json > /tmp/d.tmp && mv /tmp/d.tmp /tmp/done_items.json
+          done
+          find /tmp/results/verbose -name '*.jsonl' -empty -delete 2>/dev/null || true
+          T1=$(date +%s)
+          echo "ELAPSED=$((T1-T0))" >> "$GITHUB_ENV"
+          echo "✅ chunk ${CHUNK_INDEX} (verbose) پردازش شد. موفق=$(jq length /tmp/done_items.json) ناموفق=$(jq length /tmp/failed_items.json)"
+
+      - name: ساخت manifest این چانک
+        run: |
+          python3 verbose_repo/repro_tools/build_manifest.py \
+            /tmp/results/verbose/chunk_${{ matrix.chunk_index }} \
+            /tmp/done_items.json /tmp/failed_items.json \
+            "${{ matrix.chunk_index }}" "${{ env.ELAPSED }}" \
+            /tmp/results/verbose/chunk_${{ matrix.chunk_index }}/manifest.json
+
+      - name: فشرده‌سازی خروجی‌های این چانک (نتایج + لاگ کامل هر ترکیب + regime CSV در یک tar.gz)
+        run: |
+          mkdir -p /tmp/verbose_pack
+          cp -r /tmp/results/verbose /tmp/verbose_pack/results
+          cp -r /tmp/vlogs /tmp/verbose_pack/vlogs
+          [ -d /tmp/regime_debug ] && [ "$(ls -A /tmp/regime_debug 2>/dev/null)" ] && cp -r /tmp/regime_debug /tmp/verbose_pack/regime_debug || true
+          tar czf /tmp/verbose-outputs-${{ matrix.chunk_index }}.tar.gz -C /tmp/verbose_pack .
+          echo "حجم=$(stat -c%s /tmp/verbose-outputs-${{ matrix.chunk_index }}.tar.gz)  sha256=$(sha256sum /tmp/verbose-outputs-${{ matrix.chunk_index }}.tar.gz | cut -d' ' -f1)"
+
+      - name: آپلود خروجی‌های verbose این چانک (فشرده، tar.gz)
+        uses: actions/upload-artifact@v4
+        with:
+          name: verbose-outputs-${{ github.run_id }}-${{ matrix.chunk_index }}
+          path: /tmp/verbose-outputs-${{ matrix.chunk_index }}.tar.gz
+          retention-days: 90
+          compression-level: 9
+
+  # ==========================================================================
+  # report: مقایسه‌ی بایت‌به‌بایت witness در برابر verbose + manifest نهایی
+  # ==========================================================================
+  report:
+    needs: [prepare, witness, verbose]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: verbose_repo
+
+      - name: دانلود همه‌ی خروجی‌های witness (هر کدام یک tar.gz جدا)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: witness-outputs-${{ github.run_id }}-*
+          path: /tmp/all_witness_gz
+      - name: دانلود همه‌ی خروجی‌های verbose (هر کدام یک tar.gz جدا)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: verbose-outputs-${{ github.run_id }}-*
+          path: /tmp/all_verbose_gz
+
+      - name: استخراج همه‌ی چانک‌های witness/verbose برای مقایسه
+        run: |
+          mkdir -p /tmp/all_witness /tmp/all_verbose
+          for f in /tmp/all_witness_gz/*/*.tar.gz; do
+            [ -f "$f" ] || continue
+            DIR="/tmp/all_witness/$(basename "$(dirname "$f")")"
+            mkdir -p "$DIR"
+            tar xzf "$f" -C "$DIR"
+          done
+          for f in /tmp/all_verbose_gz/*/*.tar.gz; do
+            [ -f "$f" ] || continue
+            DIR="/tmp/all_verbose/$(basename "$(dirname "$f")")"
+            mkdir -p "$DIR"
+            tar xzf "$f" -C "$DIR"
+          done
+
+      - name: مقایسه بایت‌به‌بایت witness در برابر verbose
+        run: |
+          python3 verbose_repo/repro_tools/compare_outputs.py \
+            /tmp/all_witness /tmp/all_verbose /tmp/diff_report.json
+
+      - name: خلاصه نهایی
+        run: |
+          echo "hash_mismatch (بررسی‌شده در prepare): ${{ needs.prepare.outputs.hash_mismatch }}"
+          echo "--- diff_report.json ---"
+          cat /tmp/diff_report.json
+
+      - name: آپلود گزارش نهایی
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-final-report-${{ github.run_id }}
+          path: /tmp/diff_report.json
+          retention-days: 90
+          compression-level: 9
