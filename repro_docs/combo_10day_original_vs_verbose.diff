@@ -1,0 +1,283 @@
+--- /home/claude/work/combo_10day_original.py	2026-09-18 18:46:26.862263890 +0000
++++ /home/claude/work/combo_10day_verbose.py	2026-09-18 18:53:39.158920844 +0000
+@@ -1,8 +1,16 @@
+ #!/usr/bin/env python3
+-# combo_10day.py - تحلیل ترکیبی الگوهای خبری در بازه‌های زمانی دلخواه
+-# نسخه ادغام‌شده: هم CSV و هم JSONL (امضاهای per-period) تولید می‌کند.
+-# اولویت ۱: --ohlc-dir اجباری است. اگر داده نشود یا پوشه خالی باشد، exit 1.
+-# اولویت ۲: --jsonl-out اختیاری است؛ در صورت داده‌شدن، JSONL نیز تولید می‌شود.
++# combo_10day_verbose.py — [VERBOSE-INSTRUMENTED COPY OF combo_10day.py]
++#
++# این فایل با modules_verbose/../repro_tools/build_verbose.py از روی
++# combo_10day.py (sha256 مرجع: c3aa827684c65f46947453e20eda1b2c1404fe6774d13bd15022836a32d64135) تولید شده است.
++# قاعده‌ی سخت: هیچ خط موجود آن فایل حذف/ویرایش/جابه‌جا نشده — فقط بلوک‌های
++# جدیدِ چاپ/لاگ (همه با برچسب «# [VERBOSE]» یا نام با پیشوند _VERBOSE_) در
++# نقاط مشخص درج شده‌اند. برای اثبات خودکار این ادعا، بعد از checkout هر
++# اجرا، repro_tools/ast_diff_check.py این فایل را در برابر combo_10day.py
++# چک‌اوت‌شده (نه این کپی محلی) دوباره اعتبارسنجی می‌کند.
++#
++# منطق، ترتیب مراحل، مرتب‌سازی، نوع داده و محاسبات عددی این فایل دقیقاً
++# همان combo_10day.py مرجع است.
+ 
+ import os
+ import sys
+@@ -18,6 +26,99 @@
+ from datetime import datetime, timedelta
+ from collections import defaultdict
+ 
++
++# ============================================================================
++# [VERBOSE] هرچه از اینجا تا انتهای فایل با «# [VERBOSE]» علامت‌گذاری شده یا
++# نامش با _VERBOSE_ شروع می‌شود، صرفاً برای لاگ/گزارش اضافه شده است. هیچ خط
++# موجود این فایل ویرایش، حذف یا جابه‌جا نشده — repro_tools/ast_diff_check.py
++# این ادعا را به‌صورت خودکار در برابر combo_10day.py مرجع بررسی می‌کند.
++# ============================================================================
++import hashlib as _VERBOSE_hashlib
++import os as _VERBOSE_os
++
++
++def _VERBOSE_log(msg):
++    print(msg, flush=True)
++
++
++def _VERBOSE_sha256_file(path):
++    h = _VERBOSE_hashlib.sha256()
++    with open(path, "rb") as fh:
++        for chunk in iter(lambda: fh.read(1 << 20), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def _VERBOSE_dump_args(args):
++    _VERBOSE_log("::group::[VERBOSE] آرگومان‌های ورودی ماژول")
++    for k, v in sorted(vars(args).items()):
++        _VERBOSE_log(f"  --{k.replace('_', '-')} = {v!r}")
++    _VERBOSE_log("::endgroup::")
++
++
++def _VERBOSE_export_regime_debug_csv(coin_ohlc_index, out_dir):
++    """[VERBOSE-ONLY] بازتولید مستقلِ همان فرمول compute_market_regime، صرفاً
++    برای گزارش‌گیری (CSV سری رژیم + ستون‌های میانی MA50/MA200/ATR14 به‌ازای
++    هر کوین). این تابع در مسیر محاسبه‌ی رسمی صدا زده نمی‌شود و تاثیری روی
++    CSV/JSONL خروجی رسمی ندارد؛ فقط artifact کمکی برای اعتبارسنجی می‌سازد."""
++    import csv as _csv
++    _VERBOSE_os.makedirs(out_dir, exist_ok=True)
++    written = []
++    for coin, (dates_list, close_arr, high_arr, low_arr) in coin_ohlc_index.items():
++        n = len(close_arr)
++        rows = []
++        for idx in range(n):
++            if idx + 1 < 200:
++                ma50 = ma200 = atr14 = atr_ratio = ma_diff_pct = None
++                regime = "unknown"
++            else:
++                w_close_50 = close_arr[idx - 49: idx + 1]
++                w_close_200 = close_arr[idx - 199: idx + 1]
++                w_high_14 = high_arr[idx - 13: idx + 1]
++                w_low_14 = low_arr[idx - 13: idx + 1]
++                ma50 = float(sum(w_close_50) / 50.0)
++                ma200 = float(sum(w_close_200) / 200.0)
++                atr14 = float(sum(w_high_14 - w_low_14) / 14.0)
++                price = float(close_arr[idx])
++                if price == 0:
++                    regime = "unknown"
++                    atr_ratio = ma_diff_pct = None
++                else:
++                    atr_ratio = atr14 / price
++                    ma_diff_pct = abs(ma50 - ma200) / price
++                    if atr_ratio > 0.02:
++                        regime = "volatile"
++                    elif ma50 > ma200:
++                        regime = "trending_up"
++                    elif ma50 < ma200:
++                        regime = "trending_down"
++                    elif ma_diff_pct < 0.05:
++                        regime = "ranging"
++                    else:
++                        regime = "unknown"
++            d = dates_list[idx]
++            rows.append({
++                "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
++                "close": float(close_arr[idx]),
++                "high": float(high_arr[idx]),
++                "low": float(low_arr[idx]),
++                "ma50": ma50, "ma200": ma200, "atr14": atr14,
++                "atr_ratio": atr_ratio, "ma_diff_pct": ma_diff_pct,
++                "market_regime_for_next_day": regime,
++            })
++        out_path = _VERBOSE_os.path.join(out_dir, f"regime_debug_{coin}.csv")
++        with open(out_path, "w", encoding="utf-8-sig", newline="") as fcsv:
++            fieldnames = ["date", "close", "high", "low", "ma50", "ma200", "atr14",
++                          "atr_ratio", "ma_diff_pct", "market_regime_for_next_day"]
++            w = _csv.DictWriter(fcsv, fieldnames=fieldnames)
++            w.writeheader()
++            w.writerows(rows)
++        file_sha = _VERBOSE_sha256_file(out_path)
++        written.append((coin, out_path, len(rows), file_sha))
++        _VERBOSE_log(f"[VERBOSE][رژیم بازار] {coin}: {len(rows)} ردیف → {out_path} (sha256={file_sha})")
++    return written
++
++
+ import pandas as pd
+ import numpy as np
+ 
+@@ -951,6 +1052,17 @@
+ 
+     # [بهینه‌سازی سرعت] ایندکس یک‌باره‌ی OHLC به‌ازای کوین، برای compute_market_regime
+     coin_ohlc_index = _build_ohlc_coin_index(ohlc_df)
++    # [VERBOSE] فهرست کوین‌های OHLC و تعداد روز کاری هر کدام — برای تطبیق مستقیم
++    # با جدول مبنای «تعداد فایل / روز کاری» کاربر.
++    if coin_ohlc_index:
++        _VERBOSE_log("::group::[VERBOSE] خلاصه OHLC به‌ازای کوین (بعد از ادغام/resample)")
++        for _vc in sorted(coin_ohlc_index.keys()):
++            _vdates, _vclose, _vhigh, _vlow = coin_ohlc_index[_vc]
++            _VERBOSE_log(f"  {_vc}: {len(_vdates)} روز کاری")
++        _VERBOSE_log("::endgroup::")
++        _VERBOSE_regime_csv_dir = _VERBOSE_os.environ.get("VERBOSE_REGIME_CSV_DIR")
++        if _VERBOSE_regime_csv_dir:
++            _VERBOSE_export_regime_debug_csv(coin_ohlc_index, _VERBOSE_regime_csv_dir)
+ 
+     # ---------- مرحله ۰: بررسی حالت skeep ----------
+     use_tp_sl, take_profit, stop_loss = load_skeep_tp_sl(trades_json_path)
+@@ -979,6 +1091,13 @@
+         raise ValueError("فیلد 'trades' باید آرایه JSON باشد.")
+ 
+     print(f"📊 تعداد کل معاملات: {len(trades)}")
++    # [VERBOSE] توزیع نمادها در فایل خام معاملات (قبل از هر فیلتری)
++    _VERBOSE_symbol_counts = {}
++    for _vt in trades:
++        _vsym = _vt.get("symbol") or _vt.get("pair") or _vt.get("coin")
++        _vsym_n = normalize_symbol(_vsym) if _vsym else "(نامشخص)"
++        _VERBOSE_symbol_counts[_vsym_n] = _VERBOSE_symbol_counts.get(_vsym_n, 0) + 1
++    _VERBOSE_log(f"[VERBOSE] توزیع نمادها در فایل خام: {dict(sorted(_VERBOSE_symbol_counts.items()))}")
+ 
+     move_percents = metadata.get("move_percents", []) if metadata else []
+ 
+@@ -994,6 +1113,7 @@
+     # آماده داخل فایل معاملات وجود ندارد؛ اینجا با نرمال‌سازی نمادها، معاملات
+     # هر کوین منفرد از فایل استخراج و به‌عنوان ترکیب ساخته می‌شود.
+     target_coins = [normalize_symbol(c.strip()) for c in target_coin.split('+')]
++    _VERBOSE_log(f"[VERBOSE] کوین‌های هدف (بعد از نرمال‌سازی): {target_coins}")
+ 
+     if session:
+         if session not in SESSION_WINDOWS:
+@@ -1064,9 +1184,49 @@
+ 
+     sess_suffix = f" | سشن={session}" if session else ""
+     print(f"✅ معاملات {target_coin}{sess_suffix} با تاریخ معتبر: {len(trade_list)}")
++    # [VERBOSE] شمارش مستقل و فقط-خواندنیِ مراحل فیلتر (کوین → سشن). این پاس
++    # جدا از حلقه‌ی اصلی بالاست و هیچ مقداری از حلقه‌ی اصلی را نمی‌خواند/تغییر نمی‌دهد.
++    _VERBOSE_after_coin = 0
++    _VERBOSE_after_session = 0
++    for _vt in trades:
++        _vsym = _vt.get("symbol") or _vt.get("pair") or _vt.get("coin")
++        if normalize_symbol(_vsym) not in target_coins:
++            continue
++        _VERBOSE_after_coin += 1
++        _vtime = (_vt.get("entryTime") or _vt.get("entry_time") or
++                  _vt.get("open_time") or _vt.get("time") or _vt.get("timestamp"))
++        if not _vtime:
++            continue
++        if session:
++            _vhour = _trade_hour_utc(_vtime)
++            if _vhour is None or not (sess_start_h <= _vhour < sess_end_h):
++                continue
++        _VERBOSE_after_session += 1
++    _VERBOSE_log(f"[VERBOSE] مراحل فیلتر معاملات → کل={len(trades)}, "
++                 f"بعد از فیلتر کوین={_VERBOSE_after_coin}, "
++                 f"بعد از فیلتر سشن={_VERBOSE_after_session}, "
++                 f"نهایی (با تاریخ معتبر)={len(trade_list)}")
+ 
+     # ---------- مرحله ۳: بارگذاری اخبار ----------
+     news_events = load_news_from_directory(news_dir)
++    # [VERBOSE] تعداد و هش پایدار رویدادهای خبریِ parse‌شده (مستقل از ترتیب بارگذاری)
++    _VERBOSE_news_sorted = sorted(
++        news_events,
++        key=lambda ev: (ev["indicator"], ev["date"].isoformat() if ev["date"] else "", str(ev["actual"]))
++    )
++    _VERBOSE_news_json = json.dumps(
++        [{"date": ev["date"].isoformat() if ev["date"] else None, "indicator": ev["indicator"],
++          "actual": ev["actual"], "forecast": ev["forecast"], "previous": ev["previous"]}
++         for ev in _VERBOSE_news_sorted],
++        ensure_ascii=False, sort_keys=True
++    )
++    _VERBOSE_news_hash = _VERBOSE_hashlib.sha256(_VERBOSE_news_json.encode("utf-8")).hexdigest()
++    _VERBOSE_log(f"[VERBOSE] رویدادهای خبریِ parse‌شده: تعداد={len(news_events)}, "
++                 f"sha256={_VERBOSE_news_hash}")
++    if _VERBOSE_os.environ.get("VERBOSE_FULL_NEWS_DUMP") == "1":
++        _VERBOSE_log("::group::[VERBOSE] دامپ کامل رویدادهای خبریِ parse‌شده (اولین ترکیب این job)")
++        _VERBOSE_log(_VERBOSE_news_json)
++        _VERBOSE_log("::endgroup::")
+     if not news_events:
+         print("⚠️ هیچ رویداد خبری بارگذاری نشد.")
+         _write_empty_csv(output_path)
+@@ -1115,6 +1275,12 @@
+         return
+ 
+     print(f"📊 تعداد دوره‌های تشکیل‌شده: {len(period_groups)}")
++    # [VERBOSE] توزیع تعداد معامله در هر دوره (فقط گزارش)
++    _VERBOSE_sizes = sorted(len(v) for v in period_groups.values())
++    if _VERBOSE_sizes:
++        _vn = len(_VERBOSE_sizes)
++        _VERBOSE_log(f"[VERBOSE] تعداد معامله به‌ازای دوره → کمینه={_VERBOSE_sizes[0]}, "
++                     f"میانه={_VERBOSE_sizes[_vn // 2]}, بیشینه={_VERBOSE_sizes[-1]}")
+ 
+     # [فیکس: رژیم per-trade] period_groups اکنون (trade_date, profit) است؛
+     # period_returns (فقط برای CSV الگوی خبری، بی‌ربط به رژیم) مثل قبل مجموع کل دوره است.
+@@ -1167,6 +1333,8 @@
+                 all_combinations.append((thr, list(subset_tuple)))
+ 
+     total     = len(all_combinations)
++    _VERBOSE_log(f"[VERBOSE] تعداد کل ترکیب‌های آستانه/شاخص تولیدشده: {total} "
++                 f"(indicators={len(INDICATORS)}, thresholds={THRESHOLDS})")
+     start_idx = max(0, chunk_start)
+     end_idx   = min(total, chunk_end) if chunk_end is not None else total
+     selected  = all_combinations[start_idx:end_idx]
+@@ -1223,6 +1391,14 @@
+         # [فیکس: رژیم per-trade] یک‌بار برای این کوین جدول رژیم روزانه
+         # پیش‌محاسبه می‌شود؛ رژیم هر معامله از روی تاریخ خودش لوکاپ می‌شود.
+         regime_index = _precompute_regime_series(coin_ohlc_index)
++        # [VERBOSE] شمارش مستقل دوره‌هایی که با --min-sample-count حذف می‌شوند
++        _VERBOSE_below_min = sum(
++            1 for _vpk in period_status
++            if len(period_groups.get(_vpk, [])) < min_sample_count
++        )
++        _VERBOSE_log(f"[VERBOSE] اعمال --min-sample-count={min_sample_count}: "
++                     f"{_VERBOSE_below_min} از {len(period_status)} دوره حذف می‌شوند "
++                     f"(پیش از تفکیک رژیم بازار).")
+ 
+         records = []
+         for period_key, (status_dict, ret, start_date, end_date) in period_status.items():
+@@ -1285,6 +1461,9 @@
+             for trade_date, profit in dated_profits:
+                 regime = lookup_market_regime(regime_index, first_coin, trade_date)
+                 regime_buckets[regime].append(profit)
++            # [VERBOSE] توزیع رژیم بازار معاملات همین دوره
++            _VERBOSE_log(f"[VERBOSE][دوره {period_key}] توزیع رژیم بازار: "
++                         f"{ {k: len(v) for k, v in regime_buckets.items()} }")
+ 
+             for market_regime, bucket_profits in regime_buckets.items():
+                 if len(bucket_profits) < min_sample_count:
+@@ -1349,7 +1528,14 @@
+                     # سشن لندن» به‌عنوان یک ترکیب یکسان با هم قاطی می‌شوند.
+                     "session": session if session else "none",
+                 })
++                if _VERBOSE_os.environ.get("VERBOSE_LOG_FULL_RECORDS", "1") != "0":
++                    _VERBOSE_log("[VERBOSE][رکورد خروجی] " + json.dumps(records[-1], ensure_ascii=False, default=str))
+ 
++        # [VERBOSE] خلاصه‌ی تعداد رکورد نهایی به‌ازای رژیم بازار، قبل از نوشتن JSONL
++        _VERBOSE_by_regime = {}
++        for _vr in records:
++            _VERBOSE_by_regime[_vr["market_regime"]] = _VERBOSE_by_regime.get(_vr["market_regime"], 0) + 1
++        _VERBOSE_log(f"[VERBOSE] خلاصه رکوردهای این ترکیب به‌ازای رژیم بازار: {_VERBOSE_by_regime}")
+         _write_jsonl(jsonl_out, records)
+ 
+         # [فیکس زمان واقعی] هشدار صریح: چند دوره واقعاً طولانی/کوتاه‌تر از
+@@ -1518,6 +1704,7 @@
+                              "دوره‌های pre بدون فیلتر نگه داشته می‌شوند.")
+ 
+     args = parser.parse_args()
++    _VERBOSE_dump_args(args)  # [VERBOSE]
+ 
+     # [برای تست بدون OHLC] چک اجباری قبلی حذف شد — فقط اگر مسیر داده شود بررسی می‌کنیم.
+     if args.ohlc_dir:
