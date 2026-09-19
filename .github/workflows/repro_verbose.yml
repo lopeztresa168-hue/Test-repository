@@ -24,20 +24,11 @@ permissions:
   contents: read
 
 on:
-  workflow_dispatch:
-    inputs:
-      main_ref:
-        description: "commit/ref مخزن اصلی برای modules/ و data/news (پیش‌فرض: همان commit اجرای مرجع)"
-        required: false
-        default: "8a79f702ab10bf90fd5cbccb55cea8989e8bd479"
-      ohlc_ref:
-        description: "ref مخزن OHLC_REPO (خالی = شاخه پیش‌فرض/HEAD، مثل اجرای مرجع)"
-        required: false
-        default: ""
-      third_repo_ref:
-        description: "ref مخزن سوم (THIRD_REPO) برای trades.enc و strategies/ (خالی = شاخه پیش‌فرض/HEAD)"
-        required: false
-        default: ""
+  workflow_dispatch:   # بدون هیچ ورودی — فقط دکمه‌ی Run
+
+# مقدارهای ثابت (قبلاً ورودی بودند). خالی = HEAD، مثل اجرای مرجع.
+env:
+  MAIN_REF: "8a79f702ab10bf90fd5cbccb55cea8989e8bd479"
 
 concurrency:
   group: repro-verbose-runner
@@ -63,7 +54,7 @@ jobs:
       - name: چک‌اوت ref_repo (main_ref قفل‌شده) — modules/ و data/news/
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.main_ref }}
+          ref: ${{ env.MAIN_REF }}
           path: ref_repo
           fetch-depth: 1
 
@@ -73,7 +64,7 @@ jobs:
           cd ref_repo
           RESOLVED=$(git rev-parse HEAD)
           echo "::group::[VERBOSE][منشأ] main_ref"
-          echo "درخواست‌شده (workflow_dispatch input): ${{ github.event.inputs.main_ref }}"
+          echo "درخواست‌شده (MAIN_REF ثابت): ${{ env.MAIN_REF }}"
           echo "commit sha حل‌شده: $RESOLVED"
           echo "تاریخ commit: $(git show -s --format=%cI HEAD)"
           echo "::endgroup::"
@@ -85,7 +76,7 @@ jobs:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           THIRD_REPO: ${{ secrets.THIRD_REPO }}
         run: |
-          REF_INPUT="${{ github.event.inputs.third_repo_ref }}"
+          REF_INPUT=""
           API_REF="${REF_INPUT:-HEAD}"
           RESOLVED=$(curl -s -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/repos/$THIRD_REPO/commits/$API_REF" | jq -r '.sha // empty')
@@ -163,24 +154,27 @@ jobs:
           FOLDER_HASH_INPUT=/tmp/news_dump/_folder_concat.tmp
           : > "$FOLDER_HASH_INPUT"
           echo "::group::[VERBOSE][اخبار] فهرست فایل‌های data/news (ترتیب sorted(os.listdir))"
-          for f in $(python3 -c "import os; [print(x) for x in sorted(os.listdir('data/news'))]"); do
+          python3 -c "import os,sys; [sys.stdout.write(x+chr(0)) for x in sorted(os.listdir('data/news'))]" > /tmp/news_names.bin
+          while IFS= read -r -d '' f; do
             PATH_F="data/news/$f"
+            [ -f "$PATH_F" ] || { echo "  (نادیده: $f — فایل معمولی نیست)"; continue; }
             SIZE=$(stat -c%s "$PATH_F")
             SHA=$(sha256sum "$PATH_F" | cut -d' ' -f1)
             BLOB_SHA=$(git hash-object "$PATH_F")
             echo "  $f  size=$SIZE  sha256=$SHA  git_blob_sha=$BLOB_SHA"
             cat "$PATH_F" >> "$FOLDER_HASH_INPUT"
             cp "$PATH_F" "/tmp/news_dump/$f"
-          done
+          done < /tmp/news_names.bin
           echo "::endgroup::"
           FOLDER_SHA=$(sha256sum "$FOLDER_HASH_INPUT" | cut -d' ' -f1)
           echo "[VERBOSE][اخبار] sha256 کل پوشه (concat به ترتیب sorted): $FOLDER_SHA"
           echo "::group::[VERBOSE][اخبار] محتوای کامل هر فایل"
-          for f in $(python3 -c "import os; [print(x) for x in sorted(os.listdir('data/news'))]"); do
+          while IFS= read -r -d '' f; do
+            [ -f "data/news/$f" ] || continue
             echo "----- شروع $f -----"
             cat "data/news/$f"
             echo "----- پایان $f -----"
-          done
+          done < /tmp/news_names.bin
           echo "::endgroup::"
           rm -f /tmp/news_dump/_folder_concat.tmp
           tar czf /tmp/news_dump.tar.gz -C /tmp/news_dump .
@@ -213,7 +207,7 @@ jobs:
           echo "📦 git clone (depth=1) از مخزن OHLC ..."
           git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${OHLC_REPO}.git" /tmp/ohlc_clone
           cd /tmp/ohlc_clone
-          REF_INPUT="${{ github.event.inputs.ohlc_ref }}"
+          REF_INPUT=""
           if [ -n "$REF_INPUT" ]; then
             echo "🔀 checkout روی ohlc_ref مشخص‌شده: $REF_INPUT"
             git fetch --depth=1 origin "$REF_INPUT" 2>/dev/null || git fetch origin "$REF_INPUT"
@@ -275,9 +269,9 @@ jobs:
           echo "::group::[VERBOSE][منشأ] trades.enc"
           echo "مخزن: $THIRD_REPO"
           echo "مسیر: $AGG_FILE"
-          echo "ref درخواستی: '${{ github.event.inputs.third_repo_ref }}' (خالی = HEAD)"
+          echo "ref درخواستی: 'HEAD'"
           META=$(curl -s -w '\n%{http_code}' -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/$THIRD_REPO/contents/$AGG_FILE${{ github.event.inputs.third_repo_ref && format('?ref={0}', github.event.inputs.third_repo_ref) || '' }}")
+            "https://api.github.com/repos/$THIRD_REPO/contents/$AGG_FILE")
           HTTP_CODE=$(echo "$META" | tail -n1)
           BODY=$(echo "$META" | sed '$d')
           echo "کد HTTP متادیتای فایل: $HTTP_CODE"
@@ -345,7 +339,7 @@ jobs:
           META_CONTENT=""
           JS_FILE_REMOTE="strategies/${STRAT}.js"
           JS_CONTENT=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
-            "https://api.github.com/repos/$THIRD_REPO/contents/$JS_FILE_REMOTE${{ github.event.inputs.third_repo_ref && format('?ref={0}', github.event.inputs.third_repo_ref) || '' }}" 2>/dev/null || echo "")
+            "https://api.github.com/repos/$THIRD_REPO/contents/$JS_FILE_REMOTE" 2>/dev/null || echo "")
 
           if [ -n "$JS_CONTENT" ] && ! echo "$JS_CONTENT" | grep -q '"message": "Not Found"'; then
             echo "$JS_CONTENT" > /tmp/strat.js
@@ -378,7 +372,7 @@ jobs:
             echo "ℹ️ fallback به strategies/${STRAT}/1.json"
             META_FILE_REMOTE="strategies/${STRAT}/1.json"
             META_CONTENT=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
-              "https://api.github.com/repos/$THIRD_REPO/contents/$META_FILE_REMOTE${{ github.event.inputs.third_repo_ref && format('?ref={0}', github.event.inputs.third_repo_ref) || '' }}" 2>/dev/null || echo "")
+              "https://api.github.com/repos/$THIRD_REPO/contents/$META_FILE_REMOTE" 2>/dev/null || echo "")
             if [ -z "$META_CONTENT" ]; then
               echo "❌ نه .js و نه 1.json یافت شد."
               exit 1
@@ -451,7 +445,7 @@ jobs:
       - name: چک‌اوت ref_repo (main_ref قفل‌شده)
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.main_ref }}
+          ref: ${{ env.MAIN_REF }}
           path: ref_repo
 
       - name: چک‌اوت verbose_repo (ref جاری) — فقط برای repro_tools
@@ -579,7 +573,7 @@ jobs:
       - name: چک‌اوت ref_repo (main_ref قفل‌شده) — فقط data/news مصرف می‌شود
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.main_ref }}
+          ref: ${{ env.MAIN_REF }}
           path: ref_repo
 
       - name: چک‌اوت verbose_repo (ref جاری) — modules_verbose/ و repro_tools/
@@ -756,6 +750,18 @@ jobs:
             mkdir -p "$DIR"
             tar xzf "$f" -C "$DIR"
           done
+
+      - name: توقف اگر job قبلی شکست خورده یا چیزی برای مقایسه نیست
+        run: |
+          echo "prepare=${{ needs.prepare.result }} witness=${{ needs.witness.result }} verbose=${{ needs.verbose.result }}"
+          if [ "${{ needs.prepare.result }}" != "success" ]; then
+            echo "❌ prepare موفق نبود — witness/verbose اجرا نشده‌اند؛ گزارش «۰ مقایسه» بی‌معنی است."
+            exit 1
+          fi
+          if ! ls /tmp/all_witness/*/ >/dev/null 2>&1 || ! ls /tmp/all_verbose/*/ >/dev/null 2>&1; then
+            echo "❌ هیچ خروجی witness/verbose پیدا نشد."
+            exit 1
+          fi
 
       - name: مقایسه بایت‌به‌بایت witness در برابر verbose
         run: |
