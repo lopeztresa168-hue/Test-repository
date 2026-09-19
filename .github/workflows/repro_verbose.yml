@@ -335,11 +335,52 @@ jobs:
           STRAT: ${{ steps.queue.outputs.strat }}
         run: |
           set -e
+          # دقیقاً مثل ورکفلوی مرجع: اگر فایل رمزگشایی‌شده خودش metadata دارد، هیچ‌چیز از strategies/ خوانده نمی‌شود
+          HAS_METADATA=$(node -e "
+            const fs=require('fs');
+            const data=JSON.parse(fs.readFileSync('/tmp/all_trades_raw.json','utf8'));
+            const hasMeta=data && typeof data==='object' && !Array.isArray(data)
+                          && 'metadata' in data && data.metadata !== null;
+            console.log(hasMeta?'true':'false');
+          " 2>/dev/null || echo "false")
+          echo "[VERBOSE][متادیتا] HAS_METADATA در فایل رمزگشایی‌شده: $HAS_METADATA"
+          if [ "$HAS_METADATA" = "true" ]; then
+            jq -c '.metadata' /tmp/all_trades_raw.json > /tmp/meta.json
+            echo "✅ فرمت جدید با متادیتا — منبع: خود فایل trades.enc (بدون خواندن strategies/)"
+            echo "[VERBOSE][متادیتا] $(cat /tmp/meta.json)"
+            echo "source=embedded" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           META_SOURCE=""
           META_CONTENT=""
+          API="https://api.github.com/repos/$THIRD_REPO"
+          UNTIL=$(git -C ref_repo show -s --format=%cI HEAD)
+
+          # محتوای خام یک فایل در یک ref (خالی = HEAD)؛ فقط اگر HTTP 200 باشد چاپ می‌کند
+          fetch_raw() {
+            local url="$API/contents/$1"; [ -n "$2" ] && url="$url?ref=$2"
+            local code
+            code=$(curl -s -o /tmp/_fetch.out -w '%{http_code}' -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" "$url")
+            if [ "$code" = "200" ]; then cat /tmp/_fetch.out; return 0; fi
+            return 1
+          }
+          # اول HEAD؛ اگر فایل دیگر در HEAD نیست (مثلاً بعد از اجرای مرجع پاک/جابه‌جا شده)،
+          # آخرین نسخه‌ی آن تا زمان commit مرجع (main_ref) از تاریخچه‌ی THIRD_REPO خوانده می‌شود.
+          resolve_file() {
+            local path="$1" out ref
+            if out=$(fetch_raw "$path" ""); then echo "[متادیتا] $path ← HEAD" >&2; printf '%s' "$out"; return 0; fi
+            echo "[متادیتا] $path در HEAD نیست (404)؛ جستجو در تاریخچه تا $UNTIL" >&2
+            local hist
+            hist=$(curl -s -G -H "Authorization: token $GH_TOKEN" "$API/commits" \
+              --data-urlencode "path=$path" --data-urlencode "until=$UNTIL" --data-urlencode "per_page=1")
+            for ref in $(echo "$hist" | jq -r 'if type=="array" and length>0 then .[0].sha, (.[0].parents[0].sha // empty) else empty end'); do
+              if out=$(fetch_raw "$path" "$ref"); then echo "[متادیتا] $path ← commit $ref" >&2; printf '%s' "$out"; return 0; fi
+            done
+            return 1
+          }
+
           JS_FILE_REMOTE="strategies/${STRAT}.js"
-          JS_CONTENT=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
-            "https://api.github.com/repos/$THIRD_REPO/contents/$JS_FILE_REMOTE" 2>/dev/null || echo "")
+          JS_CONTENT=$(resolve_file "$JS_FILE_REMOTE" || true)
 
           if [ -n "$JS_CONTENT" ] && ! echo "$JS_CONTENT" | grep -q '"message": "Not Found"'; then
             echo "$JS_CONTENT" > /tmp/strat.js
@@ -371,10 +412,10 @@ jobs:
           if [ -z "$META_CONTENT" ]; then
             echo "ℹ️ fallback به strategies/${STRAT}/1.json"
             META_FILE_REMOTE="strategies/${STRAT}/1.json"
-            META_CONTENT=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3.raw" \
-              "https://api.github.com/repos/$THIRD_REPO/contents/$META_FILE_REMOTE" 2>/dev/null || echo "")
+            META_CONTENT=$(resolve_file "$META_FILE_REMOTE" || true)
             if [ -z "$META_CONTENT" ]; then
-              echo "❌ نه .js و نه 1.json یافت شد."
+              echo "❌ نه .js و نه 1.json یافت شد (نه در HEAD و نه در تاریخچه). نام‌های موجود در strategies/ شبیه این strat:"
+              curl -s -H "Authorization: token $GH_TOKEN" "$API/contents/strategies" | jq -r '.[]?.name' | grep -F "${STRAT%%_*}" || echo "  (هیچ موردی پیدا نشد)"
               exit 1
             fi
             META_SOURCE="1.json"
@@ -391,7 +432,13 @@ jobs:
           echo "source=$META_SOURCE" >> "$GITHUB_OUTPUT"
 
       - name: تزریق متادیتا در فایل معاملات — دقیقاً مثل ورکفلوی مرجع
+        env:
+          META_SRC: ${{ steps.meta.outputs.source }}
         run: |
+          if [ "$META_SRC" = "embedded" ]; then
+            cp /tmp/all_trades_raw.json /tmp/all_trades_injected.json
+            echo "ℹ️ متادیتا از قبل داخل فایل بود — فایل بدون تغییر استفاده می‌شود (مثل مرجع)."
+          else
           node -e "
             const fs=require('fs');
             const trades=JSON.parse(fs.readFileSync('/tmp/all_trades_raw.json','utf8'));
@@ -409,6 +456,7 @@ jobs:
               }
             }));
           "
+          fi
           SIZE=$(stat -c%s /tmp/all_trades_injected.json)
           SHA=$(sha256sum /tmp/all_trades_injected.json | cut -d' ' -f1)
           echo "[VERBOSE][trades بعد از تزریق متادیتا] حجم=$SIZE بایت، sha256=$SHA"
