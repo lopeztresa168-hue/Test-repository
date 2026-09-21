@@ -37,5 +37,44 @@
       "batch_outputs/chunk_2/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/ETHUSDT_PAXGUSDT_SOLUSDT/CPI_post_5d_simple_hybrid.jsonl"
     ],
     "timestamp": "2026-09-21T19:42:32.514517Z"
+  },
+  {
+    "chunk_index": "18",
+    "run_id": "35645306333",
+    "done_count": 15,
+    "failed_count": 0,
+    "files": [
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_5d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_post_10d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_5d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_30d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_post_5d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CoreCPI_post_30d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_pre_5d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_post_15d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CoreCPI_post_15d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_30d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_15d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_10d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_15d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CoreCPI_post_10d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/combo_10day_patterns/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_10d_simple_hybrid.csv",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CoreCPI_post_15d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CoreCPI_post_10d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_pre_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_post_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_15d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_10d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CoreCPI_post_30d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_post_15d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_30d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/PPI_post_15d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_30d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/FOMC_post_10d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_18/signatures/combo_10day/B4Ic14-30-57_TLpP5-mT3-pR0005_BrT012_LadLine_BufOff_1h/BTCUSDT_ETHUSDT/CorePPI_post_10d_simple_hybrid.jsonl"
+    ],
+    "timestamp": "2026-09-21T19:43:27.175213Z"
   }
 ]
