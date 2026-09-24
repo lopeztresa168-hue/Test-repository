@@ -871,8 +871,9 @@ def process_analysis(trades_json_path, news_dir, target_coin,
         records = []
         for ym, (status_dict, ret, start_date, end_date) in month_status.items():
             dated_profits = monthly_profits[ym]
-            if len(dated_profits) < min_sample_count:
-                continue
+            # [فیکس: به‌جای حذف کامل ماه‌های کم‌نمونه، همه‌ی ماه‌ها نگه داشته
+            # می‌شوند و فقط با فلگ low_sample علامت‌گذاری می‌شوند — چون در دنیای
+            # واقعی از قبل معلوم نیست یک ماه چند معامله خواهد داشت.
 
             sorted_dates, sorted_events = sorted_event_index
             events_in_range = _events_in_range_fast(sorted_dates, sorted_events, start_date, end_date)
@@ -897,10 +898,11 @@ def process_analysis(trades_json_path, news_dir, target_coin,
                 regime_buckets[regime].append(profit)
 
             for market_regime, bucket_profits in regime_buckets.items():
-                if len(bucket_profits) < min_sample_count:
-                    continue
                 total_return  = sum(bucket_profits)
                 trade_count   = len(bucket_profits)
+                # [فیکس] به‌جای continue (حذف کامل)، فقط علامت می‌زنیم که این
+                # باکت کم‌نمونه است؛ مصرف‌کننده‌ی پایین‌دستی خودش تصمیم می‌گیرد.
+                low_sample    = trade_count < min_sample_count
                 avg_trade_ret = (total_return / trade_count) if trade_count else 0.0
                 avg_daily_ret = (avg_trade_ret / period_len) if period_len else 0.0
 
@@ -944,6 +946,10 @@ def process_analysis(trades_json_path, news_dir, target_coin,
                     # لحاظ شود، وگرنه «استراتژی A همیشه» و «استراتژی A فقط
                     # سشن لندن» به‌عنوان یک ترکیب یکسان با هم قاطی می‌شوند.
                     "session": session if session else "none",
+                    # [فیکس: نگه‌داشتن ماه‌های کم‌نمونه] True یعنی این باکت
+                    # کمتر از --min-sample-count معامله دارد؛ دیگر حذف نمی‌شود،
+                    # فقط علامت می‌خورد.
+                    "low_sample": low_sample,
                 })
 
         _write_jsonl(jsonl_out, records)
@@ -1083,7 +1089,10 @@ def main():
     parser.add_argument("--jsonl-out", default=None,
                         help="مسیر خروجی JSONL (امضاهای per-month). اختیاری.")
     parser.add_argument("--min-sample-count", type=int, default=1,
-                        help="حداقل تعداد معامله در هر ماه برای ثبت در JSONL.")
+                        help="حداقل تعداد معامله در هر باکت (ماه+رژیم) برای اینکه "
+                             "low_sample=False شود. [فیکس] دیگر باعث حذف رکورد از "
+                             "JSONL نمی‌شود؛ همه‌ی باکت‌ها (حتی زیر این حد) نوشته "
+                             "می‌شوند و فقط فیلد low_sample علامت می‌خورد.")
 
     args = parser.parse_args()
 

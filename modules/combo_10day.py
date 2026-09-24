@@ -762,18 +762,65 @@ def get_period_key_from_date(date, interval, news_events, model='simple_hybrid',
     return f"{start.isoformat()}_{end.isoformat()}"
 
 
+def compute_anchor_status(direction, indicator_name, start_date, end_date,
+                           event_by_indicator_date):
+    """[فیکس ۳] status فقط برای شاخص لنگرِ خودِ interval محاسبه می‌شود (نه هر
+    ۶ شاخص خبری) — چون وقتی ترکیب صراحتاً روی یک شاخص (مثلاً PPI) لنگر شده،
+    نظردادن بر اساس شاخص‌های دیگر بی‌معنی است.
+
+    - post: رویداد لنگر دقیقاً یک روز قبل از start_date منتشر شده — actual
+      آن در لحظه‌ی شروع دوره کاملاً در دسترس است → diff = actual - forecast.
+    - pre: رویداد لنگر دقیقاً یک روز بعد از end_date منتشر می‌شود — actual
+      آن هنوز وجود ندارد (دقیقاً همان چیزی که «pre» یعنی)؛ تنها چیزی که از
+      قبل منتشر شده forecast است → diff = forecast - previous (یعنی بازار
+      برای این انتشار چه انتظاری نسبت به عدد دفعه‌ی قبل دارد — تنها
+      اطلاعاتی که واقعاً پیش از پایان دوره در دسترس است، بدون هیچ actual).
+    """
+    if indicator_name is None:
+        return None
+    if direction == 'post':
+        anchor_date = start_date - timedelta(days=1)
+    else:  # pre
+        anchor_date = end_date + timedelta(days=1)
+
+    anchor_event = event_by_indicator_date.get((indicator_name, anchor_date))
+    if anchor_event is None:
+        return None
+
+    if direction == 'post':
+        actual, forecast = anchor_event.get("actual"), anchor_event.get("forecast")
+        if actual is None or forecast is None:
+            return {thr: 'Neutral' for thr in THRESHOLDS}
+        diff = actual - forecast
+    else:
+        forecast, previous = anchor_event.get("forecast"), anchor_event.get("previous")
+        if forecast is None or previous is None:
+            return {thr: 'Neutral' for thr in THRESHOLDS}
+        diff = forecast - previous
+
+    status = {}
+    for thr in THRESHOLDS:
+        if diff > thr:
+            status[thr] = 'Bad'
+        elif diff < -thr:
+            status[thr] = 'Good'
+        else:
+            status[thr] = 'Neutral'
+    return status
+
+
 def compute_indicator_status_for_period(start_date, end_date, news_events,
                                          sorted_index=None, allow_actual=True):
     """وضعیت Good/Bad/Neutral هر شاخص را برای یک دوره حساب می‌کند.
 
-    [پاک‌سازی آینده‌نگری - مسیر CSV] این تابع قبلاً بدون توجه به جهت دوره
-    (pre/post) از actual تمام رویدادهای داخل بازه استفاده می‌کرد. برای
-    دوره‌های «pre» (مثل FOMC_pre_5d)، actual خبرها در لحظه‌ی شروع معامله
-    هنوز در دسترس نیست، پس فراخواننده باید allow_actual=False پاس بدهد؛
-    در این حالت هیچ actual ای خوانده نمی‌شود و status هر شاخص None
-    برمی‌گردد (یعنی معادل نبود خبر) — به‌جای ساختن الگوی Good/Bad/Neutral
-    ساختگی از داده‌ای که هنوز رخ نداده. برای «post» و «fixed»، actual در
-    لحظه‌ی شروع دوره از قبل منتشر شده و allow_actual=True مجاز است."""
+    [فیکس ۲] پارامتر allow_actual دیگر با False فراخوانی نمی‌شود. جلوگیری از
+    آینده‌نگری برای دوره‌های «pre» از قبل توسط خودِ محدودهٔ [start_date,
+    end_date] تضمین شده: get_period_key_from_date همیشه end_date را دقیقاً
+    یک روز قبل از رویداد لنگر می‌سازد، پس رویداد لنگر هیچ‌وقت داخل این بازه
+    قرار نمی‌گیرد و توسط events_in_range فیلتر می‌شود. رویدادهای دیگری که
+    داخل همان بازهٔ pre منتشر شده‌اند، actualشان در لحظهٔ پایان دوره واقعاً
+    موجود است — پارامتر همچنان برای سازگاری با فراخوانی‌های قدیمی نگه
+    داشته شده، ولی هیچ‌جا دیگر False پاس داده نمی‌شود."""
     if not allow_actual:
         return {ind: None for ind in INDICATORS}
 
@@ -1120,15 +1167,31 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
     # period_returns (فقط برای CSV الگوی خبری، بی‌ربط به رژیم) مثل قبل مجموع کل دوره است.
     period_returns = {period: sum(p for _, p in profits) for period, profits in period_groups.items()}
 
-    # [پاک‌سازی آینده‌نگری - مسیر CSV] جهت این اجرا (pre/post/fixed) یک‌بار
-    # از interval پارس می‌شود. برای دوره‌های «pre»، actual هیچ رویدادی —
-    # نه فقط خبر لنگر — نباید وارد محاسبه‌ی status شود، چون در لحظه‌ی شروع
-    # معامله (قبل از انتشار خبر) هنوز رخ نداده است.
-    _parsed_iv_for_status = parse_interval(interval)
-    _run_direction = _parsed_iv_for_status[1] if _parsed_iv_for_status else None
-    allow_actual_in_status = (_run_direction != 'pre')
-    if not allow_actual_in_status:
-        print("ℹ️ interval از نوع pre است → actual در محاسبه‌ی وضعیت خبری CSV استفاده نمی‌شود (آینده‌نگری حذف شد).")
+    # [فیکس ۲: حذف بلاک‌کردن غیرلازم actual برای pre] نسخهٔ قبلی اینجا برای
+    # هر interval از نوع «pre» به‌طور کامل allow_actual=False می‌فرستاد و
+    # باعث می‌شد status هر شاخص، برای *هر* دوره، همیشه None برگردد — یعنی
+    # کل CSV هر interval «pre» تضمینی خالی می‌شد.
+    # این محدودیت لازم نبود: get_period_key_from_date برای پره همیشه
+    # end_date = event_date - 1 می‌سازد، پس رویداد لنگر خودش هیچ‌وقت داخل
+    # [start_date, end_date] نمی‌افتد و در ادامه توسط events_in_range
+    # (start_date <= ev.date <= end_date) فیلتر می‌شود — یعنی آینده‌نگریِ
+    # واقعی از قبل توسط همین بازهٔ تاریخ مسدود بود. رویدادهای دیگری که
+    # *داخل* همان بازهٔ pre منتشر شده‌اند، actualشان در لحظهٔ پایان دوره
+    # کاملاً موجود و قابل‌استفاده است؛ پس دیگر allow_actual پاس داده نمی‌شود
+    # و compute_indicator_status_for_period مثل post/fixed عمل می‌کند.
+
+    # [فیکس ۳: محدود به شاخص لنگر] وقتی interval صراحتاً به یک شاخص خاص
+    # لنگر شده (مثلاً PPI_pre_5d → PPI)، دیگر معنی ندارد status شاخص‌های
+    # دیگر (FOMC, CPI و...) هم محاسبه/استفاده شود — ترکیب از قبل توسط
+    # build_all_queues.py دقیقاً برای همان یک شاخص ساخته شده.
+    _parsed_iv = parse_interval(interval)
+    if _parsed_iv and _parsed_iv[0] != 'fixed':
+        _anchor_indicator_key  = _parsed_iv[0]
+        _anchor_direction      = _parsed_iv[1]
+        _anchor_indicator_name = INTERVAL_TO_INDICATOR.get(_anchor_indicator_key)
+    else:
+        _anchor_indicator_name = None
+        _anchor_direction      = None
 
     # ---------- مرحله ۵: محاسبه وضعیت خبری هر دوره ----------
     period_status = {}
@@ -1142,10 +1205,18 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
             end_date   = datetime.strptime(end_str,   "%Y-%m-%d").date()
         except ValueError:
             continue
-        status = compute_indicator_status_for_period(
-            start_date, end_date, news_events, sorted_index=sorted_event_index,
-            allow_actual=allow_actual_in_status
-        )
+        if _anchor_indicator_name is not None:
+            # [فیکس ۳] فقط status شاخص لنگر (طبق جهت pre/post) محاسبه می‌شود.
+            anchor_status = compute_anchor_status(
+                _anchor_direction, _anchor_indicator_name, start_date, end_date,
+                event_by_indicator_date,
+            )
+            status = {_anchor_indicator_name: anchor_status} if anchor_status is not None else {}
+        else:
+            # حالت fixed: شاخص لنگر مشخصی وجود ندارد، رفتار قبلی حفظ می‌شود.
+            status = compute_indicator_status_for_period(
+                start_date, end_date, news_events, sorted_index=sorted_event_index
+            )
         period_status[period_key] = (status, ret, start_date, end_date)
 
     if not period_status:
@@ -1159,12 +1230,20 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
 
     # ---------- مرحله ۶: تولید ترکیب‌های شاخص/آستانه و CSV ----------
     all_combinations = []
-    # [فیکس: محدود به حداکثر دوشاخصی] r=1 (همه‌ی شاخص‌های تکی) و r=2 (همه‌ی
-    # ترکیبات دوبه‌دو) — ترکیبات ۳تایی به بالا دیگر اصلاً تولید نمی‌شوند.
-    for r in range(1, 3):
-        for subset_tuple in itertools.combinations(INDICATORS, r):
-            for thr in THRESHOLDS:
-                all_combinations.append((thr, list(subset_tuple)))
+    if _anchor_indicator_name is not None:
+        # [فیکس ۳] فقط شاخص لنگر خودِ interval — نه ترکیب دوتایی با شاخص‌های
+        # دیگر، چون آن شاخص‌ها اصلاً برای این interval محاسبه نشده‌اند
+        # (status[سایر شاخص‌ها] دیگر اصلاً در دیکشنری وجود ندارد).
+        for thr in THRESHOLDS:
+            all_combinations.append((thr, [_anchor_indicator_name]))
+    else:
+        # [فیکس: محدود به حداکثر دوشاخصی] حالت fixed: شاخص لنگر مشخصی
+        # وجود ندارد، پس رفتار قبلی (ترکیبات تکی و دوتایی از هر ۶ شاخص)
+        # حفظ می‌شود.
+        for r in range(1, 3):
+            for subset_tuple in itertools.combinations(INDICATORS, r):
+                for thr in THRESHOLDS:
+                    all_combinations.append((thr, list(subset_tuple)))
 
     total     = len(all_combinations)
     start_idx = max(0, chunk_start)
@@ -1227,8 +1306,11 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
         records = []
         for period_key, (status_dict, ret, start_date, end_date) in period_status.items():
             dated_profits = period_groups.get(period_key, [])
-            if len(dated_profits) < min_sample_count:
-                continue
+            # [فیکس: به‌جای حذف کامل دوره‌های کم‌نمونه، همه‌ی دوره‌ها نگه داشته
+            # می‌شوند و فقط با فلگ low_sample علامت‌گذاری می‌شوند — چون در دنیای
+            # واقعی از قبل معلوم نیست یک دوره چند معامله خواهد داشت؛ حذف کامل
+            # این دوره‌ها از JSONL باعث می‌شد نرخ موفقیت محاسبه‌شده فقط روی
+            # زیرمجموعه‌ای از آینده حساب شود که از قبل قابل‌انتخاب نیست.
 
             sorted_dates, sorted_events = sorted_event_index
             events_in_range = _events_in_range_fast(sorted_dates, sorted_events, start_date, end_date)
@@ -1287,10 +1369,12 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
                 regime_buckets[regime].append(profit)
 
             for market_regime, bucket_profits in regime_buckets.items():
-                if len(bucket_profits) < min_sample_count:
-                    continue
                 total_return  = sum(bucket_profits)
                 trade_count   = len(bucket_profits)
+                # [فیکس] به‌جای continue (حذف کامل)، فقط علامت می‌زنیم که این
+                # باکت کم‌نمونه است؛ مصرف‌کننده‌ی پایین‌دستی (golden.py،
+                # تحلیل شما) خودش تصمیم می‌گیرد این رکوردها را حساب کند یا نه.
+                low_sample    = trade_count < min_sample_count
                 avg_trade_ret = (total_return / trade_count) if trade_count else 0.0
 
                 # [فیکس زمان واقعی] این باکت مشخص (بعد از تفکیک رژیم) تاریخ‌های
@@ -1348,6 +1432,11 @@ def process_analysis(trades_json_path, news_dir, interval, target_coin,
                     # لحاظ شود، وگرنه «استراتژی A همیشه» و «استراتژی A فقط
                     # سشن لندن» به‌عنوان یک ترکیب یکسان با هم قاطی می‌شوند.
                     "session": session if session else "none",
+                    # [فیکس: نگه‌داشتن دوره‌های کم‌نمونه] True یعنی این باکت
+                    # کمتر از --min-sample-count معامله دارد. دیگر حذف نمی‌شود؛
+                    # فقط علامت می‌خورد تا بشود هم آمار «فقط باکت‌های پرنمونه»
+                    # و هم آمار «همه‌ی باکت‌ها شامل تک‌معامله‌ای‌ها» را جدا دید.
+                    "low_sample": low_sample,
                 })
 
         _write_jsonl(jsonl_out, records)
@@ -1504,7 +1593,10 @@ def main():
     parser.add_argument("--jsonl-out", default=None,
                         help="مسیر خروجی JSONL (امضاهای per-period). اختیاری.")
     parser.add_argument("--min-sample-count", type=int, default=1,
-                        help="حداقل تعداد معامله در هر دوره برای ثبت در JSONL.")
+                        help="حداقل تعداد معامله در هر باکت (دوره+رژیم) برای اینکه "
+                             "low_sample=False شود. [فیکس] دیگر باعث حذف رکورد از "
+                             "JSONL نمی‌شود؛ همه‌ی باکت‌ها (حتی زیر این حد) نوشته "
+                             "می‌شوند و فقط فیلد low_sample علامت می‌خورد.")
 
     # [پاک‌سازی آینده‌نگری] فیلترهای صریح و تک‌شاخصی، جایگزین dominant_indicator
     parser.add_argument("--min-importance", type=float, default=None,
