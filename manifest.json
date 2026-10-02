@@ -380,5 +380,30 @@
       "batch_outputs/chunk_9/combo_10day_patterns/B4DvgBull_LadFib_BufOn_30m/ETHUSDT/CoreCPI_post_30d_simple_hybrid_london_ny_overlap.csv"
     ],
     "timestamp": "2026-10-02T16:08:56.139486Z"
+  },
+  {
+    "chunk_index": "13",
+    "run_id": "37030922516",
+    "done_count": 8,
+    "failed_count": 0,
+    "files": [
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/PPI_post_10d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/PPI_post_5d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_post_30d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_5d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_15d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_10d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/PPI_post_15d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_30d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_10d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_post_30d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/PPI_post_15d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/PPI_post_5d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_15d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/PPI_post_10d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_5d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CoreCPI_post_30d_simple_hybrid_london_ny_overlap.csv"
+    ],
+    "timestamp": "2026-10-02T16:08:58.331949Z"
   }
 ]
