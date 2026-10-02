@@ -69,5 +69,28 @@
       "batch_outputs/chunk_2/combo_10day_patterns/B4DvgBull_Default_30m/ETHUSDT/CorePPI_post_15d_simple_hybrid_london_ny_overlap.csv"
     ],
     "timestamp": "2026-10-02T16:06:53.265015Z"
+  },
+  {
+    "chunk_index": "4",
+    "run_id": "37030922516",
+    "done_count": 7,
+    "failed_count": 0,
+    "files": [
+      "batch_outputs/chunk_4/signatures/combo_10day/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_10d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_4/signatures/combo_10day/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_30d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_4/signatures/combo_10day/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_15d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_4/signatures/combo_10day/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/CPI_post_15d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_4/signatures/combo_10day/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/CPI_post_10d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_4/signatures/combo_10day/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/CPI_post_5d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_4/signatures/combo_10day/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_5d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_4/combo_10day_patterns/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/CPI_post_5d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_4/combo_10day_patterns/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_30d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_4/combo_10day_patterns/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_10d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_4/combo_10day_patterns/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/CPI_post_15d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_4/combo_10day_patterns/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_15d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_4/combo_10day_patterns/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/fixed_5d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_4/combo_10day_patterns/B4DvgBull_LadFib_BufOff_30m/ETHUSDT/CPI_post_10d_simple_hybrid_london_ny_overlap.csv"
+    ],
+    "timestamp": "2026-10-02T16:06:56.410024Z"
   }
 ]
