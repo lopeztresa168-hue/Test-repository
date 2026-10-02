@@ -255,5 +255,30 @@
       "batch_outputs/chunk_0/combo_10day_patterns/B4DvgBull_Default_30m/ETHUSDT/CPI_post_10d_simple_hybrid_london_ny_overlap.csv"
     ],
     "timestamp": "2026-10-02T16:08:19.146327Z"
+  },
+  {
+    "chunk_index": "15",
+    "run_id": "37030922516",
+    "done_count": 8,
+    "failed_count": 0,
+    "files": [
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_10d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/FOMC_post_15d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/FOMC_post_10d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_30d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/FOMC_post_30d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_15d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_5d_simple_hybrid_london_ny_overlap.jsonl",
+      "batch_outputs/chunk_15/signatures/combo_10day/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/fixed_5d_simple_hybrid_newyork.jsonl",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/FOMC_post_30d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/FOMC_post_10d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/fixed_5d_simple_hybrid_newyork.csv",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_30d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/FOMC_post_15d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_10d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_15d_simple_hybrid_london_ny_overlap.csv",
+      "batch_outputs/chunk_15/combo_10day_patterns/B4Ic14-30-57+Chk_LadLine_BufOn_30m/ETHUSDT/CPI_y_y_post_5d_simple_hybrid_london_ny_overlap.csv"
+    ],
+    "timestamp": "2026-10-02T16:08:36.459991Z"
   }
 ]
