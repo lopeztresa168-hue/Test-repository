@@ -441,6 +441,26 @@ def _trade_datetime(t):
         return None
 
 
+# فقط کلیدهای «ورود». عمداً exitTime/closeTime اینجا نیست؛ _trade_datetime
+# اول closeTime/exitTime را برمی‌دارد (ترتیب _TIME_FIELD_CANDIDATES) و باعث می‌شد
+# فیلتر سشن روی ساعت «خروج» اعمال شود، نه ورود.
+_ENTRY_TIME_KEYS = [
+    "entryTime", "entry_time", "entryDate", "entry_date",
+    "openTime", "open_time", "openedAt", "opened_at", "openDate", "open_date",
+]
+
+
+def _trade_entry_datetime(t):
+    """زمان «ورود» معامله را برمی‌گرداند (هرگز به زمان خروج برنمی‌گردد)."""
+    for key in _ENTRY_TIME_KEYS:
+        v = t.get(key)
+        if v:
+            # _trade_datetime فقط اولین کلید موجود را می‌خواند؛ دیکشنری فقط
+            # با همین یک کلید ساخته می‌شود تا exitTime دخالت نکند.
+            return _trade_datetime({"entryTime": v})
+    return None
+
+
 def filter_trades_by_session(trades, session_key):
     """معاملاتی را برمی‌گرداند که ساعت ورود (entryTime، UTC) داخل بازه‌ی
     سشن معاملاتی مشخص‌شده باشد. session_key باید یکی از کلیدهای
@@ -448,7 +468,7 @@ def filter_trades_by_session(trades, session_key):
     start_h, end_h = SESSION_WINDOWS[session_key]
     out = []
     for t in trades:
-        dt = _trade_datetime(t)
+        dt = _trade_entry_datetime(t)
         if dt is None:
             continue
         if start_h <= dt.hour < end_h:
