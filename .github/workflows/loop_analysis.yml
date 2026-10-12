@@ -152,7 +152,8 @@ jobs:
             "https://x-access-token:${GH_TOKEN}@github.com/${OHLC_REPO}.git" /tmp/ohlc_repo
           cd /tmp/ohlc_repo
           git sparse-checkout set data/All_Coins_Combined
-          COUNT=$(find data/All_Coins_Combined -maxdepth 1 -name "*.csv" | wc -l)
+          # تعداد دقیق نتایج هر استراتژی = 1314 داده + 6 نتیجه‌ی ژوئن (ثابت، طبق درخواست)
+          COUNT=1320
           echo "📊 تعداد فایل‌های مورد انتظار (از OHLC_REPO): $COUNT عدد"
           echo "required_file_count=$COUNT" >> "$GITHUB_OUTPUT"
 
@@ -190,7 +191,7 @@ jobs:
 
             FULL_LIST=$(printf '%s\n' "$FULL_LIST" | while IFS= read -r NAME; do
               [ -z "$NAME" ] && continue
-              BASE_NAME=$(echo "$NAME" | sed 's/_5m$//;s/_15m$//;s/_30m$//;s/_1h$//')
+              BASE_NAME=$(echo "$NAME" | sed 's/_1m$//;s/_5m$//;s/_15m$//;s/_30m$//;s/_1h$//')
               if grep -qxF "$NAME" "$SKIP_FILE" 2>/dev/null || grep -qxF "$BASE_NAME" "$SKIP_FILE" 2>/dev/null; then
                 continue
               fi
@@ -320,7 +321,7 @@ jobs:
               echo "=============================================="
               echo "   📊 پردازش استراتژی: $STRAT (چانک $CHUNK_INDEX)"
               echo "=============================================="
-              BASE_STRAT=$(echo "$STRAT" | sed 's/_5m$//;s/_15m$//;s/_30m$//;s/_1h$//')
+              BASE_STRAT=$(echo "$STRAT" | sed 's/_1m$//;s/_5m$//;s/_15m$//;s/_30m$//;s/_1h$//')
               if [ "$BASE_STRAT" = "$STRAT" ]; then
                 echo "   ℹ️ پسوند تایم‌فریم یافت نشد. BASE_STRAT = STRAT = $STRAT"
               else
