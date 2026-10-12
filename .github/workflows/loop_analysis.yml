@@ -670,6 +670,7 @@ jobs:
         with:
           name: agg-chunk-${{ matrix.chunk_index }}
           path: /tmp/chunk_out
+          include-hidden-files: true   # بدون این، فایل‌های نقطه‌دار (.metadata_generated) در artifact نمی‌آیند
           retention-days: 1
           if-no-files-found: warn
 
