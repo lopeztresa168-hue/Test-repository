@@ -370,12 +370,17 @@ jobs:
                     let mm=js.match(/movePercent\\s*[:=]\\s*\\[(.*?)\\]/s);
                     if(mm){let n=mm[1].match(/[\\d.]+/g);if(n){mp=n.map(Number);mpSource='movePercent_direct';}}
                   }
+                  let stop=null;
                   let sl=js.match(/stopLossInitial\\s*[:=]\\s*(-?[\\d.]+)/);
-                  if(!sl){
-                    console.error('__NO_STOP_LOSS_INITIAL__');
-                    process.exit(1);
+                  if(sl){
+                    stop=parseFloat(sl[1]);
+                  } else {
+                    let fm=js.match(/stopLoss\\s*:\\s*close\\s*\\*\\s*([\\d.]+)/);
+                    if(fm){ stop=parseFloat(((1-parseFloat(fm[1]))*100).toFixed(6)); }
                   }
-                  let stop=parseFloat(sl[1]);
+                  if(stop===null){
+                    console.error('حد ضرر اولیه ثابت در .js یافت نشد (احتمالا حد ضرر پویا) -> stop_loss_initial = null');
+                  }
                   let max=mp.length?mp[mp.length-1]:null;
                   console.error('منبع move_percents: ' + mpSource);
                   console.error('move_percents استخراج‌شده (' + mp.length + ' عنصر): ' + JSON.stringify(mp));
@@ -385,13 +390,8 @@ jobs:
                 JS_META_EXIT=$?
 
                 if [ $JS_META_EXIT -ne 0 ]; then
-                  if grep -q "__NO_STOP_LOSS_INITIAL__" /tmp/prep/js_meta.log 2>/dev/null; then
-                    echo "❌ stopLossInitial در فایل $JS_FILE_REMOTE یافت نشد. هیچ مقدار پیش‌فرضی استفاده نمی‌شود."
-                    SKIP_CHUNK=true
-                  else
-                    echo "⚠️ خطا در پردازش $JS_FILE_REMOTE: $(cat /tmp/prep/js_meta.log)"
-                    META_CONTENT=""
-                  fi
+                  echo "⚠️ خطا در پردازش $JS_FILE_REMOTE: $(cat /tmp/prep/js_meta.log)"
+                  META_CONTENT=""
                 else
                   cat /tmp/prep/js_meta.log >&2
                   META_SOURCE=".js"
@@ -407,9 +407,9 @@ jobs:
                   echo "❌ نه فایل $JS_FILE_REMOTE و نه فایل $META_FILE_REMOTE یافت نشد."
                   SKIP_CHUNK=true
                 else
-                  HAS_SL=$(echo "$META_CONTENT" | jq 'has("stop_loss_initial") and .stop_loss_initial != null')
+                  HAS_SL=$(echo "$META_CONTENT" | jq 'has("stop_loss_initial")')
                   if [ "$HAS_SL" != "true" ]; then
-                    echo "❌ stop_loss_initial در فایل $META_FILE_REMOTE یافت نشد."
+                    echo "❌ کلید stop_loss_initial (حتی با مقدار null) در فایل $META_FILE_REMOTE وجود ندارد."
                     SKIP_CHUNK=true
                   else
                     META_SOURCE="1.json"
@@ -429,8 +429,8 @@ jobs:
                   const trades=JSON.parse(fs.readFileSync('/tmp/prep/all_trades.json','utf8'));
                   const meta=JSON.parse(fs.readFileSync('/tmp/prep/meta.json','utf8'));
                   const tradeList=Array.isArray(trades)?trades:trades.trades;
-                  if(meta.stop_loss_initial===undefined || meta.stop_loss_initial===null){
-                    console.error('__NO_STOP_LOSS_INITIAL__');
+                  if(meta.stop_loss_initial===undefined){
+                    console.error('__NO_STOP_LOSS_INITIAL_KEY__');
                     process.exit(1);
                   }
                   fs.writeFileSync('/tmp/prep/all_trades.json',JSON.stringify({

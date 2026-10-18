@@ -539,7 +539,7 @@ jobs:
                       sl_source = 'stopLoss_close_formula';
                     }
                   }
-                  if (stop_loss === null) { console.error('__NO_STOP_LOSS_INITIAL__'); process.exit(1); }
+                  if (stop_loss === null) { sl_source = 'none'; console.log('حد ضرر اولیه ثابت در .js یافت نشد (احتمالا حد ضرر پویا) -> stop_loss_initial = null و هیچ مقدار پیش‌فرضی جایگزین نمی‌شود'); }
                   console.log('منبع stop_loss_initial: ' + sl_source);
                   console.log('stop_loss_initial از .js خوانده شد: ' + stop_loss);
                   let max_move = move_percents.length ? move_percents[move_percents.length-1] : null;
@@ -573,9 +573,9 @@ jobs:
               if [ "$METADATA_SUCCESS" = false ]; then
                 echo "   ℹ️ فایل ${JS_FILE} یافت نشد → بازگشت به fallback (1.json)."
                 if [ -f "$META_FILE" ]; then
-                  HAS_SL=$(jq 'has("stop_loss_initial") and .stop_loss_initial != null' "$META_FILE")
+                  HAS_SL=$(jq 'has("stop_loss_initial")' "$META_FILE")
                   if [ "$HAS_SL" != "true" ]; then
-                    echo "   ❌ stop_loss_initial در فایل ${META_FILE} یافت نشد."
+                    echo "   ❌ کلید stop_loss_initial (حتی با مقدار null) در فایل ${META_FILE} وجود ندارد."
                     echo "   📝 $BASE_STRAT در فهرست افزوده‌های این چانک ثبت می‌شود و رد می‌شود."
                     add_missing_metadata "$BASE_STRAT"
                     rm -rf "/tmp/agg_${STRAT}"
@@ -600,10 +600,7 @@ jobs:
               MOVE_PERCENTS=$(jq -c '.move_percents // []' "/tmp/agg_${STRAT}/1.json")
               STOP_LOSS=$(jq '.stop_loss_initial' "/tmp/agg_${STRAT}/1.json")
               if [ "$STOP_LOSS" = "null" ]; then
-                echo "   ❌ stop_loss_initial اجباری است و در متادیتای نهایی یافت نشد."
-                add_missing_metadata "$BASE_STRAT"
-                rm -rf "/tmp/agg_${STRAT}"
-                continue
+                echo "   ℹ️ stop_loss_initial = null (حد ضرر ثابت ندارد؛ هیچ مقدار پیش‌فرضی استفاده نمی‌شود)."
               fi
               MAX_MOVE=$(jq '.max_move_percent // (if .move_percents then .move_percents[-1] else null end)' "/tmp/agg_${STRAT}/1.json")
 
