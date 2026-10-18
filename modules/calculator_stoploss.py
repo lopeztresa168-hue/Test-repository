@@ -27,7 +27,7 @@ def extract_stop_loss_from_config(data):
             if 0 < val < 1:
                 return -((1 - val) * 100)
             return -abs(val)
-    return -2.0
+    return None
 
 def extract_move_percents_from_config(file_path):
     try:
@@ -68,7 +68,7 @@ def main():
             sl = extract_stop_loss_from_config(config_text)
             mp = extract_move_percents_from_config(config_path)
         else:
-            sl = -2.0
+            sl = None
             mp = None
         key = folder  # کلید جدید: فقط نام استراتژی
         cache[key] = {"stop_loss": sl, "move_percents": mp}

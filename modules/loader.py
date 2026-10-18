@@ -118,7 +118,7 @@ def extract_stop_loss_from_config(data):
             if 0 < val < 1:
                 return -((1 - val) * 100)
             return -abs(val)
-    return -2.0
+    return None
 
 def extract_move_percents_from_config(file_path):
     """استخراج movePercentها و max_move از فایل 1.json"""
@@ -167,7 +167,7 @@ def load_strategies(aggregated_dir, strategies_dir=None):
             if os.path.exists(local_candidate):
                 config_file = local_candidate
         move_percents = None
-        stop_loss_initial = -2.0
+        stop_loss_initial = None
         max_move_percent = None
         if config_file and os.path.exists(config_file):
             try:

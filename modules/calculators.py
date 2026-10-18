@@ -34,6 +34,26 @@ SESSION_WINDOWS = {
 }
 MIN_SESSION_TRADES = 5  # کمتر از این، آماری بی‌معنی است — رد می‌شود
 
+# ══════════════════════════════════════════════
+# حد ضرر اولیه (stop_loss_initial)
+# ══════════════════════════════════════════════
+# این مقدار فقط برای «توزیع معکوس» (build_inverse_dist) لازم است. هیچ آمار دیگری
+# (شارپ، نرخ برد، نسبت سود به ضرر، ضرر متوالی، ...) به آن وابسته نیست.
+# تا وقتی استراتژی معکوس غیرفعال است (INVERSE_ENABLED=False) این مقدار اصلاً
+# استخراج/استفاده نمی‌شود (None می‌ماند) و هیچ مقدار پیش‌فرض ساختگی (مثل -2.0)
+# جایگزین نمی‌شود. اگر روزی True شود و برای استراتژی‌ای حد ضرر پیدا نشود،
+# build_inverse_dist صریحاً خطا می‌دهد (نه عدد ساختگی).
+INVERSE_ENABLED = False
+
+def _stop_loss_for(*candidates):
+    """اولین مقدار غیر None از candidates؛ ولی فقط اگر استراتژی معکوس فعال باشد، وگرنه None."""
+    if not INVERSE_ENABLED:
+        return None
+    for c in candidates:
+        if c is not None:
+            return c
+    return None
+
 # ══════════════════════════════════════════════════════════════
 # لاگ
 # ══════════════════════════════════════════════════════════════
@@ -151,7 +171,7 @@ def load_aggregated_data(enc_path, password=None):
         log.warning("%s: trades خالی است – مقادیر پیش‌فرض اعمال می‌شود.", enc_path)
     if not metadata:
         log.warning("%s: metadata موجود نیست – مقادیر پیش‌فرض اعمال می‌شود.", enc_path)
-        metadata = {"move_percents": [], "stop_loss_initial": -2.0, "max_move_percent": None}
+        metadata = {"move_percents": [], "stop_loss_initial": None, "max_move_percent": None}
     return {"trades": trades, "metadata": metadata}
 
 # ══════════════════════════════════════════════════════════════
@@ -359,6 +379,8 @@ def risk_reward_loss_months(trades):
 # ══════════════════════════════════════════════════════════════
 
 def build_inverse_dist(trades, stop_loss, max_gain):
+    if stop_loss is None:
+        raise ValueError("build_inverse_dist: stop_loss_initial برای توزیع معکوس لازم است ولی موجود نیست (مقدار پیش‌فرض ساختگی استفاده نمی‌شود).")
     inv_sl = abs(stop_loss)
     agg = defaultdict(int)
     for t in trades:
@@ -1001,7 +1023,7 @@ def process_file(enc_path, move_percents_override=None, stop_loss_override=None,
     meta = data["metadata"]
 
     mp = move_percents_override if move_percents_override is not None else (meta.get("move_percents") or [])
-    sl = stop_loss_override if stop_loss_override is not None else meta.get("stop_loss_initial", -2.0)
+    sl = _stop_loss_for(stop_loss_override, meta.get("stop_loss_initial"))
     # باگ ۸: max_g باید از mp (که ممکن است override شده باشد) محاسبه شود، نه مستقیم از metadata
     max_g = max(mp) if mp else meta.get("max_move_percent")
 
@@ -1107,8 +1129,10 @@ def cmd_risk(args):
     password = args.password or os.environ.get("RESULTS_PASSWORD", os.environ.get("DATA_PASSWORD", ""))
     with open(args.strategies_json, "r", encoding="utf-8") as f:
         strategies = json.load(f)["strategies"]
-    with open(args.stoploss_cache, "r", encoding="utf-8") as f:
-        sl_cache = json.load(f)
+    sl_cache = {}
+    if INVERSE_ENABLED and getattr(args, "stoploss_cache", "") and os.path.exists(args.stoploss_cache):
+        with open(args.stoploss_cache, "r", encoding="utf-8") as f:
+            sl_cache = json.load(f)
 
     previous_report_path = getattr(args, "previous_report", "") or ""
     known_folders = set()
@@ -1123,13 +1147,13 @@ def cmd_risk(args):
         folder = s["folder"]
         if folder in known_folders:
             continue
-        sl = sl_cache.get(folder, {}).get("stop_loss", -2.0)
+        sl = _stop_loss_for(sl_cache.get(folder, {}).get("stop_loss"))
         mp = s.get("move_percents") or []
         enc = s.get("aggregated_file") or os.path.join(args.results_base, folder, f"{folder}_trades.enc")
         if not os.path.exists(enc):
             log.warning("استراتژی %s: فایل یافت نشد: %s", folder, enc)
             continue
-        log.info("risk ← استراتژی: %s  sl=%.2f", folder, sl)
+        log.info("risk ← استراتژی: %s%s", folder, "" if sl is None else f"  sl={sl}")
         try:
             per_sym = process_file(enc, mp, stop_loss_override=sl, password=password)
             for sym, r in per_sym.items():
@@ -1523,7 +1547,7 @@ def _compute_results(strategies, returns_cache, risk_cache, inv_cache, args, pas
         folder = s["folder"]
         group = s.get("group", "aggregated")
         mp = s.get("move_percents") or []
-        sl = s.get("stop_loss_initial", -2.0)
+        sl = _stop_loss_for(s.get("stop_loss_initial"))
         max_move = s.get("max_move_percent")
         enc = s.get("aggregated_file") or (
             os.path.join(results_base, folder, f"{folder}_trades.enc") if results_base else ""
@@ -1541,8 +1565,8 @@ def _compute_results(strategies, returns_cache, risk_cache, inv_cache, args, pas
                 # به‌روزرسانی mp/sl از metadata فایل اگر خالی بود (بدون decrypt مجدد)
                 if not mp:
                     mp = meta_from_file.get("move_percents") or []
-                if sl == -2.0:
-                    sl = meta_from_file.get("stop_loss", -2.0)
+                if sl is None:
+                    sl = _stop_loss_for(meta_from_file.get("stop_loss"))
                 if max_move is None:
                     max_move = meta_from_file.get("max_move_percent")
             except Exception as e:
@@ -2045,7 +2069,7 @@ def main():
     p = sub.add_parser("risk")
     p.add_argument("--strategies-json", required=True)
     p.add_argument("--results-base", required=True)
-    p.add_argument("--stoploss-cache", required=True)
+    p.add_argument("--stoploss-cache", default="")
     p.add_argument("--output", required=True)
     p.add_argument("--password", default="")
     p.add_argument("--previous-report", default="",
@@ -2055,7 +2079,7 @@ def main():
     p = sub.add_parser("inverse")
     p.add_argument("--strategies-json", required=True)
     p.add_argument("--results-base", required=True)
-    p.add_argument("--stoploss-cache", required=True)
+    p.add_argument("--stoploss-cache", default="")
     p.add_argument("--output", required=True)
     p.add_argument("--password", default="")
 
