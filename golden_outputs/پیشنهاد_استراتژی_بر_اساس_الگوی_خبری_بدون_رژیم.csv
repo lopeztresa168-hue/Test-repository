@@ -1,0 +1,19 @@
+گروه,رتبه,نام_استراتژی,تعداد_تکرار,تعداد_سود,تعداد_ضرر,وین‌ریت_(%),میانگین_بازده_(%),بازه_زمانی_شروع,بازه_زمانی_پایان,تعداد_روز_فعال,تعداد_روز_کل_بازه
+BTCUSDT+ETHUSDT+PAXGUSDT_10_0_simple_hybrid_none_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Vol20-12+Cnd_30m (BTCUSDT+ETHUSDT+PAXGUSDT),2,2,0,100.0,0.69,2018-11-02,2019-04-10,20,160
+BTCUSDT+ETHUSDT+PAXGUSDT_5_0_simple_hybrid_none_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Vol20-12+Cnd_30m (BTCUSDT+ETHUSDT+PAXGUSDT),2,2,0,100.0,1.38,2018-11-07,2019-04-05,10,150
+BTCUSDT+ETHUSDT+SOLUSDT_5_0_simple_hybrid_none_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Cnd_30m (BTCUSDT+ETHUSDT+SOLUSDT),6,4,2,66.66666666666666,0.525,2018-11-02,2023-01-14,30,1535
+BTCUSDT+ETHUSDT_5_0_simple_hybrid_none_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Vol20-12+Cnd_15m (BTCUSDT+ETHUSDT),6,4,2,66.66666666666666,0.525,2018-11-02,2023-01-14,30,1535
+BTCUSDT+PAXGUSDT+SOLUSDT_5_0_simple_hybrid_none_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Vol20-12+Cnd_30m (BTCUSDT+PAXGUSDT+SOLUSDT),6,4,2,66.66666666666666,0.525,2018-11-02,2023-01-14,30,1535
+BTCUSDT+PAXGUSDT_10_0_simple_hybrid_none_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Vol20-12+Cnd_30m (BTCUSDT+PAXGUSDT),2,2,0,100.0,0.69,2018-11-02,2019-04-10,20,160
+BTCUSDT+PAXGUSDT_5_0_simple_hybrid_none_trending_down_fixed,1,B4Don20+Ema50-200_LadFib_BufOn_4h (BTCUSDT+PAXGUSDT),4,3,1,75.0,0.5933386417643834,2019-04-01,2023-01-14,20,1385
+BTCUSDT+PAXGUSDT_5_0_simple_hybrid_none_trending_down_fixed,2,B4DvgBull_PP12Rsi10Lb2Tol12+Vol20-12+Cnd_30m (BTCUSDT+PAXGUSDT),2,2,0,100.0,1.38,2018-11-07,2019-04-05,10,150
+BTCUSDT+SOLUSDT_5_0_simple_hybrid_none_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Cnd_30m (BTCUSDT+SOLUSDT),5,4,1,80.0,0.634,2018-11-02,2023-01-14,25,1535
+BTCUSDT_10_0_simple_hybrid_asia_tokyo_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Cnd_30m (BTCUSDT),2,2,0,100.0,0.69,2018-11-02,2019-04-10,20,160
+BTCUSDT_5_0_simple_hybrid_asia_tokyo_trending_down_fixed,1,B4DvgBull_PP12Rsi10Lb2Tol12+Cnd_30m (BTCUSDT),2,2,0,100.0,1.38,2018-11-07,2019-04-05,10,150
+BTCUSDT_5_0_simple_hybrid_london_trending_up_fixed,1,B4NYFib0218_LadFib_BufOn_15m (BTCUSDT),1,1,0,100.0,0.81,2025-09-26,2025-09-30,5,5
+ETHUSDT_10_0_simple_hybrid_london_ny_overlap_trending_down_fixed,1,B4Touch_TLpP5-mT3-pR001_LadFib_BufOn_1h (ETHUSDT),1,1,0,100.0,0.595,2022-12-31,2023-01-09,10,10
+ETHUSDT_10_0_simple_hybrid_newyork_trending_down_fixed,1,B4Touch_TLpP5-mT3-pR001_LadFib_BufOn_1h (ETHUSDT),1,1,0,100.0,0.595,2022-12-31,2023-01-09,10,10
+ETHUSDT_10_0_simple_hybrid_none_trending_down_fixed,1,B4Touch_TLpP5-mT3-pR001_LadFib_BufOn_1h (ETHUSDT),1,1,0,100.0,0.595,2022-12-31,2023-01-09,10,10
+ETHUSDT_5_0_simple_hybrid_london_ny_overlap_trending_down_fixed,1,B4Touch_TLpP5-mT3-pR001_LadFib_BufOn_1h (ETHUSDT),1,1,0,100.0,1.19,2023-01-05,2023-01-09,5,5
+ETHUSDT_5_0_simple_hybrid_newyork_trending_down_fixed,1,B4Touch_TLpP5-mT3-pR001_LadFib_BufOn_1h (ETHUSDT),1,1,0,100.0,1.19,2023-01-05,2023-01-09,5,5
+ETHUSDT_5_0_simple_hybrid_none_trending_down_fixed,1,B4Touch_TLpP5-mT3-pR001_LadFib_BufOn_1h (ETHUSDT),1,1,0,100.0,1.19,2023-01-05,2023-01-09,5,5
