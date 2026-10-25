@@ -152,7 +152,8 @@ jobs:
             "https://x-access-token:${GH_TOKEN}@github.com/${OHLC_REPO}.git" /tmp/ohlc_repo
           cd /tmp/ohlc_repo
           git sparse-checkout set data/All_Coins_Combined
-          # تعداد دقیق نتایج هر استراتژی = 1314 داده + 6 نتیجه‌ی ژوئن (ثابت، طبق درخواست)
+          # تعداد دقیق نتایج هر استراتژی = 1320 (1314 داده + 6 نتیجه‌ی ژوئن) یا 1314 (بدون ژوئن).
+          # COUNT عدد اصلی است و عدد دوم (1314) هم در مرحله‌ی بررسی شرط تعداد پذیرفته می‌شود.
           COUNT=1320
           echo "📊 تعداد فایل‌های مورد انتظار (از OHLC_REPO): $COUNT عدد"
           echo "required_file_count=$COUNT" >> "$GITHUB_OUTPUT"
@@ -374,8 +375,12 @@ jobs:
 
               echo ""
               echo "2.5- بررسی شرط تعداد فایل‌ها (REQUIRED_FILE_COUNT=$REQUIRED_FILE_COUNT از OHLC_REPO)..."
-              if [ "$FILE_COUNT" -ne "$REQUIRED_FILE_COUNT" ]; then
-                echo "   ⚠️ تعداد فایل‌ها ($FILE_COUNT) برابر با $REQUIRED_FILE_COUNT نیست. یکپارچه‌سازی $STRAT انجام نمی‌شود."
+              FILE_COUNT_OK=false
+              for N in "$REQUIRED_FILE_COUNT" 1314; do
+                if [ "$FILE_COUNT" -eq "$N" ]; then FILE_COUNT_OK=true; fi
+              done
+              if [ "$FILE_COUNT_OK" != true ]; then
+                echo "   ⚠️ تعداد فایل‌ها ($FILE_COUNT) نه $REQUIRED_FILE_COUNT است و نه 1314. یکپارچه‌سازی $STRAT انجام نمی‌شود."
                 mkdir -p "/tmp/third_repo/aggregated/${STRAT}"
                 echo "{\"status\": \"incomplete\", \"file_count\": $FILE_COUNT, \"required_count\": $REQUIRED_FILE_COUNT}" > "/tmp/third_repo/$STATUS_FILE"
                 echo "   📝 وضعیت incomplete با تعداد فایل‌ها در $STATUS_FILE ثبت شد."
@@ -385,7 +390,7 @@ jobs:
                 echo ""
                 continue
               fi
-              echo "   ✅ تعداد فایل‌ها دقیقاً $REQUIRED_FILE_COUNT است. یکپارچه‌سازی $STRAT انجام می‌شود."
+              echo "   ✅ تعداد فایل‌ها $FILE_COUNT است (مجاز: $REQUIRED_FILE_COUNT یا 1314). یکپارچه‌سازی $STRAT انجام می‌شود."
               echo ""
 
               NEW_TRADES_FILE="/tmp/agg_${STRAT}/new_trades.json"
