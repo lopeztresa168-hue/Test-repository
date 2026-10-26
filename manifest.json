@@ -388,5 +388,44 @@
       "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_5d_simple_hybrid.csv"
     ],
     "timestamp": "2026-10-26T22:14:43.329415Z"
+  },
+  {
+    "chunk_index": "17",
+    "run_id": "40409212646",
+    "done_count": 15,
+    "failed_count": 0,
+    "files": [
+      "batch_outputs/chunk_17/combo_monthly_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/monthly_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/signatures/combo_monthly/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/monthly_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_10d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_30d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_pre_5d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_10d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_30d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_30d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_5d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/PPI_post_30d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_5d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_10d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_5d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_15d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_15d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/signatures/combo_10day/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_15d_simple_hybrid_asia_tokyo.jsonl",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_15d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_30d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_10d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_10d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_10d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/PPI_post_30d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_5d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_30d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_30d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_15d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CorePPI_post_5d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_post_5d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/FOMC_pre_5d_simple_hybrid_asia_tokyo.csv",
+      "batch_outputs/chunk_17/combo_10day_patterns/S4Pdl+Ema50-200_LadFib_BufOn_5m/ETHUSDT/CPI_y_y_post_15d_simple_hybrid_asia_tokyo.csv"
+    ],
+    "timestamp": "2026-10-26T22:15:25.013481Z"
   }
 ]
