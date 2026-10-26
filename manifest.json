@@ -349,5 +349,44 @@
       "batch_outputs/chunk_18/combo_10day_patterns/S4Thr14-15+Ema50-200_LadFib_BufOn_1h/SOLUSDT/CPI_post_10d_simple_hybrid_london_ny_overlap.csv"
     ],
     "timestamp": "2026-10-26T22:14:35.767576Z"
+  },
+  {
+    "chunk_index": "13",
+    "run_id": "40409212646",
+    "done_count": 15,
+    "failed_count": 0,
+    "files": [
+      "batch_outputs/chunk_13/combo_monthly_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/monthly_simple_hybrid.csv",
+      "batch_outputs/chunk_13/signatures/combo_monthly/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/monthly_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_10d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_10d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_30d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_pre_5d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_10d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_30d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_15d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_15d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/PPI_post_30d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_30d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/signatures/combo_10day/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_15d_simple_hybrid.jsonl",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_pre_5d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_15d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_10d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_15d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_30d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_5d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_10d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CPI_y_y_post_30d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_10d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/PPI_post_30d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/CorePPI_post_5d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_15d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_30d_simple_hybrid.csv",
+      "batch_outputs/chunk_13/combo_10day_patterns/S4NYFib0618_LadFib_BufOn_15m/XRPUSDT/FOMC_post_5d_simple_hybrid.csv"
+    ],
+    "timestamp": "2026-10-26T22:14:43.329415Z"
   }
 ]
