@@ -1,0 +1,1578 @@
+name: Complete Analysis Pipeline
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunk_start:
+        description: 'شماره شروع چانک (اختیاری)'
+        required: false
+        default: ''
+      chunk_end:
+        description: 'شماره پایان چانک (اختیاری)'
+        required: false
+        default: ''
+
+concurrency:
+  group: analysis-runner-portfolios
+  cancel-in-progress: false
+
+jobs:
+  # ================================================================
+  # portfolios-generate-matrix: تولید صف کار برای ماژول portfolios
+  # ================================================================
+  portfolios-generate-matrix:
+    needs: []
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_items: ${{ steps.gen.outputs.matrix_items }}
+      empty: ${{ steps.gen.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: دانلود صف all_combinations_portfolios.json از مخزن سوم
+        id: queue
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          # باگ فایل‌های بزرگ‌تر از ~1MB fix: هدر Accept: application/vnd.github.v3.raw
+          # برای فایل‌های بزرگ به‌صورت خاموش محتوای خالی/قطع‌شده برمی‌گرداند.
+          # به‌جای آن، ابتدا متادیتا گرفته می‌شود و سپس از download_url دانلود می‌شود
+          # (دقیقاً مطابق پیاده‌سازی gh_api_get در build_all_queues.py).
+          META_HTTP_CODE=$(curl -s -o /tmp/queue_meta.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_portfolios.json")
+          echo "[DEBUG] META_HTTP_CODE=$META_HTTP_CODE"
+
+          if [ "$META_HTTP_CODE" != "200" ]; then
+            echo "⚠️ متادیتای صف دریافت نشد (HTTP $META_HTTP_CODE) — matrix خالی."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          DOWNLOAD_URL=$(jq -r '.download_url // empty' /tmp/queue_meta.json)
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            echo "⚠️ download_url در پاسخ متادیتا یافت نشد — matrix خالی."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          HTTP_CODE=$(curl -sL -o /tmp/all_combinations_portfolios.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            "$DOWNLOAD_URL")
+          echo "[DEBUG] HTTP_CODE=$HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/all_combinations_portfolios.json ] || \
+             ! jq -e 'type == "array"' /tmp/all_combinations_portfolios.json > /dev/null 2>&1; then
+            echo "⚠️ صف all_combinations_portfolios.json نامعتبر یا یافت نشد (HTTP $HTTP_CODE) — matrix خالی."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          QUEUE_TOTAL=$(jq 'length' /tmp/all_combinations_portfolios.json)
+          echo "[DEBUG] تعداد آیتم‌های صف portfolios: $QUEUE_TOTAL"
+          if [ "$QUEUE_TOTAL" -eq 0 ]; then
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+          else
+            echo "queue_empty=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: تقسیم صف به چانک‌های حداکثر ۶۲۵ تایی (نگهداری کامل signature_path و archive_path)
+        id: gen
+        if: steps.queue.outputs.queue_empty != 'true'
+        run: |
+          mkdir -p /tmp/portfolios_chunks
+
+          # ========== تغییر: به‌جای استخراج فقط signature_path، کل آیتم صف
+          # (شامل signature_path و archive_path) بدون تغییر نگهداری می‌شود تا
+          # هر job در مرحله‌ی portfolios-batch بتواند archive_path لازم خودش
+          # را مستقیماً دانلود کند و دیگر نیازی به artifact عظیم all-signatures
+          # نباشد. همچنین یک سقف MAX_COMBOS_PER_RUN اعمال می‌شود تا هر اجرا
+          # حداکثر روی آیتم‌های اول صف کار کند. ==========
+          jq -c '[.[] | select(. != null)]' \
+            /tmp/all_combinations_portfolios.json > /tmp/portfolios_chunks/queue_items_full.json
+
+          # [فیکس مشابه analysis_fixed_batch.yml] قبلاً CHUNK_SIZE=2500 هاردکد
+          # بود، یعنی chunk آخر با تقسیم غیردقیق TOTAL می‌توانست کوچک‌تر/بزرگ‌تر
+          # از بقیه دربیاید. راه‌حل: به‌جای CHUNK_SIZE ثابت، تعداد چانک را ثابت
+          # نگه می‌داریم (DESIRED_CHUNK_COUNT) و مرز هر چانک را با
+          # floor(TOTAL*i/CHUNK_COUNT) محاسبه می‌کنیم — این‌طور همیشه دقیقاً
+          # DESIRED_CHUNK_COUNT چانک تولید می‌شود (مگر وقتی TOTAL از آن کمتر
+          # باشد) و چون MAX_COMBOS_PER_RUN=DESIRED_CHUNK_COUNT*MAX_CHUNK_SIZE،
+          # هیچ چانکی هرگز از MAX_CHUNK_SIZE بزرگ‌تر نمی‌شود.
+          DESIRED_CHUNK_COUNT=20
+          MAX_CHUNK_SIZE=625
+          MAX_COMBOS_PER_RUN=$((DESIRED_CHUNK_COUNT * MAX_CHUNK_SIZE))
+          jq -c ".[0:${MAX_COMBOS_PER_RUN}]" /tmp/portfolios_chunks/queue_items_full.json \
+            > /tmp/portfolios_chunks/queue_items.json
+          rm -f /tmp/portfolios_chunks/queue_items_full.json
+
+          TOTAL=$(jq 'length' /tmp/portfolios_chunks/queue_items.json)
+          echo "[DEBUG] تعداد آیتم‌های صف پس از اعمال سقف $MAX_COMBOS_PER_RUN: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHUNK_COUNT=$DESIRED_CHUNK_COUNT
+          if [ "$TOTAL" -lt "$DESIRED_CHUNK_COUNT" ]; then
+            CHUNK_COUNT=$TOTAL
+          fi
+
+          INPUT_START="${{ github.event.inputs.chunk_start }}"
+          INPUT_END="${{ github.event.inputs.chunk_end }}"
+          [ -z "$INPUT_START" ] && INPUT_START=0
+          [ -z "$INPUT_END" ]   && INPUT_END=$((CHUNK_COUNT - 1))
+          if ! [[ "$INPUT_START" =~ ^[0-9]+$ ]]; then
+            echo "⚠️ chunk_start غیرعددی ('$INPUT_START') — به 0 تنظیم شد."
+            INPUT_START=0
+          fi
+          if ! [[ "$INPUT_END" =~ ^[0-9]+$ ]]; then
+            echo "⚠️ chunk_end غیرعددی ('$INPUT_END') — به $((CHUNK_COUNT - 1)) تنظیم شد."
+            INPUT_END=$((CHUNK_COUNT - 1))
+          fi
+          [ "$INPUT_START" -lt 0 ] && INPUT_START=0
+          [ "$INPUT_END" -ge "$CHUNK_COUNT" ] && INPUT_END=$((CHUNK_COUNT - 1))
+          if [ "$INPUT_START" -gt "$INPUT_END" ]; then
+            echo "⚠️ بازه chunk خالی است (start=$INPUT_START > end=$INPUT_END) — matrix خالی."
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            echo "empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "[DEBUG] پردازش chunk‌های $INPUT_START تا $INPUT_END از مجموع $CHUNK_COUNT (TOTAL=$TOTAL)"
+
+          INDICES="["
+          for ((i=0; i<CHUNK_COUNT; i++)); do
+            START=$(( TOTAL * i / CHUNK_COUNT ))
+            END=$(( TOTAL * (i + 1) / CHUNK_COUNT ))
+            jq ".[$START:$END]" /tmp/portfolios_chunks/queue_items.json > /tmp/portfolios_chunks/chunk_${i}.json
+            if [ "$i" -ge "$INPUT_START" ] && [ "$i" -le "$INPUT_END" ]; then
+              if [ "${#INDICES}" -gt 1 ]; then INDICES+=", "; fi
+              INDICES+="$i"
+            fi
+          done
+          INDICES+="]"
+          rm -f /tmp/portfolios_chunks/queue_items.json
+          echo "matrix_items=$INDICES" >> $GITHUB_OUTPUT
+          echo "empty=false" >> $GITHUB_OUTPUT
+          echo "✅ $TOTAL آیتم در $CHUNK_COUNT چانک (حداکثر $MAX_CHUNK_SIZE در هر چانک) — اجرای chunk‌های $INPUT_START تا $INPUT_END."
+
+      - name: آپلود چانک‌های portfolios
+        if: steps.gen.outputs.empty == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-chunks-${{ github.run_id }}
+          path: /tmp/portfolios_chunks/
+          retention-days: 1
+
+  # ================================================================
+  # portfolios-cleanup: حذف گروه‌های پردازش‌شده از صف
+  # (بعد از فیکس معماری build/score/merge: به‌جای ادغام done_items ۲۰
+  # چانکِ portfolios-batح قدیمی، مستقیماً all_sig_keys/group_queue_keys
+  # را از artifact فاز portfolios-whole-time-build می‌خواند — چون الان تنها
+  # یک فاز build وجود دارد، نه ۲۰ اجرای مستقل و تکراری.)
+  # ================================================================
+  portfolios-cleanup:
+    needs: [portfolios-generate-matrix, portfolios-whole-time-build, portfolios-whole-time-merge-final]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.portfolios-whole-time-merge-final.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: دانلود متادیتای صف (all_sig_keys/group_queue_keys) از فاز build
+        id: download_meta
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-wt-queue-meta-${{ github.run_id }}
+          path: /tmp/queue_meta
+        continue-on-error: true
+
+      - name: ادغام (flatten) group_queue_keys.json و حذف از all_combinations_portfolios.json
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          CURL="/usr/bin/curl"
+
+          # [فیکس معماری regular/whole-time مشترک] قبلاً اینجا ۲۰ تا
+          # artifact جدای done-items-* (خروجی ۲۰ چانک مستقل و تکراریِ
+          # run() قدیمی) دانلود و ادغام می‌شدند. الان چون فقط یک فاز build
+          # وجود دارد (نه ۲۰ اجرای مستقل)، کل گروه‌های دیده‌شده در همان یک
+          # فایل group_queue_keys.json هستند — فقط باید مقادیرش (هرکدام
+          # آرایه‌ای از queue_key) را flatten کرد.
+          if [ "${{ steps.download_meta.outcome }}" != "success" ] || \
+             [ ! -f /tmp/queue_meta/group_queue_keys.json ]; then
+            echo "⚠️ group_queue_keys.json یافت نشد — چیزی از صف حذف نمی‌شود."
+            echo "[]" > /tmp/merged_done.json
+          elif ! jq -e 'type == "object"' /tmp/queue_meta/group_queue_keys.json > /dev/null 2>&1; then
+            echo "⚠️ group_queue_keys.json نامعتبر — چیزی از صف حذف نمی‌شود."
+            echo "[]" > /tmp/merged_done.json
+          else
+            jq '[.[][]] | unique' /tmp/queue_meta/group_queue_keys.json > /tmp/merged_done.json
+          fi
+          [ -s /tmp/merged_done.json ] || echo "[]" > /tmp/merged_done.json
+
+          if ! jq -e 'type == "array"' /tmp/merged_done.json > /dev/null 2>&1; then
+            echo "⚠️ merged_done.json نامعتبر — reset به []"
+            echo "[]" > /tmp/merged_done.json
+          fi
+
+          MERGED_COUNT=$(jq length /tmp/merged_done.json)
+          echo "[DEBUG] تعداد کل signatureهای موفق این run: $MERGED_COUNT"
+
+          if [ "$MERGED_COUNT" -eq 0 ]; then
+            echo "ℹ️ هیچ signature موفقی برای حذف وجود ندارد."
+            QUEUE_RESP=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_portfolios.json" \
+              2>/dev/null)
+            QUEUE_HTTP=$(echo "$QUEUE_RESP" | tail -1)
+            QUEUE_BODY=$(echo "$QUEUE_RESP" | head -n -1)
+            if [ "$QUEUE_HTTP" = "200" ]; then
+              QUEUE_LEN=$(echo "$QUEUE_BODY" | jq 'length' 2>/dev/null || echo "-1")
+              if [ "$QUEUE_LEN" = "0" ]; then
+                echo "✅ صف خالی است — به‌روزرسانی completed_portfolios.json به [\"completed\"]..."
+                echo '["completed"]' > /tmp/completed_portfolios_empty.json
+                SHA_COMP_E=$(gh api "repos/$THIRD_REPO/contents/completed_portfolios.json" -q '.sha' 2>/dev/null || echo "")
+                B64_E=$(base64 -w0 /tmp/completed_portfolios_empty.json)
+                # fix: ساخت payload به فایل و آپلود با --data-binary
+                if [ -n "$SHA_COMP_E" ]; then
+                  jq -n --arg c "$B64_E" --arg s "$SHA_COMP_E" \
+                    '{message:"portfolios completed (queue empty)",content:$c,branch:"main",sha:$s}' \
+                    > /tmp/payload_empty.json
+                else
+                  jq -n --arg c "$B64_E" \
+                    '{message:"portfolios completed (queue empty)",content:$c,branch:"main"}' \
+                    > /tmp/payload_empty.json
+                fi
+                curl -s -X PUT -o /dev/null \
+                  -H "Authorization: token $GH_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  --data-binary @/tmp/payload_empty.json \
+                  "https://api.github.com/repos/$THIRD_REPO/contents/completed_portfolios.json"
+                rm -f /tmp/payload_empty.json
+              else
+                echo "[DEBUG] صف هنوز $QUEUE_LEN آیتم دارد — ادامه loop."
+              fi
+            elif [ "$QUEUE_HTTP" = "404" ]; then
+              echo "⚠️ all_combinations_portfolios.json وجود ندارد (404) — loop متوقف می‌شود."
+            else
+              echo "⚠️ دریافت صف ناموفق (HTTP $QUEUE_HTTP) — ادامه loop."
+            fi
+          else
+            jq '[.[] | if type == "object" then (.path // .signature // .signature_path) else . end] | map(select(. != null)) | unique' \
+              /tmp/merged_done.json > /tmp/merged_done_normalized.json
+            [ -s /tmp/merged_done_normalized.json ] || echo "[]" > /tmp/merged_done_normalized.json
+
+            RETRY=0; MAX=10000
+            while [ $RETRY -lt $MAX ]; do
+              SHA=$(gh api "repos/$THIRD_REPO/contents/all_combinations_portfolios.json" -q '.sha' 2>/dev/null || echo "")
+              if [ -z "$SHA" ]; then
+                echo "ERROR: SHA نامعتبر"
+                RETRY=$((RETRY+1)); sleep $(( (RANDOM % 4) + 2 )); continue
+              fi
+
+              $CURL -s -o /tmp/current.json \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3.raw" \
+                "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_portfolios.json" 2>/dev/null
+              if [ ! -s /tmp/current.json ] || ! jq empty /tmp/current.json 2>/dev/null; then
+                echo "ERROR: دریافت محتوای فایل ناموفق — تلاش مجدد..."
+                RETRY=$((RETRY+1)); sleep $(( (RANDOM % 5) + 3 )); continue
+              fi
+
+              jq -s '.[0] as $c | .[1] as $d
+                | ($d | unique) as $done_set
+                | $c | map(
+                    (if type == "object" then (.path // .signature // .signature_path) else . end) as $key
+                    | select(($done_set | index($key)) == null)
+                  )
+              ' /tmp/current.json /tmp/merged_done_normalized.json > /tmp/new_content.json
+
+              BEFORE=$(jq length /tmp/current.json)
+              AFTER=$(jq length /tmp/new_content.json)
+              echo "[DEBUG] قبل: $BEFORE  بعد: $AFTER  (حذف‌شده: $((BEFORE-AFTER)))"
+
+              base64 -w0 /tmp/new_content.json > /tmp/new_content_base64.txt
+              # fix ARG_MAX: --rawfile به جای --arg content "$(cat ...)"
+              jq -n \
+                --arg msg "remove $((BEFORE-AFTER)) processed signatures (run ${{ github.run_id }})" \
+                --rawfile content /tmp/new_content_base64.txt \
+                --arg sha "$SHA" \
+                '{message: $msg, content: ($content | rtrimstr("\n")), sha: $sha, branch: "main"}' \
+                > /tmp/payload.json
+              HTTP_CODE=$($CURL -s -X PUT -o /tmp/upload_response.txt -w "%{http_code}" \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @/tmp/payload.json \
+                "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_portfolios.json")
+
+              if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
+                echo "✅ $((BEFORE-AFTER)) signature با موفقیت حذف شدند."
+                break
+              elif [ "$HTTP_CODE" -eq 409 ] || [ "$HTTP_CODE" -eq 422 ]; then
+                echo "⚠️ تداخل SHA (کد $HTTP_CODE) — تلاش مجدد..."
+                RETRY=$((RETRY+1)); sleep $(( (RANDOM % 5) + 2 )); continue
+              else
+                echo "ERROR: آپلود ناموفق ($HTTP_CODE)"; cat /tmp/upload_response.txt; exit 1
+              fi
+            done
+            [ $RETRY -ge $MAX ] && { echo "ERROR: پس از $MAX تلاش ناموفق."; exit 1; }
+
+            # fix ARG_MAX: همه عملیات merge روی فایل انجام میشه نه shell variable
+            # new_sigs.json (خروجی همین chunk) یک‌بار ساخته میشه و ثابت می‌مونه
+            jq '[.[] | if type == "object" then (.path // .signature // .signature_path) else . end] | map(select(. != null and . != "")) | unique' \
+              /tmp/merged_done.json > /tmp/new_sigs.json 2>/dev/null \
+              || echo "[]" > /tmp/new_sigs.json
+
+            COMP_RETRY=0; COMP_MAX=10000
+            while [ $COMP_RETRY -lt $COMP_MAX ]; do
+
+              # fix race condition: هر بار از نو دانلود + merge — نه فقط SHA،
+              # وگرنه در retry بعد از تداخل SHA، محتوای قدیمی این chunk
+              # ممکنه کار chunkهای موازی دیگه رو overwrite کنه (lost update)
+              curl -s \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3.raw" \
+                "https://api.github.com/repos/$THIRD_REPO/contents/completed_portfolios.json" \
+                2>/dev/null > /tmp/current_completed_raw.json
+              if ! jq -e 'type == "array"' /tmp/current_completed_raw.json > /dev/null 2>&1; then
+                echo "[]" > /tmp/current_completed_raw.json
+              fi
+              jq '[.[] | if type == "object" then (.path // .signature // .signature_path) else . end] | map(select(. != null and . != "" and . != "completed")) | unique' \
+                /tmp/current_completed_raw.json > /tmp/current_normalized.json 2>/dev/null \
+                || echo "[]" > /tmp/current_normalized.json
+
+              jq -s '.[0] + .[1] | unique' \
+                /tmp/current_normalized.json /tmp/new_sigs.json > /tmp/completed_portfolios.json 2>/dev/null \
+                || echo "[]" > /tmp/completed_portfolios.json
+
+              MERGED_COMP_COUNT=$(jq 'length' /tmp/completed_portfolios.json)
+              echo "[DEBUG] تعداد کل signatureهای ثبت‌شده در completed_portfolios: $MERGED_COMP_COUNT"
+
+              rm -f /tmp/current_completed_raw.json /tmp/current_normalized.json
+
+              SHA_COMP=$(gh api "repos/$THIRD_REPO/contents/completed_portfolios.json" -q '.sha' 2>/dev/null || echo "")
+              base64 -w0 /tmp/completed_portfolios.json > /tmp/completed_base64.txt
+              if [ -n "$SHA_COMP" ]; then
+                jq -n \
+                  --arg msg "update completed_portfolios ($MERGED_COMP_COUNT signatures, run ${{ github.run_id }})" \
+                  --rawfile content /tmp/completed_base64.txt \
+                  --arg sha "$SHA_COMP" \
+                  '{message: $msg, content: ($content | rtrimstr("\n")), branch: "main", sha: $sha}' \
+                  > /tmp/payload_comp.json
+              else
+                jq -n \
+                  --arg msg "update completed_portfolios ($MERGED_COMP_COUNT signatures, run ${{ github.run_id }})" \
+                  --rawfile content /tmp/completed_base64.txt \
+                  '{message: $msg, content: ($content | rtrimstr("\n")), branch: "main"}' \
+                  > /tmp/payload_comp.json
+              fi
+              COMP_HTTP=$(curl -s -o /tmp/comp_upload_resp.txt -w "%{http_code}" -X PUT \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @/tmp/payload_comp.json \
+                "https://api.github.com/repos/$THIRD_REPO/contents/completed_portfolios.json")
+              if [ "$COMP_HTTP" = "200" ] || [ "$COMP_HTTP" = "201" ]; then
+                echo "✅ completed_portfolios.json به‌روز شد."
+                break
+              elif [ "$COMP_HTTP" = "409" ] || [ "$COMP_HTTP" = "422" ]; then
+                echo "⚠️ تداخل SHA در completed_portfolios (HTTP $COMP_HTTP) — تلاش مجدد با merge تازه..."
+                COMP_RETRY=$((COMP_RETRY+1)); sleep $(( (RANDOM % 4) + 2 )); continue
+              else
+                echo "⚠️ به‌روزرسانی completed_portfolios.json ناموفق (HTTP $COMP_HTTP)"
+                break
+              fi
+            done
+
+            rm -f /tmp/current.json /tmp/new_content.json /tmp/new_content_base64.txt \
+              /tmp/payload.json /tmp/upload_response.txt /tmp/completed_*.json \
+              /tmp/completed_base64.txt /tmp/payload_completed.json
+          fi
+
+      - name: دانلود portfolios_scores (روش اول)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
+          path: /tmp/portfolios_scores_parts
+          merge-multiple: false
+        continue-on-error: true
+        id: dl1
+
+      - name: گزارش نتیجه روش اول
+        id: dl1_report
+        run: |
+          if [ "${{ steps.dl1.outcome }}" = "success" ]; then
+            COUNT=$(find /tmp/portfolios_scores_parts \( -name 'part_*.parquet' -o -name 'part_*.csv' \) 2>/dev/null | wc -l)
+            if [ "$COUNT" -gt 0 ]; then
+              echo "✅ روش اول موفق بود — $COUNT فایل دریافت شد."
+              echo "found=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ روش اول (download-artifact) هیچ فایلی پیدا نکرد — تلاش با روش دوم..."
+              echo "found=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "⚠️ روش اول (download-artifact) ناموفق بود — تلاش با روش دوم..."
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: دانلود portfolios_scores (روش دوم)
+        if: steps.dl1_report.outputs.found != 'true'
+        id: dl2
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          mkdir -p /tmp/portfolios_scores_parts
+          gh run download ${{ github.run_id }} \
+            --pattern "portfolios-wt-part-*-${{ github.run_id }}" \
+            --dir /tmp/portfolios_scores_parts
+          COUNT=$(find /tmp/portfolios_scores_parts \( -name 'part_*.parquet' -o -name 'part_*.csv' \) 2>/dev/null | wc -l)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "⚠️ روش دوم (gh run download) هیچ فایلی پیدا نکرد."
+            exit 1
+          fi
+          echo "✅ روش دوم موفق بود — $COUNT فایل دریافت شد."
+
+      - name: دانلود portfolios_scores (روش سوم)
+        if: steps.dl1_report.outputs.found != 'true' && steps.dl2.outcome != 'success'
+        id: dl3
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          mkdir -p /tmp/portfolios_scores_parts
+          ARTIFACTS=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts")
+          echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name | startswith("portfolios-wt-part-")) | .archive_download_url' | while read -r url; do
+            curl -L -H "Authorization: token $GH_TOKEN" -o /tmp/artifact.zip "$url"
+            unzip -o -d /tmp/portfolios_scores_parts /tmp/artifact.zip
+            rm -f /tmp/artifact.zip
+          done
+          COUNT=$(find /tmp/portfolios_scores_parts \( -name 'part_*.parquet' -o -name 'part_*.csv' \) 2>/dev/null | wc -l)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ روش سوم (GitHub API + curl) نیز هیچ فایلی پیدا نکرد."
+            echo "ERROR: هر سه روش دانلود portfolios_scores ناموفق بودند."
+            exit 1
+          fi
+          echo "✅ روش سوم موفق بود — $COUNT فایل دریافت شد."
+
+      - name: آپلود portfolios.csv به مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD }}
+        run: |
+          pip install pandas --quiet --break-system-packages 2>/dev/null || \
+            pip install pandas --quiet 2>/dev/null || true
+
+          CSV_COUNT=$(find /tmp/portfolios_scores_parts -name 'portfolios*.csv' 2>/dev/null | wc -l)
+          if [ "$CSV_COUNT" -eq 0 ]; then
+            echo "⚠️ هیچ portfolios csv یافت نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          find /tmp/portfolios_scores_parts -name 'portfolios*.csv' | sort > /tmp/portfolios_csv_list.txt
+
+          python3 - <<'PYEOF'
+          import sys, pathlib
+          try:
+              import pandas as pd
+              paths = pathlib.Path("/tmp/portfolios_csv_list.txt").read_text().strip().split("\n")
+              paths = [p for p in paths if p and pathlib.Path(p).exists()]
+              if not paths:
+                  sys.exit(0)
+              dfs = []
+              for p in paths:
+                  try:
+                      dfs.append(pd.read_csv(p, index_col=0))
+                  except Exception as e:
+                      print(f"skip {p}: {e}")
+              if not dfs:
+                  sys.exit(0)
+              merged = pd.concat(dfs, ignore_index=False)
+              if not merged.index.is_unique:
+                  merged = merged[~merged.index.duplicated(keep="last")]
+              merged.to_csv("/tmp/portfolios_scores.csv", index=True)
+              print(f"merged {len(merged)} rows from {len(dfs)} files")
+          except ImportError:
+              import shutil
+              paths = pathlib.Path("/tmp/portfolios_csv_list.txt").read_text().strip().split("\n")
+              paths = [p for p in paths if p]
+              shutil.copy(paths[-1], "/tmp/portfolios_scores.csv")
+              print(f"pandas not available, used last file: {paths[-1]}")
+          PYEOF
+
+          if [ ! -f /tmp/portfolios_scores.csv ]; then
+            echo "⚠️ portfolios_scores.csv پس از merge وجود ندارد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp /tmp/portfolios_scores.csv portfolios_outputs/portfolios_scores.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios outputs (run ${{ github.run_id }})"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/ به مخزن اصلی موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+          rm -f /tmp/portfolios_scores.csv /tmp/portfolios_csv_list.txt
+
+  portfolios-whole-time-build:
+    needs: [portfolios-generate-matrix]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.portfolios-generate-matrix.outputs.empty != 'true' }}
+    outputs:
+      empty: ${{ steps.chunk.outputs.empty }}
+      matrix_items: ${{ steps.chunk.outputs.matrix_items }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: 1. دانلود چانک‌های صف از آرتیفکت portfolios-generate-matrix (بدون وابستگی به تایمینگ cleanup)
+        id: download_chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-chunks-${{ github.run_id }}
+          path: /tmp/portfolios_chunks
+        continue-on-error: true
+
+      - name: بازسازی all_combinations_portfolios.json از چانک‌های تغییرناپذیر آرتیفکت
+        id: queue_full
+        run: |
+          if [ "${{ steps.download_chunks.outcome }}" != "success" ]; then
+            echo "⚠️ آرتیفکت portfolios-chunks-${{ github.run_id }} یافت نشد — رد می‌شویم."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHUNK_FILES=$(ls /tmp/portfolios_chunks/chunk_*.json 2>/dev/null | sort -t_ -k2 -n)
+          if [ -z "$CHUNK_FILES" ]; then
+            echo "⚠️ هیچ chunk_*.json در آرتیفکت یافت نشد — رد می‌شویم."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          jq -s 'add' $CHUNK_FILES > /tmp/all_combinations_portfolios.json
+          QUEUE_TOTAL=$(jq 'length' /tmp/all_combinations_portfolios.json)
+          echo "ℹ️ تعداد آیتم‌های صف (بازسازی‌شده از آرتیفکت، نه دانلود مجدد): $QUEUE_TOTAL"
+          if [ "$QUEUE_TOTAL" -eq 0 ]; then
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+          else
+            echo "queue_empty=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 2. دانلود golden_scores.csv از مخزن سوم
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/golden_scores
+          HTTP_CODE=$(curl -s -o /tmp/golden_scores.csv.enc -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/golden_scores.csv.tar.gz.enc")
+
+          if [ "$HTTP_CODE" = "404" ]; then
+            echo "ℹ️ golden_scores.csv.tar.gz.enc موجود نیست — بدون golden_scores اجرا می‌شود."
+            exit 0
+          fi
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/golden_scores.csv.enc ]; then
+            echo "❌ golden_scores.csv.tar.gz.enc دریافت نشد (HTTP $HTTP_CODE)."
+            exit 1
+          fi
+
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const data=fs.readFileSync('/tmp/golden_scores.csv.enc');
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=data.slice(0,16),enc=data.slice(16);
+            const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+            const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+            fs.writeFileSync('/tmp/golden_scores.tar.gz',dec);
+          "
+          if [ ! -s /tmp/golden_scores.tar.gz ]; then
+            echo "❌ رمزگشایی golden_scores.tar.gz ناموفق بود."; exit 1
+          fi
+          tar -xzf /tmp/golden_scores.tar.gz -C /tmp/golden_scores
+          FOUND_CSV=$(find /tmp/golden_scores -name '*.csv' | head -1)
+          if [ -z "$FOUND_CSV" ]; then
+            echo "❌ هیچ فایل .csv داخل tar.gz یافت نشد."; exit 1
+          fi
+          if [ "$FOUND_CSV" != "/tmp/golden_scores/golden_scores.csv" ]; then
+            mv "$FOUND_CSV" /tmp/golden_scores/golden_scores.csv
+          fi
+          echo "✅ golden_scores.csv دریافت، رمزگشایی و استخراج شد."
+
+      - name: 3. دانلود و استخراج تمام آرشیوهای صف (نه فقط یک chunk)
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/archives_extracted_wt
+          jq -r '[.[] | if type == "object" then .archive_path else empty end]
+                 | map(select(. != null and . != "")) | unique | .[]' \
+            /tmp/all_combinations_portfolios.json > /tmp/archive_list_wt.txt
+
+          ARCH_TOTAL=$(wc -l < /tmp/archive_list_wt.txt | tr -d ' ')
+          echo "ℹ️ تعداد کل آرشیوهای یکتا: $ARCH_TOTAL"
+          if [ "$ARCH_TOTAL" -eq 0 ]; then
+            echo "❌ هیچ archive_path در صف یافت نشد."; exit 1
+          fi
+
+          FAIL_COUNT=0
+          while IFS= read -r ARCH_PATH; do
+            [ -z "$ARCH_PATH" ] && continue
+            DL_URL=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/$ARCH_PATH" | jq -r '.download_url // empty')
+            if [ -z "$DL_URL" ] || [ "$DL_URL" = "null" ]; then
+              echo "⚠️ آدرس دانلود برای $ARCH_PATH یافت نشد — رد می‌شود."
+              FAIL_COUNT=$((FAIL_COUNT+1)); continue
+            fi
+            ENC_FILE="/tmp/$(basename "$ARCH_PATH")"
+            curl -s -L -H "Authorization: token $GH_TOKEN" -o "$ENC_FILE" "$DL_URL"
+            if [ ! -s "$ENC_FILE" ]; then
+              echo "⚠️ دانلود $ARCH_PATH ناموفق بود — رد می‌شود."
+              FAIL_COUNT=$((FAIL_COUNT+1)); rm -f "$ENC_FILE"; continue
+            fi
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('$ENC_FILE');
+              const key=crypto.scryptSync(pass,'salt',32);
+              const iv=data.slice(0,16),enc=data.slice(16);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+              fs.writeFileSync('${ENC_FILE%.enc}',dec);
+            " 2>/dev/null && tar -xzf "${ENC_FILE%.enc}" -C /tmp/archives_extracted_wt \
+              || { echo "⚠️ رمزگشایی/استخراج $ARCH_PATH ناموفق بود."; FAIL_COUNT=$((FAIL_COUNT+1)); }
+            rm -f "$ENC_FILE" "${ENC_FILE%.enc}"
+          done < /tmp/archive_list_wt.txt
+
+          JSONL_TOTAL=$(find /tmp/archives_extracted_wt -name '*.jsonl' | wc -l)
+          echo "✅ تعداد $JSONL_TOTAL فایل JSONL استخراج‌شده از $ARCH_TOTAL آرشیو (ناموفق: $FAIL_COUNT)."
+          rm -f /tmp/archive_list_wt.txt
+
+          if [ "$JSONL_TOTAL" -eq 0 ]; then
+            echo "❌ هیچ فایل .jsonl استخراج نشد."; exit 1
+          fi
+
+      - name: 4. اجرای portfolios.py --whole-time-build (فاز ۱ — ساخت صف کامل ترکیبات + داده‌ی مشترک سبک)
+        id: build
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        run: |
+          mkdir -p /tmp/portfolios_wt_build
+          GOLDEN_ARG=""
+          if [ -f /tmp/golden_scores/golden_scores.csv ]; then
+            GOLDEN_ARG="--golden-scores /tmp/golden_scores/golden_scores.csv"
+          else
+            echo "ℹ️ golden_scores.csv موجود نیست — بدون آن اجرا می‌شود."
+          fi
+
+          python modules/portfolios.py \
+            --signatures-dir /tmp/archives_extracted_wt \
+            $GOLDEN_ARG \
+            --output-dir /tmp/portfolios_wt_build \
+            --whole-time-build \
+            --dump-queue-metadata
+          echo "✅ فاز build کامل شد."
+
+      - name: 5. تقسیم صف ترکیبات به دقیقاً ۲۰ chunk (بدون هیچ سقفی روی تعداد کل ترکیبات)
+        id: chunk
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        run: |
+          if [ ! -f /tmp/portfolios_wt_build/combos.json ] || [ "$(cat /tmp/portfolios_wt_build/empty.flag 2>/dev/null)" = "1" ]; then
+            echo "⚠️ صف ترکیبات خالی است (هیچ کاندید/ترکیب معتبری یافت نشد)."
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          TOTAL=$(jq 'length' /tmp/portfolios_wt_build/combos.json)
+          echo "ℹ️ تعداد کل ترکیبات کاندید (بدون هیچ سقفی): $TOTAL"
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          DESIRED_CHUNK_COUNT=20
+          CHUNK_COUNT=$DESIRED_CHUNK_COUNT
+          if [ "$TOTAL" -lt "$DESIRED_CHUNK_COUNT" ]; then
+            CHUNK_COUNT=$TOTAL
+          fi
+
+          mkdir -p /tmp/portfolios_wt_build/chunks
+          INDICES="["
+          for ((i=0; i<CHUNK_COUNT; i++)); do
+            START=$(( TOTAL * i / CHUNK_COUNT ))
+            END=$(( TOTAL * (i + 1) / CHUNK_COUNT ))
+            jq ".[$START:$END]" /tmp/portfolios_wt_build/combos.json > /tmp/portfolios_wt_build/chunks/combo_chunk_${i}.json
+            if [ "$i" -gt 0 ]; then INDICES+=", "; fi
+            INDICES+="$i"
+          done
+          INDICES+="]"
+          echo "matrix_items=$INDICES" >> $GITHUB_OUTPUT
+          echo "empty=false" >> $GITHUB_OUTPUT
+          echo "✅ $TOTAL ترکیب در $CHUNK_COUNT chunk (بدون هیچ سقفی روی سایز هر chunk) تقسیم شد."
+
+      - name: آپلود داده‌ی مشترک + chunkهای صف ترکیبات (برای فاز ۲ — matrix)
+        if: steps.chunk.outputs.empty != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-wt-shared-${{ github.run_id }}
+          path: |
+            /tmp/portfolios_wt_build/monthly_returns.parquet
+            /tmp/portfolios_wt_build/corr_lookup.parquet
+            /tmp/portfolios_wt_build/strategy_meta.parquet
+            /tmp/portfolios_wt_build/exact_valid_periods.parquet
+            /tmp/portfolios_wt_build/period_length_by_date.parquet
+            /tmp/portfolios_wt_build/chunks/*.json
+          retention-days: 1
+
+      - name: آپلود متادیتای صف (all_sig_keys/group_queue_keys) برای portfolios-cleanup
+        # [فیکس معماری regular/whole-time مشترک] جدا از artifact بالا و
+        # مستقل از خالی/پر بودن combos.json آپلود می‌شود — چون حتی وقتی
+        # هیچ ترکیب معتبری ساخته نشود (مثلاً هیچ کاندیدی از Golden رد
+        # نشده)، باز هم باید گروه‌های دیده‌شده از صف اصلی حذف شوند (دقیقاً
+        # همان رفتار run() قدیمی: هر گروهی که این اجرا دیده، پردازش‌شده
+        # علامت می‌خورد، صرف‌نظر از اینکه سبدی از آن ساخته شده باشد یا نه).
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-wt-queue-meta-${{ github.run_id }}
+          path: |
+            /tmp/portfolios_wt_build/all_sig_keys.json
+            /tmp/portfolios_wt_build/group_queue_keys.json
+          retention-days: 1
+
+  portfolios-whole-time-score:
+    needs: [portfolios-whole-time-build]
+    runs-on: ubuntu-latest
+    if: ${{ needs.portfolios-whole-time-build.outputs.empty == 'false' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk_index: ${{ fromJson(needs.portfolios-whole-time-build.outputs.matrix_items || '[0]') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود داده‌ی مشترک فاز build
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-wt-shared-${{ github.run_id }}
+          path: /tmp/portfolios_wt_shared
+
+      - name: امتیازدهیِ برشِ این job از صف ترکیبات (مستقل از بقیه‌ی chunkها)
+        run: |
+          mkdir -p /tmp/portfolios_wt_parts
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_wt_out \
+            --whole-time-score \
+            --shared-dir /tmp/portfolios_wt_shared \
+            --combos-file /tmp/portfolios_wt_shared/chunks/combo_chunk_${{ matrix.chunk_index }}.json \
+            --output-file /tmp/portfolios_wt_parts/part_${{ matrix.chunk_index }}.parquet
+
+      - name: آپلود part این chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-wt-part-${{ matrix.chunk_index }}-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts/part_${{ matrix.chunk_index }}.parquet
+          retention-days: 1
+
+  portfolios-whole-time-merge:
+    needs: [portfolios-whole-time-build, portfolios-whole-time-score]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.portfolios-whole-time-build.outputs.empty == 'false' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود همه‌ی partهای فاز ۲ (matrix)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts
+          merge-multiple: true
+
+      - name: "[دیباگ کد ۱۴۳] چک اینکه فایل‌های part واقعاً دانلود شده‌اند"
+        run: |
+          echo "تعداد فایل part_*.parquet روی دیسک:"
+          find /tmp/portfolios_wt_parts -name 'part_*.parquet' | wc -l
+          echo "لیست کامل + حجم هرکدام:"
+          ls -la /tmp/portfolios_wt_parts/ || echo "⚠️ پوشه‌ی parts وجود ندارد"
+          echo "مجموع حجم:"
+          du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
+          echo "حافظه‌ی آزاد runner قبل از شروع merge:"
+          free -h
+
+      - name: دانلود portfolios_whole_time.csv قبلی از مخزن سوم (برای ادغام با تاریخچه)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          API_RESP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/analysis_results/portfolios_whole_time.csv.enc")
+          DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+          if [ -n "$DL_URL" ]; then
+            curl -s -H "Authorization: token $GH_TOKEN" -L "$DL_URL" -o /tmp/portfolios_wt_prev.enc
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('/tmp/portfolios_wt_prev.enc');
+              const iv=data.subarray(0,16), ct=data.subarray(16);
+              const key=crypto.scryptSync(pass,'salt',32);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+              fs.writeFileSync('/tmp/portfolios_whole_time_previous.csv', dec);
+            "
+            echo "✅ نسخه‌ی قبلی portfolios_whole_time.csv دانلود شد."
+          else
+            echo "ℹ️ نسخه‌ی قبلی یافت نشد — این اولین چرخه است."
+          fi
+          rm -f /tmp/portfolios_wt_prev.enc
+
+      - name: ادغام نهایی + نرمال‌سازی/انتخاب سراسری (فاز ۳)
+        run: |
+          mkdir -p /tmp/portfolios_whole_time_out
+
+          # [فیکس ریشه‌ای OOM] راهبرد پیش‌فرض از "full" به "columnar" تغییر
+          # کرد. لاگ آخرین اجرا نشون داد "full" مشکلش preemption زیرساخت
+          # نبود — OOM واقعی بود: فقط با decode شدن ستون‌های تودرتوی
+          # (members/member_coin_compositions/member_signatures) دو تا از
+          # ۲۰ part، حافظه از ۱۶۵MB رفت روی ۱۵GB (از ۱۶GB کل رانر) و فقط
+          # ۲۰۴MB آزاد مونده بود؛ چون این سه ستون برای همه‌ی partها با هم
+          # decode و نگه داشته می‌شن (بدون آزادسازی بین partها)، رشد حافظه
+          # خطی با تعداد part است و برای ۲۰ part اصلاً روی رانر ۱۶GB جا
+          # نمی‌شه. "columnar" دقیقاً برای همین ساخته شده: پاس اول فقط
+          # ستون‌های سبک (اسکالر) همه‌ی partها رو می‌خونه، evaluate_group_finalize
+          # روی همون‌ها برنده‌ها رو انتخاب می‌کنه، و فقط برای همون چند ردیف
+          # برنده ستون‌های سنگین از part اصلی‌شون خونده می‌شه.
+          (
+            while true; do
+              {
+                echo "---- $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) ----"
+                free -m
+                echo "top 5 پروسس از نظر حافظه:"
+                ps aux --sort=-%mem | head -6
+              } >> /tmp/oom_watch.log
+              sync
+              sleep 2
+            done
+          ) &
+          WATCHER_PID=$!
+
+          set +e
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_whole_time_out \
+            --whole-time-merge \
+            --whole-time-merge-strategy columnar \
+            --parts-dir /tmp/portfolios_wt_parts \
+            --previous-whole-time-csv /tmp/portfolios_whole_time_previous.csv \
+            --min-score 50 \
+            --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          kill "$WATCHER_PID" 2>/dev/null || true
+
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "❌ portfolios.py --whole-time-merge (strategy=columnar) با کد $PY_EXIT شکست خورد."
+            exit "$PY_EXIT"
+          fi
+          echo "✅ portfolios.py --whole-time-merge (strategy=columnar) اجرا شد."
+
+      - name: "[دیباگ کد ۱۴۳] آپلود لاگ‌های دیباگ (همیشه، حتی روی fail)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-merge-debug-logs-${{ github.run_id }}
+          path: |
+            /tmp/oom_watch.log
+            /tmp/portfolios_merge.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
+        run: |
+          FOUND=$(find /tmp/portfolios_whole_time_out -name 'portfolios_whole_time*.csv' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "⚠️ هیچ portfolios_whole_time*.csv تولید نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp "$FOUND" portfolios_outputs/portfolios_whole_time.csv
+          # [فیکس معماری regular/whole-time مشترک] portfolios.csv قبلاً توسط
+          # run() جدا تولید می‌شد؛ چون آن مسیر (portfolios-batch) حذف شد و
+          # این‌جا دقیقاً همان محاسبه است، یک کپی ساده جای تولید مجدد را می‌گیرد
+          # تا قرارداد بیرونیِ نام فایل (analysis_results/portfolios.csv.enc) نشکند.
+          cp "$FOUND" portfolios_outputs/portfolios.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios whole-time outputs (run ${{ github.run_id }})"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/portfolios_whole_time.csv موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+      # [فیکس ریشه‌ای کد ۱ در timeline] علاوه بر commit/push به main، فایل رو
+      # به‌عنوان آرتیفکت هم آپلود می‌کنیم. جاب‌های بعدی (مثل timeline) با
+      # actions/checkout بدون ref: مشخص، کامیتی که هنگام trigger شدن
+      # workflow ثابت شده رو می‌گیرن — نه لزوماً آخرین HEAD شاخه‌ی main.
+      # پس اگه این جاب بعد از اون لحظه یه کامیت جدید push کنه، جاب بعدی
+      # ممکنه اون فایل رو تو checkoutِ خودش نبینه (race condition).
+      # آرتیفکت به این race وابسته نیست.
+      - name: آپلود portfolios_whole_time.csv به‌عنوان آرتیفکت (مستقل از race با checkout)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: portfolios_outputs/portfolios_whole_time.csv
+          if-no-files-found: warn
+          retention-days: 7
+
+  portfolios-whole-time-merge-retry1:
+    needs: [portfolios-whole-time-merge]
+    runs-on: ubuntu-latest
+    # [فیکس] بدون always()/failure() اینجا، GitHub Actions به‌صورت ضمنی
+    # success() رو به این شرط اضافه می‌کنه؛ چون portfolios-whole-time-merge
+    # fail شده، success() خودش false می‌شه و کل جاب skip میشه — مهم نیست
+    # مقایسه‌ی result=='failure' درست باشه یا نه.
+    if: ${{ always() && needs.portfolios-whole-time-merge.result == 'failure' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود همه‌ی partهای فاز ۲ (matrix)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts
+          merge-multiple: true
+
+      - name: "[دیباگ کد ۱۴۳] چک اینکه فایل‌های part واقعاً دانلود شده‌اند"
+        run: |
+          echo "تعداد فایل part_*.parquet روی دیسک:"
+          find /tmp/portfolios_wt_parts -name 'part_*.parquet' | wc -l
+          ls -la /tmp/portfolios_wt_parts/ || echo "⚠️ پوشه‌ی parts وجود ندارد"
+          du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
+          free -h
+
+      - name: دانلود portfolios_whole_time.csv قبلی از مخزن سوم (برای ادغام با تاریخچه)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          API_RESP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/analysis_results/portfolios_whole_time.csv.enc")
+          DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+          if [ -n "$DL_URL" ]; then
+            curl -s -H "Authorization: token $GH_TOKEN" -L "$DL_URL" -o /tmp/portfolios_wt_prev.enc
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('/tmp/portfolios_wt_prev.enc');
+              const iv=data.subarray(0,16), ct=data.subarray(16);
+              const key=crypto.scryptSync(pass,'salt',32);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+              fs.writeFileSync('/tmp/portfolios_whole_time_previous.csv', dec);
+            "
+            echo "✅ نسخه‌ی قبلی portfolios_whole_time.csv دانلود شد."
+          else
+            echo "ℹ️ نسخه‌ی قبلی یافت نشد — این اولین چرخه است."
+          fi
+          rm -f /tmp/portfolios_wt_prev.enc
+
+      - name: "تلاش دوم: تلاش مجدد با همون راهبرد امن columnar (retry ساده، برای preemption موقت)"
+        run: |
+          mkdir -p /tmp/portfolios_whole_time_out
+          (
+            while true; do
+              {
+                echo "---- $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) ----"
+                free -m
+                ps aux --sort=-%mem | head -6
+              } >> /tmp/oom_watch.log
+              sync
+              sleep 2
+            done
+          ) &
+          WATCHER_PID=$!
+
+          set +e
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_whole_time_out \
+            --whole-time-merge \
+            --whole-time-merge-strategy columnar \
+            --parts-dir /tmp/portfolios_wt_parts \
+            --previous-whole-time-csv /tmp/portfolios_whole_time_previous.csv \
+            --min-score 50 \
+            --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          kill "$WATCHER_PID" 2>/dev/null || true
+
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "❌ تلاش دوم (columnar) هم با کد $PY_EXIT شکست خورد."
+            exit "$PY_EXIT"
+          fi
+          echo "✅ تلاش دوم (columnar) موفق بود."
+
+      - name: "[دیباگ کد ۱۴۳] آپلود لاگ‌های دیباگ (همیشه، حتی روی fail)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-merge-retry1-debug-logs-${{ github.run_id }}
+          path: |
+            /tmp/oom_watch.log
+            /tmp/portfolios_merge.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
+        run: |
+          FOUND=$(find /tmp/portfolios_whole_time_out -name 'portfolios_whole_time*.csv' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "⚠️ هیچ portfolios_whole_time*.csv تولید نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp "$FOUND" portfolios_outputs/portfolios_whole_time.csv
+          # [فیکس معماری regular/whole-time مشترک] portfolios.csv قبلاً توسط
+          # run() جدا تولید می‌شد؛ چون آن مسیر (portfolios-batch) حذف شد و
+          # این‌جا دقیقاً همان محاسبه است، یک کپی ساده جای تولید مجدد را می‌گیرد
+          # تا قرارداد بیرونیِ نام فایل (analysis_results/portfolios.csv.enc) نشکند.
+          cp "$FOUND" portfolios_outputs/portfolios.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios whole-time outputs (run ${{ github.run_id }}, retry=1, strategy=columnar)"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/portfolios_whole_time.csv موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+      # [فیکس ریشه‌ای کد ۱ در timeline] همون دلیل بالا: آرتیفکت مستقل از
+      # race بین commit/push این جاب و checkout جاب timeline است.
+      - name: آپلود portfolios_whole_time.csv به‌عنوان آرتیفکت (مستقل از race با checkout)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: portfolios_outputs/portfolios_whole_time.csv
+          if-no-files-found: warn
+          retention-days: 7
+
+  portfolios-whole-time-merge-retry2:
+    needs: [portfolios-whole-time-merge-retry1]
+    runs-on: ubuntu-latest
+    # [فیکس] همون مشکل retry1: بدون always()، اگر retry1 هم fail بشه (یا
+    # حتی skip بشه)، success() ضمنی این جاب رو هم skip می‌کنه.
+    if: ${{ always() && needs.portfolios-whole-time-merge-retry1.result == 'failure' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: دانلود همه‌ی partهای فاز ۲ (matrix)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: portfolios-wt-part-*-${{ github.run_id }}
+          path: /tmp/portfolios_wt_parts
+          merge-multiple: true
+
+      - name: "[دیباگ کد ۱۴۳] چک اینکه فایل‌های part واقعاً دانلود شده‌اند"
+        run: |
+          echo "تعداد فایل part_*.parquet روی دیسک:"
+          find /tmp/portfolios_wt_parts -name 'part_*.parquet' | wc -l
+          ls -la /tmp/portfolios_wt_parts/ || echo "⚠️ پوشه‌ی parts وجود ندارد"
+          du -sh /tmp/portfolios_wt_parts/ 2>/dev/null || true
+          free -h
+
+      - name: دانلود portfolios_whole_time.csv قبلی از مخزن سوم (برای ادغام با تاریخچه)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          API_RESP=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/analysis_results/portfolios_whole_time.csv.enc")
+          DL_URL=$(echo "$API_RESP" | jq -r '.download_url // empty' 2>/dev/null || echo "")
+          if [ -n "$DL_URL" ]; then
+            curl -s -H "Authorization: token $GH_TOKEN" -L "$DL_URL" -o /tmp/portfolios_wt_prev.enc
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('/tmp/portfolios_wt_prev.enc');
+              const iv=data.subarray(0,16), ct=data.subarray(16);
+              const key=crypto.scryptSync(pass,'salt',32);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(ct),decipher.final()]);
+              fs.writeFileSync('/tmp/portfolios_whole_time_previous.csv', dec);
+            "
+            echo "✅ نسخه‌ی قبلی portfolios_whole_time.csv دانلود شد."
+          else
+            echo "ℹ️ نسخه‌ی قبلی یافت نشد — این اولین چرخه است."
+          fi
+          rm -f /tmp/portfolios_wt_prev.enc
+
+      - name: "تلاش سوم: ادغام با راهبرد columnar (فالبک ۲، کم‌مصرف‌ترین)"
+        run: |
+          mkdir -p /tmp/portfolios_whole_time_out
+          (
+            while true; do
+              {
+                echo "---- $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) ----"
+                free -m
+                ps aux --sort=-%mem | head -6
+              } >> /tmp/oom_watch.log
+              sync
+              sleep 2
+            done
+          ) &
+          WATCHER_PID=$!
+
+          set +e
+          python modules/portfolios.py \
+            --signatures-dir /tmp \
+            --output-dir /tmp/portfolios_whole_time_out \
+            --whole-time-merge \
+            --whole-time-merge-strategy columnar \
+            --parts-dir /tmp/portfolios_wt_parts \
+            --previous-whole-time-csv /tmp/portfolios_whole_time_previous.csv \
+            --min-score 50 \
+            --top-n 15 2>&1 | tee /tmp/portfolios_merge.log
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          kill "$WATCHER_PID" 2>/dev/null || true
+
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "❌ فالبک ۲ (columnar) هم با کد $PY_EXIT شکست خورد — هر سه راهبرد ناموفق بودند."
+            exit "$PY_EXIT"
+          fi
+          echo "✅ فالبک ۲ (columnar) موفق بود."
+
+      - name: "[دیباگ کد ۱۴۳] آپلود لاگ‌های دیباگ (همیشه، حتی روی fail)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-merge-retry2-debug-logs-${{ github.run_id }}
+          path: |
+            /tmp/oom_watch.log
+            /tmp/portfolios_merge.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: آپلود portfolios_whole_time.csv به مخزن اصلی (portfolios_outputs/)
+        run: |
+          FOUND=$(find /tmp/portfolios_whole_time_out -name 'portfolios_whole_time*.csv' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "⚠️ هیچ portfolios_whole_time*.csv تولید نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp "$FOUND" portfolios_outputs/portfolios_whole_time.csv
+          # [فیکس معماری regular/whole-time مشترک] portfolios.csv قبلاً توسط
+          # run() جدا تولید می‌شد؛ چون آن مسیر (portfolios-batch) حذف شد و
+          # این‌جا دقیقاً همان محاسبه است، یک کپی ساده جای تولید مجدد را می‌گیرد
+          # تا قرارداد بیرونیِ نام فایل (analysis_results/portfolios.csv.enc) نشکند.
+          cp "$FOUND" portfolios_outputs/portfolios.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios whole-time outputs (run ${{ github.run_id }}, fallback=columnar)"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/portfolios_whole_time.csv موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+      # [فیکس ریشه‌ای کد ۱ در timeline] همون دلیل بالا: آرتیفکت مستقل از
+      # race بین commit/push این جاب و checkout جاب timeline است.
+      - name: آپلود portfolios_whole_time.csv به‌عنوان آرتیفکت (مستقل از race با checkout)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: portfolios_outputs/portfolios_whole_time.csv
+          if-no-files-found: warn
+          retention-days: 7
+
+  portfolios-whole-time-merge-final:
+    needs: [portfolios-whole-time-merge, portfolios-whole-time-merge-retry1, portfolios-whole-time-merge-retry2]
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      result: ${{ steps.decide.outputs.result }}
+    steps:
+      - name: تعیین نتیجه‌ی نهایی سه تلاش ادغام
+        id: decide
+        run: |
+          if [ "${{ needs.portfolios-whole-time-merge.result }}" = "success" ] || \
+             [ "${{ needs.portfolios-whole-time-merge-retry1.result }}" = "success" ] || \
+             [ "${{ needs.portfolios-whole-time-merge-retry2.result }}" = "success" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          elif [ "${{ needs.portfolios-whole-time-merge.result }}" = "skipped" ] && \
+               [ "${{ needs.portfolios-whole-time-merge-retry1.result }}" = "skipped" ] && \
+               [ "${{ needs.portfolios-whole-time-merge-retry2.result }}" = "skipped" ]; then
+            echo "result=skipped" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+  portfolios-timeline:
+    needs: [portfolios-generate-matrix, portfolios-whole-time-merge-final]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.portfolios-generate-matrix.outputs.empty != 'true' && needs.portfolios-whole-time-merge-final.outputs.result == 'success' }}
+    steps:
+      # [فیکس کد ۱] قبلاً بدون ref، چک‌اوت روی کامیتِ ثابتِ لحظه‌ی trigger
+      # شدنِ workflow انجام می‌شد، نه آخرین HEAD شاخه‌ی main. چون جاب‌های
+      # portfolios-whole-time-merge/retry1/retry2 بعد از اون لحظه یه کامیت
+      # جدید (شامل portfolios_outputs/portfolios_whole_time.csv) به main
+      # push می‌کنن، این جاب اون فایل رو تو checkout خودش نمی‌دید.
+      # ref: main رو صریح می‌کنیم تا آخرین HEAD گرفته بشه (دفاع دوم؛
+      # دفاع اصلی دانلود از آرتیفکت در ادامه‌ست).
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+
+      - name: 1. دانلود چانک‌های صف از آرتیفکت portfolios-generate-matrix (بدون وابستگی به تایمینگ cleanup)
+        id: download_chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-chunks-${{ github.run_id }}
+          path: /tmp/portfolios_chunks
+        continue-on-error: true
+
+      - name: بازسازی all_combinations_portfolios.json از چانک‌های تغییرناپذیر آرتیفکت
+        id: queue_full
+        run: |
+          if [ "${{ steps.download_chunks.outcome }}" != "success" ]; then
+            echo "⚠️ آرتیفکت portfolios-chunks-${{ github.run_id }} یافت نشد — رد می‌شویم."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHUNK_FILES=$(ls /tmp/portfolios_chunks/chunk_*.json 2>/dev/null | sort -t_ -k2 -n)
+          if [ -z "$CHUNK_FILES" ]; then
+            echo "⚠️ هیچ chunk_*.json در آرتیفکت یافت نشد — رد می‌شویم."
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          jq -s 'add' $CHUNK_FILES > /tmp/all_combinations_portfolios.json
+          QUEUE_TOTAL=$(jq 'length' /tmp/all_combinations_portfolios.json)
+          echo "ℹ️ تعداد آیتم‌های صف (بازسازی‌شده از آرتیفکت، نه دانلود مجدد): $QUEUE_TOTAL"
+          if [ "$QUEUE_TOTAL" -eq 0 ]; then
+            echo "queue_empty=true" >> $GITHUB_OUTPUT
+          else
+            echo "queue_empty=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 2. دانلود golden_scores.csv از مخزن سوم
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/golden_scores
+          HTTP_CODE=$(curl -s -o /tmp/golden_scores.csv.enc -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/golden_scores.csv.tar.gz.enc")
+
+          if [ "$HTTP_CODE" = "404" ]; then
+            echo "ℹ️ golden_scores.csv.tar.gz.enc موجود نیست — بدون golden_scores اجرا می‌شود."
+            exit 0
+          fi
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/golden_scores.csv.enc ]; then
+            echo "❌ golden_scores.csv.tar.gz.enc دریافت نشد (HTTP $HTTP_CODE)."
+            exit 1
+          fi
+
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const data=fs.readFileSync('/tmp/golden_scores.csv.enc');
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=data.slice(0,16),enc=data.slice(16);
+            const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+            const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+            fs.writeFileSync('/tmp/golden_scores.tar.gz',dec);
+          "
+          if [ ! -s /tmp/golden_scores.tar.gz ]; then
+            echo "❌ رمزگشایی golden_scores.tar.gz ناموفق بود."; exit 1
+          fi
+          tar -xzf /tmp/golden_scores.tar.gz -C /tmp/golden_scores
+          FOUND_CSV=$(find /tmp/golden_scores -name '*.csv' | head -1)
+          if [ -z "$FOUND_CSV" ]; then
+            echo "❌ هیچ فایل .csv داخل tar.gz یافت نشد."; exit 1
+          fi
+          if [ "$FOUND_CSV" != "/tmp/golden_scores/golden_scores.csv" ]; then
+            mv "$FOUND_CSV" /tmp/golden_scores/golden_scores.csv
+          fi
+          echo "✅ golden_scores.csv دریافت، رمزگشایی و استخراج شد."
+
+      - name: 3. دانلود و استخراج تمام آرشیوهای صف (نه فقط یک chunk)
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/archives_extracted_tl
+          jq -r '[.[] | if type == "object" then .archive_path else empty end]
+                 | map(select(. != null and . != "")) | unique | .[]' \
+            /tmp/all_combinations_portfolios.json > /tmp/archive_list_tl.txt
+
+          ARCH_TOTAL=$(wc -l < /tmp/archive_list_tl.txt | tr -d ' ')
+          echo "ℹ️ تعداد کل آرشیوهای یکتا: $ARCH_TOTAL"
+          if [ "$ARCH_TOTAL" -eq 0 ]; then
+            echo "❌ هیچ archive_path در صف یافت نشد."; exit 1
+          fi
+
+          FAIL_COUNT=0
+          while IFS= read -r ARCH_PATH; do
+            [ -z "$ARCH_PATH" ] && continue
+            DL_URL=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/$ARCH_PATH" | jq -r '.download_url // empty')
+            if [ -z "$DL_URL" ] || [ "$DL_URL" = "null" ]; then
+              echo "⚠️ آدرس دانلود برای $ARCH_PATH یافت نشد — رد می‌شود."
+              FAIL_COUNT=$((FAIL_COUNT+1)); continue
+            fi
+            ENC_FILE="/tmp/$(basename "$ARCH_PATH")"
+            curl -s -L -H "Authorization: token $GH_TOKEN" -o "$ENC_FILE" "$DL_URL"
+            if [ ! -s "$ENC_FILE" ]; then
+              echo "⚠️ دانلود $ARCH_PATH ناموفق بود — رد می‌شود."
+              FAIL_COUNT=$((FAIL_COUNT+1)); rm -f "$ENC_FILE"; continue
+            fi
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('$ENC_FILE');
+              const key=crypto.scryptSync(pass,'salt',32);
+              const iv=data.slice(0,16),enc=data.slice(16);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+              fs.writeFileSync('${ENC_FILE%.enc}',dec);
+            " 2>/dev/null && tar -xzf "${ENC_FILE%.enc}" -C /tmp/archives_extracted_tl \
+              || { echo "⚠️ رمزگشایی/استخراج $ARCH_PATH ناموفق بود."; FAIL_COUNT=$((FAIL_COUNT+1)); }
+            rm -f "$ENC_FILE" "${ENC_FILE%.enc}"
+          done < /tmp/archive_list_tl.txt
+
+          JSONL_TOTAL=$(find /tmp/archives_extracted_tl -name '*.jsonl' | wc -l)
+          echo "✅ تعداد $JSONL_TOTAL فایل JSONL استخراج‌شده از $ARCH_TOTAL آرشیو (ناموفق: $FAIL_COUNT)."
+          rm -f /tmp/archive_list_tl.txt
+
+          if [ "$JSONL_TOTAL" -eq 0 ]; then
+            echo "❌ هیچ فایل .jsonl استخراج نشد."; exit 1
+          fi
+
+      # [فیکس ریشه‌ای کد ۱] دانلود مستقیم از آرتیفکتی که جاب merge/retry1/retry2
+      # (هرکدوم موفق شده) آپلود کرده. این راه به race بین commit/push و
+      # checkout وابسته نیست، چون از طریق GitHub Actions artifacts منتقل
+      # می‌شه، نه از طریق git history.
+      - name: "3.5. دانلود portfolios_whole_time.csv از آرتیفکت جاب merge (مطمئن، بدون race با checkout)"
+        id: download_whole_time
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: portfolios-whole-time-csv-${{ github.run_id }}
+          path: /tmp/portfolios_whole_time_csv
+        continue-on-error: true
+
+      - name: 4. اجرای portfolios.py --timeline
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        run: |
+          WHOLE_TIME_CSV=""
+          if [ -s /tmp/portfolios_whole_time_csv/portfolios_whole_time.csv ]; then
+            WHOLE_TIME_CSV="/tmp/portfolios_whole_time_csv/portfolios_whole_time.csv"
+            echo "ℹ️ portfolios_whole_time.csv از آرتیفکت جاب merge گرفته شد."
+          elif [ -s portfolios_outputs/portfolios_whole_time.csv ]; then
+            WHOLE_TIME_CSV="portfolios_outputs/portfolios_whole_time.csv"
+            echo "ℹ️ آرتیفکت پیدا نشد — به‌جاش از نسخه‌ی چک‌اوت‌شده از مخزن استفاده شد (فالبک)."
+          else
+            echo "❌ portfolios_whole_time.csv نه در آرتیفکت و نه در چک‌اوت مخزن یافت نشد یا خالی است."
+            echo "   طبق طراحیِ جدید، timeline بدون آن هیچ سبدی نمی‌سازد."
+            exit 1
+          fi
+
+          mkdir -p /tmp/portfolios_timeline_out
+          GOLDEN_ARG=""
+          if [ -f /tmp/golden_scores/golden_scores.csv ]; then
+            GOLDEN_ARG="--golden-scores /tmp/golden_scores/golden_scores.csv"
+          else
+            echo "ℹ️ golden_scores.csv موجود نیست — بدون آن اجرا می‌شود."
+          fi
+
+          python modules/portfolios.py \
+            --signatures-dir /tmp/archives_extracted_tl \
+            $GOLDEN_ARG \
+            --output-dir /tmp/portfolios_timeline_out \
+            --whole-time-csv "$WHOLE_TIME_CSV" \
+            --timeline
+          echo "✅ portfolios.py --timeline اجرا شد."
+
+      - name: 5. آپلود portfolios_timeline.csv به مخزن اصلی (portfolios_outputs/)
+        if: steps.queue_full.outputs.queue_empty != 'true'
+        run: |
+          FOUND=$(find /tmp/portfolios_timeline_out -name 'portfolios_timeline*.csv' | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "⚠️ هیچ portfolios_timeline*.csv تولید نشد — رد می‌شویم."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p portfolios_outputs
+          cp "$FOUND" portfolios_outputs/portfolios_timeline.csv
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git add -f portfolios_outputs
+          if git diff --cached --quiet; then
+            echo "ℹ️ چیزی برای commit نیست."
+          else
+            git commit -m "portfolios timeline outputs (run ${{ github.run_id }})"
+            for attempt in $(seq 1 10); do
+              git pull --rebase || true
+              if git push; then
+                echo "✅ push portfolios_outputs/portfolios_timeline.csv موفق بود."
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+          fi
+
+  portfolios-trigger-next-loop:
+    needs: [portfolios-cleanup, portfolios-whole-time-merge-final, portfolios-timeline]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ always() &&
+          !(needs.portfolios-cleanup.result == 'skipped' &&
+            needs.portfolios-whole-time-merge-final.outputs.result == 'skipped' &&
+            needs.portfolios-timeline.result == 'skipped') }}
+    steps:
+      - name: فراخوانی مجدد loop_analysis.yml
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          CS="${{ github.event.inputs.chunk_start }}"
+          CE="${{ github.event.inputs.chunk_end }}"
+          if [ -n "$CS" ] || [ -n "$CE" ]; then
+            gh api repos/${{ github.repository }}/actions/workflows/loop_analysis.yml/dispatches \
+              -X POST \
+              -f ref="main" \
+              -f "inputs[chunk_start]=${CS}" \
+              -f "inputs[chunk_end]=${CE}"
+          else
+            gh api repos/${{ github.repository }}/actions/workflows/loop_analysis.yml/dispatches \
+              -X POST -f ref="main"
+          fi

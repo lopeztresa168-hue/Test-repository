@@ -1,0 +1,74 @@
+name: پاک‌سازی خروجی‌های fixed با سشن نادرست
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "اگر true باشه واقعاً حذف/ری‌کیو انجام می‌شه؛ اگر false فقط گزارش می‌ده (dry-run)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: purge-session-mismatches
+  cancel-in-progress: false
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    # ۹۰ دقیقه (به‌جای ۶۰): اسکریپت حالا علاوه بر batch_outputs محلی، آرشیوهای
+    # signature_archives/pattern_archives را هم در مخزن سوم دانلود/رمزگشایی/
+    # بازفشرده‌سازی/آپلود می‌کند که می‌تواند به‌ازای هر آرشیو چند ثانیه طول بکشد.
+    timeout-minutes: 90
+    steps:
+      - name: چک‌اوت مخزن اصلی
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: تنظیمات git برای commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: نصب Node.js و gh CLI
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: نصب وابستگی‌های پایتون (اختیاری)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: بررسی دسترسی gh CLI
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}   # ← تغییر نام
+        run: gh auth status || echo "gh auth از طریق GH_TOKEN env انجام می‌شود"
+
+      - name: اجرای اسکریپت پاک‌سازی
+        env:
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}   # ← تغییر نام
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD }}
+          BATCH_OUTPUTS_ROOT: batch_outputs
+        run: |
+          MODE_FLAG="--scan-only"
+          if [ "${{ inputs.apply }}" == "true" ]; then
+            MODE_FLAG="--apply"
+          fi
+          echo "🔧 اجرا با فلگ: $MODE_FLAG"
+          python3 scripts/purge_session_mismatches.py $MODE_FLAG
+
+      - name: آپلود گزارش
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-mismatches-report
+          path: /tmp/session_mismatches.json
+          if-no-files-found: warn
+          retention-days: 30

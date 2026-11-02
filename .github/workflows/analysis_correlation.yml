@@ -1,0 +1,836 @@
+name: Complete Analysis Pipeline
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: analysis-runner-correlation
+  cancel-in-progress: false
+
+jobs:
+  # ================================================================
+  # correlation-generate-matrix: تولید صف کار برای ماژول correlation
+  # ================================================================
+  correlation-generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_items: ${{ steps.gen.outputs.matrix_items }}
+      empty: ${{ steps.gen.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: دانلود و استخراج یک‌باره همه archiveهای signature
+        id: extract
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/signatures
+          TREE=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/git/trees/main?recursive=1")
+
+          ARCHIVES=$(echo "$TREE" | jq -r '[.tree[] | select(.path | startswith("signature_archives/")) | select(.path | endswith(".tar.gz.enc")) | .path] | unique')
+          ARCHIVE_COUNT=$(echo "$ARCHIVES" | jq 'length')
+          echo "[DEBUG] تعداد archive های signature: $ARCHIVE_COUNT"
+
+          # دریافت لیست آرشیوهای قبلاً پردازش‌شده از completed_archives.json
+          # (فایل جداگانه‌ای که نام آرشیوهای پردازش‌شده را نگه می‌دارد — نه completed_correlation.json)
+          COMPLETED_ARCHIVES_RAW=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/completed_archives.json" 2>/dev/null || echo "[]")
+          echo "$COMPLETED_ARCHIVES_RAW" | jq -e 'type == "array"' >/dev/null 2>&1 || COMPLETED_ARCHIVES_RAW="[]"
+          echo "$COMPLETED_ARCHIVES_RAW" > /tmp/completed_archives_list.json
+
+          # [DIAG] لاگ کامل وضعیت ورودی قبل از شروع حلقه — برای تشخیص قطعی ددلاک
+          COMPLETED_COUNT_BEFORE=$(jq length /tmp/completed_archives_list.json 2>/dev/null || echo "ERR")
+          echo "[DIAG] ARCHIVE_COUNT (کل آرشیوهای موجود در repo) = $ARCHIVE_COUNT"
+          echo "[DIAG] COMPLETED_ARCHIVES_COUNT (تعداد قبلاً پردازش‌شده طبق completed_archives.json) = $COMPLETED_COUNT_BEFORE"
+
+          # FIX: تشخیص و رفع ددلاک
+          # اگه صف (all_combinations_correlation.json) پر باشه ولی /tmp/all_signatures خالی بمونه
+          # یعنی state ناهماهنگه — completed_archives.json رو برای skip logic نادیده می‌گیریم
+          QUEUE_PRECHECK_COUNT=0
+          QUEUE_PRECHECK_RAW=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_correlation.json" 2>/dev/null || echo "[]")
+          jq empty <<<"$QUEUE_PRECHECK_RAW" 2>/dev/null && \
+            QUEUE_PRECHECK_COUNT=$(jq length <<<"$QUEUE_PRECHECK_RAW" 2>/dev/null || echo "0") || \
+            QUEUE_PRECHECK_COUNT=0
+
+          FORCE_REEXTRACT=false
+          if [ "$ARCHIVE_COUNT" -gt 0 ] && [ "$COMPLETED_COUNT_BEFORE" != "ERR" ] && [ "$ARCHIVE_COUNT" -le "$COMPLETED_COUNT_BEFORE" ]; then
+            echo "[DIAG] ⚠️ ARCHIVE_COUNT <= COMPLETED_ARCHIVES_COUNT — ددلاک محتمل."
+            if [ "$QUEUE_PRECHECK_COUNT" -gt 0 ]; then
+              echo "[FIX] 🔄 صف ($QUEUE_PRECHECK_COUNT آیتم) پر است ولی همه آرشیوها در completed_archives.json هستند."
+              echo "[FIX] → force re-extract فعال شد. completed_archives.json برای این run نادیده گرفته می‌شود."
+              FORCE_REEXTRACT=true
+              # تاریخچه قدیمی رو جدا نگه می‌داریم برای merge نهایی (نه برای skip logic)
+              cp /tmp/completed_archives_list.json /tmp/completed_archives_history.json
+              echo "[]" > /tmp/completed_archives_list.json
+            else
+              echo "[DIAG] ⚠️ ARCHIVE_COUNT <= COMPLETED_ARCHIVES_COUNT — ولی صف هم خالیه. ددلاک نیست، کار تمام شده."
+            fi
+          else
+            echo "[]" > /tmp/completed_archives_history.json
+          fi
+
+          SKIPPED_COUNT=0
+          NEW_COUNT=0
+          echo "$ARCHIVES" | jq -r '.[]' > /tmp/archives_list.txt
+          while read -r ARCH_PATH; do
+            # بررسی اینکه آیا این آرشیو قبلاً پردازش شده است
+            # (اگه FORCE_REEXTRACT=true باشه، این چک همیشه false برمی‌گردونه چون لیست رو reset کردیم)
+            ARCH_BASENAME=$(basename "$ARCH_PATH")
+            ALREADY_DONE=$(jq --arg p "$ARCH_PATH" --arg b "$ARCH_BASENAME" \
+              'map(select(. == $p or . == $b)) | length' /tmp/completed_archives_list.json 2>/dev/null || echo "0")
+            if [ "$ALREADY_DONE" != "0" ] && [ "$ALREADY_DONE" != "" ]; then
+              SKIPPED_COUNT=$((SKIPPED_COUNT+1))
+              echo "ℹ️ آرشیو قبلاً پردازش شده — رد می‌شود: $ARCH_PATH"
+              continue
+            fi
+            NEW_COUNT=$((NEW_COUNT+1))
+
+            DL_URL=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/$ARCH_PATH" | jq -r '.download_url')
+            [ -z "$DL_URL" ] || [ "$DL_URL" = "null" ] && continue
+            ENC_FILE="/tmp/$(basename "$ARCH_PATH")"
+            curl -s -L -H "Authorization: token $GH_TOKEN" -o "$ENC_FILE" "$DL_URL"
+            [ -s "$ENC_FILE" ] || continue
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('$ENC_FILE');
+              const key=crypto.scryptSync(pass,'salt',32);
+              const iv=data.slice(0,16),enc=data.slice(16);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+              fs.writeFileSync('${ENC_FILE%.enc}',dec);
+            " 2>/dev/null && tar -xzf "${ENC_FILE%.enc}" -C /tmp && \
+              jq --arg p "$ARCH_PATH" '. + [$p] | unique' /tmp/completed_archives_list.json > /tmp/completed_archives_list.tmp && \
+              mv /tmp/completed_archives_list.tmp /tmp/completed_archives_list.json
+            rm -f "$ENC_FILE" "${ENC_FILE%.enc}"
+          done < /tmp/archives_list.txt
+          rm -f /tmp/archives_list.txt
+
+          # [DIAG] خلاصه نهایی حلقه استخراج
+          echo "[DIAG] خلاصه حلقه: FORCE_REEXTRACT=$FORCE_REEXTRACT  SKIPPED_COUNT=$SKIPPED_COUNT  NEW_COUNT(تلاش‌شده)=$NEW_COUNT  ARCHIVE_COUNT(کل)=$ARCHIVE_COUNT"
+          if [ "$NEW_COUNT" -eq 0 ] && [ "$ARCHIVE_COUNT" -gt 0 ]; then
+            if [ "$FORCE_REEXTRACT" = "true" ]; then
+              echo "[DIAG] 🔴 با وجود force re-extract، هیچ آرشیو جدیدی استخراج نشد. مشکل در دانلود یا رمزگشایی آرشیوها بررسی شود."
+            else
+              echo "[DIAG] 🔴 تایید ددلاک: هیچ آرشیو جدیدی برای استخراج وجود نداشت چون همه در completed_archives.json بودند. این علت اصلی jsonl_total=0 در این اجراست."
+            fi
+          fi
+
+          # FIX: merge تاریخچه قدیمی با نتایج این run قبل از آپلود
+          # (جلوگیری از overwrite تاریخچه وقتی FORCE_REEXTRACT=true بوده)
+          if [ -s /tmp/completed_archives_history.json ] && [ "$(jq length /tmp/completed_archives_history.json 2>/dev/null || echo 0)" != "0" ]; then
+            jq -s '.[0] + .[1] | unique' \
+              /tmp/completed_archives_history.json /tmp/completed_archives_list.json \
+              > /tmp/completed_archives_merged.json
+            mv /tmp/completed_archives_merged.json /tmp/completed_archives_list.json
+            echo "[FIX] تاریخچه قدیمی با نتایج این run ادغام شد."
+          fi
+
+          # آپلود completed_archives.json به‌روزرسانی‌شده به مخزن سوم
+          if [ -s /tmp/completed_archives_list.json ] && [ "$(jq length /tmp/completed_archives_list.json)" != "0" ]; then
+            SHA_CA=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/completed_archives.json" | jq -r '.sha // empty' 2>/dev/null || echo "")
+            base64 -w0 /tmp/completed_archives_list.json > /tmp/completed_archives_b64.txt
+            CA_MSG="update completed_archives (run ${{ github.run_id }})"
+            # fix ARG_MAX + JSON corruption: ساخت payload با jq+--rawfile
+            if [ -n "$SHA_CA" ]; then
+              jq -n \
+                --arg msg "$CA_MSG" \
+                --rawfile content /tmp/completed_archives_b64.txt \
+                --arg sha "$SHA_CA" \
+                '{message: $msg, content: ($content | rtrimstr("\n")), sha: $sha, branch: "main"}' \
+                > /tmp/payload_ca.json
+            else
+              jq -n \
+                --arg msg "$CA_MSG" \
+                --rawfile content /tmp/completed_archives_b64.txt \
+                '{message: $msg, content: ($content | rtrimstr("\n")), branch: "main"}' \
+                > /tmp/payload_ca.json
+            fi
+            curl -s -X PUT -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/json" \
+              --data-binary @/tmp/payload_ca.json \
+              "https://api.github.com/repos/$THIRD_REPO/contents/completed_archives.json" >/dev/null
+            rm -f /tmp/completed_archives_b64.txt /tmp/payload_ca.json
+          fi
+
+          JSONL_TOTAL=$(find /tmp/signatures -name '*.jsonl' | wc -l)
+          echo "✅ تعداد $JSONL_TOTAL فایل JSONL استخراج‌شده از $ARCHIVE_COUNT archive."
+          echo "jsonl_total=$JSONL_TOTAL" >> $GITHUB_OUTPUT
+
+      - name: آپلود یک artifact مشترک با تمام signatureهای استخراج‌شده
+        if: steps.extract.outputs.jsonl_total != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-signatures-${{ github.run_id }}
+          path: /tmp/signatures/
+          retention-days: 1
+
+      - name: تولید صف گسترش‌یافته (فایل‌های JSONL واقعی) و چانک‌بندی ۵۰۰ تایی در Bash
+        id: gen
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          mkdir -p /tmp/correlation_chunks
+
+          # دانلود all_combinations_correlation.json (صف واقعی)
+          # FIX: مدیریت ۴۰۴ — در صورت نبود فایل، empty=true تنظیم می‌شود
+          HTTP_CODE=$(curl -s -o /tmp/all_combinations_correlation.json -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_correlation.json")
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s /tmp/all_combinations_correlation.json ] || ! jq empty /tmp/all_combinations_correlation.json 2>/dev/null; then
+            echo "ℹ️ فایل all_combinations_correlation.json یافت نشد یا نامعتبر است (کد $HTTP_CODE) — empty=true، ادامه بدون پردازش"
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          QUEUE_COUNT=$(jq length /tmp/all_combinations_correlation.json)
+          echo "[DEBUG] تعداد آیتم‌های صف اصلی (سطح آرشیو): $QUEUE_COUNT"
+          if [ "$QUEUE_COUNT" -eq 0 ]; then
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ================================================================
+          # گسترش صف: از «نام آرشیو» به «فایل‌های JSONL واقعی»
+          # signature همان مسیر کامل فایل داخل /tmp است
+          # (مثلاً signatures/combo_10day/Best_15m/BTCUSDT/fixed_5d_simple_hybrid.jsonl)
+          # پیاده‌سازی در پایتون به‌جای bash برای جلوگیری از spawn هزاران subprocess
+          # ================================================================
+          python3 - <<'PYEOF'
+          import json
+          import os
+
+          with open('/tmp/all_combinations_correlation.json') as f:
+              items = json.load(f)
+
+          sig_count = 0
+          for root, dirs, files in os.walk('/tmp/signatures'):
+              sig_count += sum(1 for fn in files if fn.endswith('.jsonl'))
+          print(f"[DIAG] تعداد فایل .jsonl موجود در /tmp/signatures قبل از گسترش صف = {sig_count}")
+
+          expanded = []
+          missing = 0
+          for item in items:
+              sig = item.get('signature', '')
+              coin = item.get('coin_composition', '')
+              full_path = os.path.join('/tmp', sig)
+              if os.path.isfile(full_path):
+                  expanded.append({'coin_composition': coin, 'signature': sig})
+              else:
+                  missing += 1
+
+          with open('/tmp/expanded_queue.json', 'w') as f:
+              json.dump(expanded, f, ensure_ascii=False)
+
+          print(f"[DEBUG] تعداد آیتم‌های صف گسترش‌یافته (فایل‌های JSONL واقعی): {len(expanded)}")
+          if missing:
+              print(f"[DIAG] تعداد آیتم‌هایی که فایلشان پیدا نشد: {missing}")
+          PYEOF
+
+          EXPANDED_COUNT=$(jq length /tmp/expanded_queue.json)
+
+          if [ "$EXPANDED_COUNT" -eq 0 ]; then
+            echo "[DIAG] 🔴 صف گسترش‌یافته خالی است — هیچ پوشه/فایل JSONL منطبقی برای آیتم‌های صف یافت نشد."
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo "matrix_items=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ================================================================
+          # چانک‌بندی ۵۰۰ تایی صف گسترش‌یافته
+          # ================================================================
+          CHUNK_SIZE=500
+          TOTAL=$EXPANDED_COUNT
+          NUM_CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+          for ((i=0; i<NUM_CHUNKS; i++)); do
+            START=$((i*CHUNK_SIZE))
+            jq ".[$START:$((START+CHUNK_SIZE))]" /tmp/expanded_queue.json > /tmp/correlation_chunks/chunk_${i}.json
+          done
+          echo "$NUM_CHUNKS" > /tmp/correlation_chunks/num_chunks.txt
+          echo "[DEBUG] تعداد چانک‌های ساخته‌شده (۵۰۰ تایی): $NUM_CHUNKS از مجموع $TOTAL آیتم"
+
+          INDICES="["
+          for ((i=0; i<NUM_CHUNKS; i++)); do
+            [ $i -gt 0 ] && INDICES+=", "
+            INDICES+="$i"
+          done
+          INDICES+="]"
+          echo "[DEBUG] INDICES=$INDICES"
+          echo "matrix_items=$INDICES" >> $GITHUB_OUTPUT
+          echo "empty=false" >> $GITHUB_OUTPUT
+
+      - name: آپلود چانک‌های correlation
+        if: steps.gen.outputs.empty == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: correlation-chunks-${{ github.run_id }}
+          path: /tmp/correlation_chunks/
+          retention-days: 1
+
+  # ================================================================
+  # correlation-batch: پردازش موازی چانک‌های correlation
+  # ================================================================
+  correlation-batch:
+    needs: [correlation-generate-matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    if: ${{ needs.correlation-generate-matrix.outputs.empty == 'false' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk_index: ${{ fromJson(needs.correlation-generate-matrix.outputs.matrix_items || '[0]') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: دانلود چانک‌های correlation
+        uses: actions/download-artifact@v4
+        with:
+          name: correlation-chunks-${{ github.run_id }}
+          path: /tmp/correlation_chunks
+
+      - name: بررسی Cache این chunk
+        id: cache_check
+        uses: actions/cache@v4
+        with:
+          path: /tmp/correlation_chunk_cache
+          key: correlation-chunk-result-${{ matrix.chunk_index }}-${{ github.run_id }}
+
+      - name: بارگذاری نتایج از Cache در صورت وجود
+        id: prev_check
+        run: |
+          mkdir -p /tmp/correlation_chunk_cache
+          if [ "${{ steps.cache_check.outputs.cache-hit }}" = "true" ] && \
+             [ -f /tmp/correlation_chunk_cache/done_items.json ] && \
+             [ -f /tmp/correlation_chunk_cache/chunk_completed.flag ]; then
+            echo "⏭️ chunk ${{ matrix.chunk_index }} قبلاً کامل شده. بارگذاری نتایج از Cache..."
+            cp /tmp/correlation_chunk_cache/done_items.json /tmp/done_items.json
+            echo "already_done=true" >> $GITHUB_OUTPUT
+          else
+            echo "already_done=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 1. بررسی interrupt.flag
+        if: steps.prev_check.outputs.already_done != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/interrupt.flag")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "🛑 interrupt.flag یافت شد — job خاتمه می‌یابد."
+            exit 0
+          fi
+
+      - name: 2. راه‌اندازی پایتون و نصب کتابخانه‌ها
+        if: steps.prev_check.outputs.already_done != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scipy pyarrow
+        if: steps.prev_check.outputs.already_done != 'true'
+
+      - name: دانلود artifact مشترک تمام signatureهای استخراج‌شده (بدون تماس API)
+        if: steps.prev_check.outputs.already_done != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: all-signatures-${{ github.run_id }}
+          path: /tmp/signatures
+
+      # FIX: استفاده از --signatures-filter برای فیلتر کردن (به‌جای کپی انتخابی)
+      - name: 3. آماده‌سازی signatures برای این چانک
+        if: steps.prev_check.outputs.already_done != 'true'
+        run: |
+          # artifact مستقیم به /tmp/signatures دانلود شد — هیچ کپی اضافی لازم نیست
+          echo "✅ همه signatureها آماده در /tmp/signatures (فیلتر توسط --signatures-filter انجام می‌شود)"
+
+      - name: 5. اجرای correlation.py برای این چانک
+        if: steps.prev_check.outputs.already_done != 'true'
+        run: |
+          mkdir -p /tmp/correlation_chunk_cache
+          python modules/correlation.py \
+            --signatures-dir /tmp/signatures \
+            --news-dir data/news \
+            --output-dir /tmp/correlation_chunk_cache \
+            --interrupt-flag ${{ runner.temp }}/interrupt.flag \
+            --signatures-filter /tmp/correlation_chunks/chunk_${{ matrix.chunk_index }}.json \
+            --resume
+          echo "✅ correlation chunk ${{ matrix.chunk_index }} پردازش شد."
+
+      - name: 5.2. رمزنگاری و ذخیره correlations.parquet به‌عنوان artifact
+        if: steps.prev_check.outputs.already_done != 'true'
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          PARQUET_FILE=$(find /tmp/correlation_chunk_cache -name 'correlations.parquet' 2>/dev/null | head -1)
+          if [ -z "$PARQUET_FILE" ] || [ ! -s "$PARQUET_FILE" ]; then
+            echo "ℹ️ فایل correlations.parquet یافت نشد — رد می‌شود."
+            exit 0
+          fi
+
+          mkdir -p /tmp/corr_output
+          cp "$PARQUET_FILE" /tmp/correlations.parquet
+          tar -czf /tmp/correlations.tar.gz -C /tmp correlations.parquet
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=crypto.randomBytes(16);
+            const data=fs.readFileSync('/tmp/correlations.tar.gz');
+            const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+            const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
+            fs.writeFileSync('/tmp/corr_output/correlations.tar.gz.enc',enc);
+          "
+          echo "✅ correlations.parquet رمزنگاری شد — آماده آپلود به‌عنوان artifact."
+          rm -f /tmp/correlations.parquet /tmp/correlations.tar.gz
+
+      - name: 5.3. آپلود correlations رمزنگاری‌شده به‌عنوان artifact
+        if: steps.prev_check.outputs.already_done != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: corr-parquet-${{ matrix.chunk_index }}-${{ github.run_id }}
+          path: /tmp/corr_output/correlations.tar.gz.enc
+          retention-days: 1
+          if-no-files-found: warn
+
+      # FIX: استفاده از unique_by با کلید ترکیبی (coin_composition, signature)
+      - name: 5.5. ذخیره done_items این chunk در Cache
+        if: always()
+        run: |
+          mkdir -p /tmp/correlation_chunk_cache
+
+          if [ -f /tmp/correlation_chunk_cache/correlation_status.json ]; then
+            jq -c '.processed_signatures // []' /tmp/correlation_chunk_cache/correlation_status.json > /tmp/done_items_from_status.json 2>/dev/null || echo "[]" > /tmp/done_items_from_status.json
+          else
+            echo "[]" > /tmp/done_items_from_status.json
+          fi
+
+          CHUNK_SIGS=$(cat /tmp/correlation_chunks/chunk_${{ matrix.chunk_index }}.json)
+
+          # unique بر اساس ترکیب coin_composition+signature (نه object equality)
+          jq -n --slurpfile arr1 /tmp/done_items_from_status.json --argjson arr2 "$CHUNK_SIGS" \
+            '$arr1[0] + $arr2 | unique_by(.coin_composition + "|||" + .signature)' \
+            > /tmp/done_items_unique.json
+          mv /tmp/done_items_unique.json /tmp/done_items.json
+          cp /tmp/done_items.json /tmp/correlation_chunk_cache/done_items.json
+          touch /tmp/correlation_chunk_cache/chunk_completed.flag
+
+          echo "✅ done_items برای chunk ${{ matrix.chunk_index }} ذخیره شد."
+
+      - name: 6. ذخیره نتایج در Cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: /tmp/correlation_chunk_cache
+          key: correlation-chunk-result-${{ matrix.chunk_index }}-${{ github.run_id }}
+
+      - name: 6.5. آپلود done_items این چانک به‌عنوان artifact مجزا
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: done-items-${{ matrix.chunk_index }}-${{ github.run_id }}
+          path: /tmp/correlation_chunk_cache/done_items.json
+          retention-days: 1
+          if-no-files-found: warn
+
+  # ================================================================
+  # correlation-cleanup: ادغام نتایج correlation و حذف از صف
+  # ================================================================
+  correlation-cleanup:
+    needs: [correlation-generate-matrix, correlation-batch]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.correlation-batch.result != 'skipped' }}
+    steps:
+      - name: دانلود artifact های done_items همه‌ی چانک‌ها
+        uses: actions/download-artifact@v4
+        with:
+          pattern: done-items-*-${{ github.run_id }}
+          path: /tmp/done_artifacts_raw
+          merge-multiple: false
+
+      - name: ادغام لیست‌های done و حذف از all_combinations_correlation.json
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          CURL="/usr/bin/curl"
+          find /tmp/done_artifacts_raw -name 'done_items.json' -print0 2>/dev/null \
+            | while IFS= read -r -d '' f; do
+                jq empty "$f" 2>/dev/null && cat "$f" || echo "[]"
+              done \
+            | jq -s 'add // [] | unique_by(.coin_composition + "|||" + .signature)' \
+            > /tmp/merged_done.json 2>/dev/null || echo "[]" > /tmp/merged_done.json
+          [ -s /tmp/merged_done.json ] || echo "[]" > /tmp/merged_done.json
+
+          MERGED_COUNT=$(jq length /tmp/merged_done.json)
+          echo "[DEBUG] تعداد کل signatureهای موفق این run: $MERGED_COUNT"
+
+          if [ "$MERGED_COUNT" -eq 0 ]; then
+            echo "ℹ️ هیچ signature موفقی برای حذف وجود ندارد."
+            ALL_COMBO_COUNT=$(curl -s -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.raw" \
+              "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_correlation.json" 2>/dev/null \
+              | jq 'length' 2>/dev/null || echo "-1")
+            if [ "$ALL_COMBO_COUNT" = "0" ]; then
+              echo "✅ all_combinations_correlation.json خالی است. به‌روزرسانی completed_correlation.json..."
+              echo '["completed"]' > /tmp/completed_correlation.json
+              SHA_COMP=$(gh api "repos/$THIRD_REPO/contents/completed_correlation.json" -q '.sha' 2>/dev/null || echo "")
+              base64 -w0 /tmp/completed_correlation.json > /tmp/completed_base64.txt
+              # fix ARG_MAX: --rawfile به جای heredoc+$(cat)
+              jq -n \
+                --rawfile content /tmp/completed_base64.txt \
+                '{message: "correlation completed (empty queue)", content: ($content | rtrimstr("\n")), branch: "main"}' \
+                > /tmp/payload_completed.json
+              if [ -n "$SHA_COMP" ]; then
+                jq --arg sha "$SHA_COMP" '. + {sha: $sha}' /tmp/payload_completed.json > /tmp/payload_completed_with_sha.json
+                mv /tmp/payload_completed_with_sha.json /tmp/payload_completed.json
+              fi
+              $CURL -s -X PUT -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @/tmp/payload_completed.json \
+                "https://api.github.com/repos/$THIRD_REPO/contents/completed_correlation.json" >/dev/null
+              rm -f /tmp/completed_*.json /tmp/completed_base64.txt /tmp/payload_completed.json
+            fi
+          else
+            # تبدیل done_items به set کلیدهای (coin_composition|||signature)
+            jq '[.[] | .coin_composition + "|||" + .signature] | unique' \
+              /tmp/merged_done.json > /tmp/done_keys.json
+
+            RETRY=0; MAX=10000
+            while [ $RETRY -lt $MAX ]; do
+              SHA=$(gh api "repos/$THIRD_REPO/contents/all_combinations_correlation.json" -q '.sha' 2>/dev/null || echo "")
+              if [ -z "$SHA" ]; then
+                echo "ERROR: SHA نامعتبر — پاسخ gh api: $(gh api "repos/$THIRD_REPO/contents/all_combinations_correlation.json" 2>&1 | head -c 300)"
+                RETRY=$((RETRY+1)); sleep $(( (RANDOM % 4) + 2 )); continue
+              fi
+
+              $CURL -s -o /tmp/current.json \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Accept: application/vnd.github.v3.raw" \
+                "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_correlation.json" 2>/dev/null
+              if [ ! -s /tmp/current.json ] || ! jq empty /tmp/current.json 2>/dev/null; then
+                echo "ERROR: دریافت محتوای فایل ناموفق — تلاش مجدد..."
+                RETRY=$((RETRY+1)); sleep $(( (RANDOM % 5) + 3 )); continue
+              fi
+
+              jq -s '
+                .[0] as $c | .[1] as $done_keys |
+                ($done_keys | unique) as $dk |
+                $c | map(
+                  if type == "object" then
+                    if .coin_composition and .signature then
+                      (.coin_composition + "|||" + .signature) as $k | select(($dk | index($k)) == null)
+                    else
+                      (.signature_path // "") as $sp |
+                      ($sp | split("/")) as $parts |
+                      (if ($parts | length) >= 3 then
+                        (($parts[-1] | sub("\\.jsonl$"; "")) + "|||" + $parts[-2])
+                      else $sp + "|||" + $sp end) as $k |
+                      select(($dk | index($k)) == null)
+                    end
+                  else
+                    .
+                  end
+                )
+              ' /tmp/current.json /tmp/done_keys.json > /tmp/new_content.json
+
+              BEFORE=$(jq length /tmp/current.json)
+              AFTER=$(jq length /tmp/new_content.json)
+              echo "[DEBUG] قبل: $BEFORE  بعد: $AFTER  (حذف‌شده: $((BEFORE-AFTER)))"
+
+              base64 -w0 /tmp/new_content.json > /tmp/new_content_base64.txt
+              # fix ARG_MAX: --rawfile به جای heredoc+$(cat) برای فایل بزرگ
+              jq -n \
+                --arg msg "remove $((BEFORE-AFTER)) processed signatures (run ${{ github.run_id }})" \
+                --rawfile content /tmp/new_content_base64.txt \
+                --arg sha "$SHA" \
+                '{message: $msg, content: ($content | rtrimstr("\n")), sha: $sha, branch: "main"}' \
+                > /tmp/payload.json
+              HTTP_CODE=$($CURL -s -X PUT -o /tmp/upload_response.txt -w "%{http_code}" \
+                -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @/tmp/payload.json \
+                "https://api.github.com/repos/$THIRD_REPO/contents/all_combinations_correlation.json")
+
+              if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
+                echo "✅ $((BEFORE-AFTER)) signature با موفقیت حذف شدند."
+                break
+              elif [ "$HTTP_CODE" -eq 409 ] || [ "$HTTP_CODE" -eq 422 ]; then
+                echo "⚠️ تداخل SHA (کد $HTTP_CODE) — تلاش مجدد..."
+                RETRY=$((RETRY+1)); sleep $(( (RANDOM % 5) + 2 )); continue
+              else
+                echo "ERROR: آپلود ناموفق ($HTTP_CODE)"; cat /tmp/upload_response.txt; exit 1
+              fi
+            done
+            [ $RETRY -ge $MAX ] && { echo "ERROR: پس از $MAX تلاش ناموفق."; exit 1; }
+
+            if [ "$AFTER" -eq 0 ]; then
+              echo "✅ all_combinations_correlation.json خالی شد. به‌روزرسانی completed_correlation.json..."
+              echo '["completed"]' > /tmp/completed_correlation.json
+              SHA_COMP=$(gh api "repos/$THIRD_REPO/contents/completed_correlation.json" -q '.sha' 2>/dev/null || echo "")
+              base64 -w0 /tmp/completed_correlation.json > /tmp/completed_base64.txt
+              # fix ARG_MAX: --rawfile به جای heredoc+$(cat)
+              jq -n \
+                --rawfile content /tmp/completed_base64.txt \
+                '{message: "correlation completed", content: ($content | rtrimstr("\n")), branch: "main"}' \
+                > /tmp/payload_completed.json
+              if [ -n "$SHA_COMP" ]; then
+                jq --arg sha "$SHA_COMP" '. + {sha: $sha}' /tmp/payload_completed.json > /tmp/payload_completed_with_sha.json
+                mv /tmp/payload_completed_with_sha.json /tmp/payload_completed.json
+              fi
+              $CURL -s -X PUT -H "Authorization: token $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @/tmp/payload_completed.json \
+                "https://api.github.com/repos/$THIRD_REPO/contents/completed_correlation.json" >/dev/null
+            fi
+
+            rm -f /tmp/current.json /tmp/new_content.json /tmp/new_content_base64.txt /tmp/payload.json /tmp/upload_response.txt /tmp/completed_*.json /tmp/completed_base64.txt /tmp/payload_completed.json
+          fi
+
+      - name: "دانلود artifact های correlations.parquet رمزنگاری‌شده (روش ۱ - actions/download-artifact)"
+        id: dl_method1
+        uses: actions/download-artifact@v4
+        with:
+          pattern: corr-parquet-*-${{ github.run_id }}
+          path: /tmp/corr_artifacts
+          merge-multiple: false
+        continue-on-error: true
+
+      - name: بررسی نتیجه روش ۱ و اجرای روش ۲ در صورت شکست (gh run download)
+        id: dl_method2
+        if: steps.dl_method1.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "⚠️ روش ۱ (actions/download-artifact) ناموفق بود — تلاش با روش ۲ (gh run download)..."
+          mkdir -p /tmp/corr_artifacts
+          if gh run download ${{ github.run_id }} \
+              --repo ${{ github.repository }} \
+              --pattern "corr-parquet-*-${{ github.run_id }}" \
+              --dir /tmp/corr_artifacts; then
+            FOUND=$(find /tmp/corr_artifacts -name 'correlations.tar.gz.enc' 2>/dev/null | wc -l)
+            if [ "$FOUND" -gt 0 ]; then
+              echo "✅ روش ۲ موفق بود — $FOUND فایل دریافت شد."
+              echo "success=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ روش ۲ اجرا شد ولی هیچ فایلی یافت نشد."
+              echo "success=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "⚠️ روش ۲ (gh run download) ناموفق بود."
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: بررسی نتیجه روش ۲ و اجرای روش ۳ در صورت شکست (curl + GitHub API)
+        id: dl_method3
+        if: steps.dl_method1.outcome != 'success' && steps.dl_method2.outputs.success != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "⚠️ روش ۲ (gh run download) ناموفق بود — تلاش با روش ۳ (curl + GitHub API)..."
+          mkdir -p /tmp/corr_artifacts
+
+          ARTIFACTS_JSON=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100")
+
+          MATCHED=$(echo "$ARTIFACTS_JSON" | jq -c --arg run "${{ github.run_id }}" \
+            '[.artifacts[] | select(.name | startswith("corr-parquet-") and endswith("-" + $run))]')
+          MATCHED_COUNT=$(echo "$MATCHED" | jq 'length')
+          echo "[DEBUG] تعداد artifact های منطبق یافت‌شده از API: $MATCHED_COUNT"
+
+          DOWNLOADED=0
+          if [ "$MATCHED_COUNT" -gt 0 ]; then
+            echo "$MATCHED" | jq -c '.[]' | while IFS= read -r ART; do
+              ART_ID=$(echo "$ART" | jq -r '.id')
+              ART_NAME=$(echo "$ART" | jq -r '.name')
+              DEST_DIR="/tmp/corr_artifacts/$ART_NAME"
+              mkdir -p "$DEST_DIR"
+              ZIP_PATH="/tmp/corr_artifacts/${ART_NAME}.zip"
+              HTTP_CODE=$(curl -s -L -o "$ZIP_PATH" -w "%{http_code}" \
+                -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip")
+              if [ "$HTTP_CODE" = "200" ] && [ -s "$ZIP_PATH" ]; then
+                unzip -o -q "$ZIP_PATH" -d "$DEST_DIR" && rm -f "$ZIP_PATH"
+              else
+                echo "⚠️ دانلود artifact $ART_NAME ناموفق بود (HTTP $HTTP_CODE)."
+              fi
+            done
+          fi
+
+          FOUND=$(find /tmp/corr_artifacts -name 'correlations.tar.gz.enc' 2>/dev/null | wc -l)
+          if [ "$FOUND" -gt 0 ]; then
+            echo "✅ روش ۳ موفق بود — $FOUND فایل دریافت شد."
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "🔴 روش ۳ نیز ناموفق بود — هیچ فایلی دریافت نشد."
+            echo "success=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: توقف Workflow در صورت شکست هر سه روش دانلود
+        if: steps.dl_method1.outcome != 'success' && steps.dl_method2.outputs.success != 'true' && steps.dl_method3.outputs.success != 'true'
+        run: |
+          echo "🔴 هر سه روش دانلود artifact های corr-parquet ناموفق بودند."
+          exit 1
+
+      - name: آپلود نهایی correlations.parquet.enc به مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          # باگ ۵ fix: ادغام همه chunk‌های parquet، نه فقط tail -1
+          pip install pyarrow pandas --quiet --break-system-packages 2>/dev/null || \
+            pip install pyarrow pandas --quiet 2>/dev/null || true
+
+          find /tmp/corr_artifacts -name 'correlations.tar.gz.enc' 2>/dev/null \
+            | sort > /tmp/corr_enc_list.txt
+          ENC_COUNT=$(wc -l < /tmp/corr_enc_list.txt)
+
+          if [ "$ENC_COUNT" -eq 0 ]; then
+            echo "ℹ️ هیچ correlations.tar.gz.enc برای آپلود یافت نشد — رد می‌شود."
+            exit 0
+          fi
+
+          mkdir -p /tmp/corr_dec_parts
+          IDX=0
+          while IFS= read -r ENC_FILE; do
+            [ -z "$ENC_FILE" ] && continue
+            DEC_FILE="/tmp/corr_dec_parts/correlations_${IDX}.parquet"
+            TMP_TAR="/tmp/corr_dec_parts/tmp_${IDX}.tar.gz"
+            node -e "
+              const crypto=require('crypto'),fs=require('fs');
+              const pass=process.env.RESULTS_PASSWORD;
+              const data=fs.readFileSync('$ENC_FILE');
+              const key=crypto.scryptSync(pass,'salt',32);
+              const iv=data.slice(0,16),enc=data.slice(16);
+              const decipher=crypto.createDecipheriv('aes-256-cbc',key,iv);
+              const dec=Buffer.concat([decipher.update(enc),decipher.final()]);
+              fs.writeFileSync('$TMP_TAR',dec);
+            " 2>/dev/null
+            tar -xzf "$TMP_TAR" -C /tmp/corr_dec_parts 2>/dev/null && \
+              mv /tmp/corr_dec_parts/correlations.parquet "$DEC_FILE" 2>/dev/null || true
+            rm -f "$TMP_TAR"
+            IDX=$((IDX+1))
+          done < /tmp/corr_enc_list.txt
+
+          PARQUET_COUNT=$(find /tmp/corr_dec_parts -name 'correlations_*.parquet' | wc -l)
+          echo "[DEBUG] تعداد parquet‌های رمزگشایی‌شده: $PARQUET_COUNT"
+
+          if [ "$PARQUET_COUNT" -eq 0 ]; then
+            echo "⚠️ هیچ parquet قابل رمزگشایی یافت نشد."
+            exit 0
+          fi
+
+          python3 - <<'PYEOF'
+          import sys, pathlib
+          try:
+              import pandas as pd
+              paths = list(pathlib.Path("/tmp/corr_dec_parts").glob("correlations_*.parquet"))
+              if not paths:
+                  sys.exit(0)
+              dfs = []
+              for p in sorted(paths):
+                  try:
+                      dfs.append(pd.read_parquet(p))
+                  except Exception as e:
+                      print(f"skip {p}: {e}")
+              if not dfs:
+                  sys.exit(0)
+              merged = pd.concat(dfs, ignore_index=False)
+              if not merged.index.is_unique:
+                  merged = merged[~merged.index.duplicated(keep="last")]
+              merged.to_parquet("/tmp/correlations_merged.parquet", index=True)
+              print(f"merged {len(merged)} rows from {len(dfs)} files")
+          except ImportError:
+              import shutil
+              paths = sorted(pathlib.Path("/tmp/corr_dec_parts").glob("correlations_*.parquet"))
+              if paths:
+                  shutil.copy(paths[-1], "/tmp/correlations_merged.parquet")
+                  print(f"pandas not available, used last file: {paths[-1]}")
+          PYEOF
+
+          if [ ! -f /tmp/correlations_merged.parquet ]; then
+            echo "⚠️ ادغام parquet ناموفق بود."
+            exit 0
+          fi
+
+          tar -czf /tmp/correlations_final.tar.gz -C /tmp correlations_merged.parquet
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const data=fs.readFileSync('/tmp/correlations_final.tar.gz');
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=crypto.randomBytes(16);
+            const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+            const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
+            fs.writeFileSync('/tmp/correlations_final.tar.gz.enc',enc);
+          "
+
+          DEST="analysis_results/correlations.parquet.enc"
+          SHA_DEST=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/$DEST" | jq -r '.sha // empty' 2>/dev/null || echo "")
+          base64 -w0 /tmp/correlations_final.tar.gz.enc > /tmp/corr_b64.txt
+          CORR_MSG="update correlations.parquet merged (run ${{ github.run_id }})"
+          if [ -n "$SHA_DEST" ]; then
+            jq -n \
+              --arg msg "$CORR_MSG" \
+              --rawfile content /tmp/corr_b64.txt \
+              --arg sha "$SHA_DEST" \
+              '{message: $msg, content: ($content | rtrimstr("\n")), sha: $sha, branch: "main"}' \
+              > /tmp/payload_corr.json
+          else
+            jq -n \
+              --arg msg "$CORR_MSG" \
+              --rawfile content /tmp/corr_b64.txt \
+              '{message: $msg, content: ($content | rtrimstr("\n")), branch: "main"}' \
+              > /tmp/payload_corr.json
+          fi
+          HTTP_CORR=$(curl -s -o /tmp/corr_resp.txt -w "%{http_code}" -X PUT \
+            -H "Authorization: token $GH_TOKEN" -H "Content-Type: application/json" \
+            --data-binary @/tmp/payload_corr.json \
+            "https://api.github.com/repos/$THIRD_REPO/contents/$DEST")
+          if [ "$HTTP_CORR" = "200" ] || [ "$HTTP_CORR" = "201" ]; then
+            echo "✅ correlations.parquet.enc (ادغام‌شده از $PARQUET_COUNT chunk) آپلود شد."
+          else
+            echo "⚠️ آپلود ناموفق (HTTP $HTTP_CORR): $(cat /tmp/corr_resp.txt | head -c 200)"
+          fi
+          rm -f /tmp/corr_b64.txt /tmp/payload_corr.json /tmp/corr_resp.txt \
+            /tmp/correlations_merged.parquet /tmp/correlations_final.tar.gz \
+            /tmp/correlations_final.tar.gz.enc /tmp/corr_enc_list.txt
+
+  # ================================================================
+  # dispatch-loop: فراخوانی loop_analysis.yml — همیشه اجرا می‌شود
+  # حتی اگر correlation-batch یا correlation-cleanup skip شده باشد
+  # ================================================================
+  dispatch-loop:
+    needs: [correlation-generate-matrix, correlation-cleanup]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: فراخوانی مجدد loop_analysis.yml
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/actions/workflows/loop_analysis.yml/dispatches \
+            -X POST -f ref="main"

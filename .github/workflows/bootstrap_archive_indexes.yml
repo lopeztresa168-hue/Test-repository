@@ -1,0 +1,144 @@
+name: بازسازی ایندکس‌های آرشیو (signature + pattern) با اسکن موازی
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "تایید اجرا (این عملیات همه‌ی آرشیوهای signature_archives/ و pattern_archives/ را دانلود/رمزگشایی می‌کند)"
+        required: true
+        type: boolean
+        default: false
+      shards:
+        description: "تعداد شارد موازی"
+        required: true
+        type: number
+        default: 20
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bootstrap-archive-indexes
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ inputs.confirm == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.prep.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: نصب وابستگی‌های پایتون (اختیاری)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: لیست‌گیری سبک از پوشه‌ها و تقسیم به شارد
+        id: prep
+        env:
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          python3 scripts/bootstrap_archive_indexes.py prepare \
+            --shards "${{ inputs.shards }}" \
+            --out /tmp/bootstrap_shards.json \
+            --matrix-out /tmp/bootstrap_matrix.json
+          echo "matrix=$(cat /tmp/bootstrap_matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - name: آپلود فایل شاردها برای مرحله‌ی shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-shard-plan
+          path: /tmp/bootstrap_shards.json
+          retention-days: 1
+
+  shard:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: نصب وابستگی‌های پایتون (اختیاری)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: دانلود فایل شاردها
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-shard-plan
+          path: /tmp
+
+      - name: اسکن شارد ${{ matrix.shard_index }} (فقط خواندنی — چیزی روی مخزن سوم نوشته نمی‌شود)
+        env:
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD }}
+        run: |
+          python3 scripts/bootstrap_archive_indexes.py shard \
+            --in-file /tmp/bootstrap_shards.json \
+            --shard-index "${{ matrix.shard_index }}" \
+            --out /tmp/shard_${{ matrix.shard_index }}.json
+
+      - name: آپلود نتیجه‌ی شارد
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-shard-result-${{ matrix.shard_index }}
+          path: /tmp/shard_${{ matrix.shard_index }}.json
+          retention-days: 1
+
+  merge:
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: نصب وابستگی‌های پایتون (اختیاری)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: دانلود همه‌ی نتایج شاردها
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bootstrap-shard-result-*
+          path: /tmp/shards
+          merge-multiple: true
+
+      - name: ادغام و آپلود یک‌باره‌ی هر دو ایندکس (تک‌نویسنده — بدون race)
+        env:
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          python3 scripts/bootstrap_archive_indexes.py merge --in-dir /tmp/shards

@@ -1,0 +1,82 @@
+name: Market Regime Snapshot
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  calc-regime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی پایتون و نصب کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy
+
+      - name: دانلود کامل داده‌های OHLC (همان روش analysis_fixed_batch.yml)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          OHLC_REPO: ${{ secrets.OHLC_REPO }}
+        run: |
+          set -e
+          mkdir -p /tmp/ohlc_master
+
+          if [ -z "$OHLC_REPO" ]; then
+            echo "❌ متغیر OHLC_REPO تنظیم نشده — workflow متوقف می‌شود."
+            exit 1
+          fi
+
+          echo "📦 شروع git clone کامل مخزن OHLC (depth=1)..."
+          git clone \
+            --depth=1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${OHLC_REPO}.git" \
+            /tmp/ohlc_clone
+
+          OHLC_PATH="/tmp/ohlc_clone/data/All_Coins_Combined"
+          if [ ! -d "$OHLC_PATH" ]; then
+            echo "❌ پوشه data/All_Coins_Combined در مخزن OHLC یافت نشد."
+            exit 1
+          fi
+
+          CSV_COUNT=$(find "$OHLC_PATH" -name '*.csv' | wc -l)
+          if [ "$CSV_COUNT" -eq 0 ]; then
+            echo "❌ هیچ فایل CSV در data/All_Coins_Combined یافت نشد."
+            exit 1
+          fi
+
+          cp "$OHLC_PATH"/*.csv /tmp/ohlc_master/
+          rm -rf /tmp/ohlc_clone
+
+          DOWNLOADED_COUNT=$(find /tmp/ohlc_master -name '*.csv' | wc -l)
+          if [ "$DOWNLOADED_COUNT" -ne "$CSV_COUNT" ]; then
+            echo "❌ کپی ناقص: $DOWNLOADED_COUNT از $CSV_COUNT فایل."
+            exit 1
+          fi
+          echo "✅ تعداد $DOWNLOADED_COUNT فایل OHLC دانلود شد."
+
+      - name: محاسبه‌ی رژیم بازار برای همه‌ی کوین‌ها
+        run: |
+          python scripts/calc_market_regime.py \
+            --ohlc-dir /tmp/ohlc_master \
+            --output market_regime.json
+
+      - name: ذخیره‌ی نتیجه در مخزن
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add market_regime.json
+          if git diff --cached --quiet; then
+            echo "ℹ️ تغییری در رژیم بازار نبود — چیزی برای commit نیست."
+          else
+            git commit -m "update market_regime.json (run ${{ github.run_id }})"
+            git pull --rebase origin main
+            git push origin main
+          fi
+          

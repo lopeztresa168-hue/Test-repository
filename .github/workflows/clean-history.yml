@@ -1,0 +1,95 @@
+name: Clean History
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_message:
+        description: "Commit message for the fresh root commit"
+        default: "Initial commit (history cleaned)"
+      exclude_files:
+        description: "Space-separated files to exclude (e.g. .env config.json)"
+        default: ""
+      exclude_folders:
+        description: "Space-separated folders to exclude (e.g. node_modules dist)"
+        default: ""
+  workflow_call:
+    inputs:
+      save_artifact:
+        type: boolean
+        default: false
+      user_name:
+        type: string
+      user_email:
+        type: string
+      commit_message:
+        type: string
+        default: "Initial commit (history cleaned)"
+      exclude_files:
+        type: string
+      exclude_folders:
+        type: string
+    secrets:
+      token:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  save-artifact:
+    if: ${{ inputs.save_artifact }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.token || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.repository_owner }}-${{ github.event.repository.name }}
+          path: .
+          overwrite: true
+
+  always-first-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.token || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set git name and email
+        env:
+          INPUT_NAME: ${{ inputs.user_name }}
+          INPUT_EMAIL: ${{ inputs.user_email }}
+        run: |
+          git config user.name  "${INPUT_NAME:-$(git log -n 1 --pretty=format:%an)}"
+          git config user.email "${INPUT_EMAIL:-$(git log -n 1 --pretty=format:%ae)}"
+          echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Create orphan branch
+        run: git checkout --orphan "${{ env.sha }}"
+
+      - name: Exclude files
+        env:
+          EXCLUDE_FILES: ${{ inputs.exclude_files }}
+        run: |
+          if [[ -n "$EXCLUDE_FILES" ]]; then
+            git rm --cached $EXCLUDE_FILES
+          fi
+
+      - name: Exclude folders
+        env:
+          EXCLUDE_FOLDERS: ${{ inputs.exclude_folders }}
+        run: |
+          if [[ -n "$EXCLUDE_FOLDERS" ]]; then
+            git rm --cached -rf $EXCLUDE_FOLDERS
+          fi
+
+      - name: Push fresh history
+        env:
+          COMMIT_MESSAGE: ${{ inputs.commit_message }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git commit -m "$COMMIT_MESSAGE"
+          git push --force origin "HEAD:$BRANCH"
