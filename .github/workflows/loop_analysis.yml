@@ -1098,11 +1098,12 @@ jobs:
 
           if [ -d "reports" ] && [ -n "$(find reports -type f 2>/dev/null)" ]; then
             echo "📦 reports/ در مخزن اصلی یافت شد — انتقال reports.tar.gz.enc به ریشه‌ی مخزن سوم..."
-            if [ -f "reports/reports.tar.gz.enc" ]; then
-              cp "reports/reports.tar.gz.enc" "/tmp/third_repo/reports.tar.gz.enc"
+            if ls reports/reports.tar.gz.enc reports/reports.tar.gz.enc.7z.* >/dev/null 2>&1; then
+              rm -f /tmp/third_repo/reports.tar.gz.enc /tmp/third_repo/reports.tar.gz.enc.7z.*
+              cp reports/reports.tar.gz.enc* /tmp/third_repo/
               UPLOADED=true
             else
-              echo "⚠️ فایل reports/reports.tar.gz.enc یافت نشد."
+              echo "⚠️ فایل گزارش (تک‌فایل یا پارت‌ها) در reports/ یافت نشد."
             fi
           else
             echo "ℹ️ reports/ در مخزن اصلی یافت نشد یا خالی است."
@@ -1272,6 +1273,17 @@ jobs:
             "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" \
             /tmp/third_repo
 
+      - name: بازسازی گزارش قبلی از پارت‌های 7z (در صورت وجود)
+        run: |
+          if ls /tmp/third_repo/reports.tar.gz.enc.7z.001 >/dev/null 2>&1; then
+            command -v 7z >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full)
+            echo "🧩 ترکیب پارت‌های گزارش قبلی..."
+            7z x -y /tmp/third_repo/reports.tar.gz.enc.7z.001 -o/tmp/third_repo/
+            echo "✅ reports.tar.gz.enc بازسازی شد."
+          else
+            echo "ℹ️ گزارش قبلیِ چندپارتی وجود ندارد (یا تک‌فایل است)."
+          fi
+
       - name: اجرای loader.py
         env:
           RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
@@ -1373,8 +1385,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p reports
-          cp /tmp/reports.tar.gz.enc reports/reports.tar.gz.enc
-          git add -f reports/reports.tar.gz.enc
+          rm -f reports/reports.tar.gz.enc reports/reports.tar.gz.enc.7z.*
+          MAX_BYTES=$((90*1024*1024))
+          SIZE=$(stat -c%s /tmp/reports.tar.gz.enc)
+          echo "📏 حجم گزارش رمزشده: $SIZE بایت"
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            command -v 7z >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full)
+            echo "✂️ بیش از 90MB است؛ تقسیم به پارت‌های 90MB با 7z..."
+            7z a -mx0 -v90m reports/reports.tar.gz.enc.7z /tmp/reports.tar.gz.enc
+            ls -la reports/
+          else
+            cp /tmp/reports.tar.gz.enc reports/reports.tar.gz.enc
+          fi
+          git add -A -f reports
           git commit -m "update reports (run ${{ github.run_id }})" || echo "No changes to commit"
           for attempt in $(seq 1 10); do
             git pull --rebase || true
