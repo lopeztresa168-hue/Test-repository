@@ -1098,9 +1098,20 @@ jobs:
 
           if [ -d "reports" ] && [ -n "$(find reports -type f 2>/dev/null)" ]; then
             echo "📦 reports/ در مخزن اصلی یافت شد — انتقال reports.tar.gz.enc به ریشه‌ی مخزن سوم..."
-            if ls reports/reports.tar.gz.enc reports/reports.tar.gz.enc.7z.* >/dev/null 2>&1; then
+            HAS_SINGLE=false
+            HAS_PARTS=false
+            [ -f reports/reports.tar.gz.enc ] && HAS_SINGLE=true
+            if compgen -G "reports/reports.tar.gz.enc.7z.*" >/dev/null; then HAS_PARTS=true; fi
+
+            if [ "$HAS_PARTS" = "true" ]; then
+              echo "🧩 گزارش چندپارتی (7z) شناسایی شد."
               rm -f /tmp/third_repo/reports.tar.gz.enc /tmp/third_repo/reports.tar.gz.enc.7z.*
-              cp reports/reports.tar.gz.enc* /tmp/third_repo/
+              cp reports/reports.tar.gz.enc.7z.* /tmp/third_repo/
+              UPLOADED=true
+            elif [ "$HAS_SINGLE" = "true" ]; then
+              echo "📄 گزارش تک‌فایل شناسایی شد."
+              rm -f /tmp/third_repo/reports.tar.gz.enc /tmp/third_repo/reports.tar.gz.enc.7z.*
+              cp reports/reports.tar.gz.enc /tmp/third_repo/
               UPLOADED=true
             else
               echo "⚠️ فایل گزارش (تک‌فایل یا پارت‌ها) در reports/ یافت نشد."
