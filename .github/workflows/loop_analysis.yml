@@ -1554,6 +1554,7 @@ jobs:
       run_fixed: ${{ steps.gate.outputs.run_fixed }}
       run_golden: ${{ steps.gate.outputs.run_golden }}
       run_portfolios: ${{ steps.gate.outputs.run_portfolios }}
+      skip_requested: ${{ steps.gate.outputs.skip_requested }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -1574,6 +1575,17 @@ jobs:
               echo "run_fixed=false" >> $GITHUB_OUTPUT
               echo "run_golden=false" >> $GITHUB_OUTPUT
               echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            # بررسی skip_analysis.flag: اگر وجود داشت، سه فیلتر skip می‌شوند و loop ادامه می‌یابد
+            SKIP_FLAG_FILE="skip_analysis.flag"
+            if gh api "repos/$THIRD_REPO/contents/$SKIP_FLAG_FILE" >/dev/null 2>&1; then
+              echo "⏭️ $SKIP_FLAG_FILE یافت شد — fixed / golden / portfolios هر سه skip می‌شوند و loop ادامه می‌یابد."
+              echo "run_fixed=false" >> $GITHUB_OUTPUT
+              echo "run_golden=false" >> $GITHUB_OUTPUT
+              echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              echo "skip_requested=true" >> $GITHUB_OUTPUT
               exit 0
             fi
 
@@ -1615,6 +1627,41 @@ jobs:
               echo "run_fixed=false" >> $GITHUB_OUTPUT
               echo "run_golden=false" >> $GITHUB_OUTPUT
               echo "run_portfolios=false" >> $GITHUB_OUTPUT
+            fi
+          }
+
+  # ============================================================
+  # Job 4.5: اگر skip_analysis.flag وجود داشت، سه dispatch بالا اجرا نمی‌شوند
+  # و برای اینکه چرخه قطع نشود، خود loop_analysis.yml دوباره صدا زده می‌شود
+  # (با تأخیر تا حلقه‌ی بی‌وقفه و پرفشار ایجاد نشود).
+  # ============================================================
+  continue-loop-on-skip:
+    needs: check-queues
+    if: needs.check-queues.outputs.skip_requested == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: فراخوانی مجدد loop_analysis.yml (حالت skip)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SKIP_LOOP_DELAY: "60"
+        run: |
+          {
+            echo "⏳ صبر ${SKIP_LOOP_DELAY} ثانیه قبل از چرخه‌ی بعدی..."
+            sleep "$SKIP_LOOP_DELAY"
+            SUCCESS=false
+            for attempt in 1 2 3; do
+              if gh workflow run loop_analysis.yml --repo "${{ github.repository }}" --ref main 2>&1; then
+                echo "✅ فراخوانی مجدد loop_analysis.yml موفق بود (تلاش $attempt)."
+                SUCCESS=true
+                break
+              else
+                echo "⚠️ تلاش $attempt ناموفق بود. 5 ثانیه صبر می‌کنم..."
+                sleep 5
+              fi
+            done
+            if [ "$SUCCESS" = "false" ]; then
+              echo "❌ هر سه تلاش برای فراخوانی مجدد loop_analysis.yml ناموفق بود."
+              exit 1
             fi
           }
 
