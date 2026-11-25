@@ -50,6 +50,11 @@ on:
         required: false
         type: boolean
         default: false
+      pool_polish:
+        description: '[pool_search] بهتر کردن سبد پیداشده (شروع از selected.csv ذخیره‌شده در مخزن سوم با هدف pool_objective؛ جستجوی از صفر انجام نمی‌شود، پرچم اتمام ساخته نمی‌شود)'
+        required: false
+        type: boolean
+        default: false
       pool_end:
         description: '[pool_search] ماه پایان به‌صورت YYYY-MM (خالی = پیش‌فرض ماژول)'
         required: false
@@ -2558,12 +2563,13 @@ jobs:
           POOL_MIN_TRADES: ${{ inputs.pool_min_trades }}
           POOL_FEE: ${{ inputs.pool_fee }}
           POOL_TUNE_WEIGHTS: ${{ inputs.pool_tune_weights }}
+          POOL_POLISH: ${{ inputs.pool_polish }}
           POOL_END: ${{ inputs.pool_end }}
         run: |
           echo "🔁 هنوز ${{ needs.pool-collect.outputs.blocking }} فایل پردازش‌نشده مانده — اجرای بعدی pool_search..."
           ARGS=(-f analysis_module=pool_search -f pool_objective="$POOL_OBJECTIVE" -f pool_max_members="$POOL_MAX_MEMBERS"
                 -f pool_max_per_file="$POOL_MAX_PER_FILE" -f pool_min_trades="$POOL_MIN_TRADES" -f pool_fee="$POOL_FEE"
-                -f pool_tune_weights="$POOL_TUNE_WEIGHTS")
+                -f pool_tune_weights="$POOL_TUNE_WEIGHTS" -f pool_polish="$POOL_POLISH")
           if [ -n "$POOL_END" ]; then ARGS+=(-f pool_end="$POOL_END"); fi
           for attempt in 1 2 3; do
             if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
@@ -2590,6 +2596,7 @@ jobs:
       POOL_MIN_TRADES: ${{ inputs.pool_min_trades }}
       POOL_FEE: ${{ inputs.pool_fee }}
       POOL_TUNE_WEIGHTS: ${{ inputs.pool_tune_weights }}
+      POOL_POLISH: ${{ inputs.pool_polish }}
       POOL_END: ${{ inputs.pool_end }}
     steps:
       - uses: actions/checkout@v5
@@ -2616,7 +2623,7 @@ jobs:
           git clone --depth=1 --filter=blob:none --sparse \
             "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
           cd /tmp/third_repo
-          git sparse-checkout set pool_candidates
+          git sparse-checkout set pool_candidates analysis_results
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           echo "📦 فایل‌های کش: $(find pool_candidates -name '*.npz.enc' 2>/dev/null | wc -l)"
@@ -2634,6 +2641,7 @@ jobs:
                 --max-members "$POOL_MAX_MEMBERS" --max-per-file "$POOL_MAX_PER_FILE"
                 --objective "$POOL_OBJECTIVE")
           if [ "$POOL_TUNE_WEIGHTS" = "true" ]; then ARGS+=(--tune-weights); fi
+          if [ "$POOL_POLISH" = "true" ]; then ARGS+=(--polish); echo "✨ حالت polish: شروع از سبد ذخیره‌شده‌ی مخزن سوم"; fi
           if [ -n "$POOL_END" ]; then ARGS+=(--end "$POOL_END"); fi
           set -o pipefail
           python -u modules/pool_search.py "${ARGS[@]}" 2>&1 | tee /tmp/pool_results/run.log
@@ -2680,13 +2688,17 @@ jobs:
 
           cd /tmp/third_repo
           mkdir -p analysis_results
-          cp /tmp/pool_search_results.tar.gz.enc analysis_results/pool_search_results.tar.gz.enc
-          git add --sparse -f analysis_results/pool_search_results.tar.gz.enc
+          RES_NAME=pool_search_results.tar.gz.enc
+          if [ "$POOL_POLISH" = "true" ]; then RES_NAME=pool_search_polished.tar.gz.enc; fi   # نتیجه‌ی polish روی سبد اصلی نوشته نمی‌شود
+          cp /tmp/pool_search_results.tar.gz.enc "analysis_results/$RES_NAME"
+          git add --sparse -f "analysis_results/$RES_NAME"
 
           # پرچم اتمام همراه اثرانگشت داده: loop_analysis.yml فقط وقتی aggregated عوض شده باشد دوباره اجرا می‌کند.
           # اگر داده در طول همین اجرا تغییر کرده باشد پرچم ساخته نمی‌شود تا اجرای افزایشی بعدی انجام شود.
           CUR_FP=$(git ls-tree --format='%(path) %(objectname)' HEAD:aggregated | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
-          if [ "$CUR_FP" = "$PLAN_FP" ]; then
+          if [ "$POOL_POLISH" = "true" ]; then
+            echo "ℹ️ حالت polish: پرچم اتمام ساخته/تغییر داده نمی‌شود."
+          elif [ "$CUR_FP" = "$PLAN_FP" ]; then
             printf '{"run_id":"%s","finished_at":"%s","fingerprint":"%s"}\n' "${{ github.run_id }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CUR_FP" > pool_search_done.flag
             git add --sparse -f pool_search_done.flag
             echo "🏁 pool_search_done.flag با اثرانگشت $CUR_FP ساخته می‌شود."
@@ -2702,7 +2714,7 @@ jobs:
           for attempt in $(seq 1 10); do
             git pull --rebase -q || true
             if git push -q; then
-              echo "✅ push نتایج به مخزن سوم موفق بود (تلاش $attempt): analysis_results/pool_search_results.tar.gz.enc"
+              echo "✅ push نتایج به مخزن سوم موفق بود (تلاش $attempt): analysis_results/$RES_NAME"
               exit 0
             fi
             sleep $(( (RANDOM % 10) + 3 ))
@@ -2717,6 +2729,7 @@ jobs:
         run: |
           # در حالت skip، loop_analysis.yml برای اجرای pool_search خودش را مجدد صدا نمی‌زند؛
           # پس اینجا (فقط پس از موفقیت) دوباره dispatch می‌شود تا چرخه‌ی حالت skip مثل قبل ادامه یابد.
+          if [ "$POOL_POLISH" = "true" ]; then echo "ℹ️ اجرای polish دستی بود — loop دوباره صدا زده نمی‌شود."; exit 0; fi
           if gh api "repos/$THIRD_REPO/contents/skip_analysis.flag" >/dev/null 2>&1; then
             echo "⏭️ skip_analysis.flag هنوز هست — فراخوانی مجدد loop_analysis.yml..."
             SUCCESS=false
