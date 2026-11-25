@@ -37,11 +37,16 @@ MODES (--mode)
             python pool_search.py --mode search --password PASS --repo-dir REPO --regime market_regime.json --out pool_results
           Up to --max-missing-pct % of the files may be missing (failed files); more than that exits with code 3.
 
+  polish  (flag, with --mode search or all) improve the portfolio that was already found instead of searching from scratch:
+            python pool_search.py --mode search --polish --objective sortino --tune-weights --password PASS --repo-dir REPO --regime market_regime.json --out pool_polish
+          starts from selected.csv (saved results archive in REPO, or --polish-from FILE), then add / remove / replace passes with --objective;
+          the result is never worse than the start under that objective. Writes polish_changes.csv next to the usual files.
+
 POOL_DIR: any folder tree; every *.enc found recursively is one strategy file (name = parent folder, else file name).
 Options: --max-members 25 --min-gain 0.01 --min-trades 5 --max-per-file 3 --objective green|sortino|sharpe --max-month-share 0.25
          --tune-weights --jobs 8 --start 2018-01 --end 2026-05 --rebuild
 """
-import argparse, glob, hashlib, io, json, os, pickle, re, subprocess, sys
+import argparse, glob, hashlib, io, json, os, pickle, re, subprocess, sys, tarfile
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 import numpy as np
@@ -190,14 +195,17 @@ def score_rows(P, objective):
     return (pos - neg) + 2 * T - pen + tie
 
 
-def search(C, keys, a):
+def search(C, keys, a, init=None, init_w=None):
+    """init: indices of an existing portfolio to continue from (polish); init_w: {index: weight} of those members.
+    Members keep their weight, newly added / replacing candidates get weight 1.0. The result is never worse than init."""
     X = C.astype(np.float64)
     n = len(keys)
     fk = np.array([hash(k[:3]) for k in keys])          # (file, coin, direction)
     fl = np.array([hash(k[0]) for k in keys])           # file
-    sel = []
-    cur = np.zeros(X.shape[1])
-    best = -9
+    wt = {i: float((init_w or {}).get(i, 1.0)) for i in (init or [])}
+    sel = list(init or [])
+    cur = sum((X[i] * wt[i] for i in sel), np.zeros(X.shape[1]))
+    best = score_rows(cur[None, :], a.objective)[0] if sel else -9
 
     def allowed(excl=None):
         ok = np.ones(n, bool)
@@ -222,25 +230,25 @@ def search(C, keys, a):
         j = int(np.argmax(sc))
         if sc[j] < best + a.min_gain:
             break
-        sel.append(j); cur = cur + X[j]; best = sc[j]
+        sel.append(j); wt[j] = 1.0; cur = cur + X[j]; best = sc[j]
     improved = True                                       # refinement: remove / replace
     while improved:
         improved = False
         for pos in range(len(sel)):
             i = sel[pos]
-            base = cur - X[i]
+            base = cur - X[i] * wt[i]
             sc = scores(base, allowed(excl=i))
             j = int(np.argmax(sc))
             rem = score_rows(base[None, :], a.objective)[0] if len(sel) > 1 else -9
             if rem >= best + 1e-9 and rem >= sc[j]:        # removing is better
-                sel.pop(pos); cur = base; best = rem; improved = True; break
+                sel.pop(pos); wt.pop(i, None); cur = base; best = rem; improved = True; break
             if j != i and sc[j] > best + 1e-6:             # replacing is better
-                sel[pos] = j; cur = base + X[j]; best = sc[j]; improved = True; break
-    return sel
+                wt.pop(i, None); wt[j] = 1.0; sel[pos] = j; cur = base + X[j]; best = sc[j]; improved = True; break
+    return sel, wt
 
 
-def tune_weights(C, sel, a, grid=(0.5, 1.0, 1.5)):
-    w = {i: 1.0 for i in sel}
+def tune_weights(C, sel, a, grid=(0.5, 1.0, 1.5), w0=None):
+    w = {i: float((w0 or {}).get(i, 1.0)) for i in sel}
     X = C.astype(np.float64)
     cur = sum(X[i] * w[i] for i in sel)
     best = score_rows(cur[None, :], a.objective)[0]
@@ -267,10 +275,12 @@ def describe(p):
                 sortino=round(float(score_rows(p[None, :], 'sortino')[0]), 2))
 
 
-def report(keys, CF, ns, a, idx):
-    """STEP 1 (selection, no filter) + STEP 2 (filters on the final portfolio) + write csv files."""
-    sel = search(CF['none'], keys, a)
-    w = tune_weights(CF['none'], sel, a) if a.tune_weights else {i: 1.0 for i in sel}
+def report(keys, CF, ns, a, idx, sel=None, w=None):
+    """STEP 1 (selection, no filter) + STEP 2 (filters on the final portfolio) + write csv files.
+    sel / w given -> the portfolio is already decided (polish mode), only the report is produced."""
+    if sel is None:
+        sel, _ = search(CF['none'], keys, a)
+        w = tune_weights(CF['none'], sel, a) if a.tune_weights else {i: 1.0 for i in sel}
     rows = []
     for i in sel:
         s = CF['none'][i].astype(np.float64)
@@ -304,6 +314,66 @@ def report(keys, CF, ns, a, idx):
     yy = pd.Series(P, index=idx).groupby(idx.year).agg(total='sum', win_pct=lambda x: (x > 0).mean() * 100).round(1)
     print(yy.T.to_string())
     print(f'\nfiles written to {a.out}/')
+
+
+# ---------------------------------------------------------------- polish: improve an already found portfolio
+SEED_IN_REPO = os.path.join('analysis_results', 'pool_search_results.tar.gz.enc')
+
+
+def load_seed(a):
+    """selected.csv of the portfolio already found: --polish-from (a csv file) or the encrypted results tar in the repo."""
+    if a.polish_from:
+        return pd.read_csv(a.polish_from)
+    p = os.path.join(a.repo_dir, SEED_IN_REPO)
+    if not os.path.isfile(p):
+        sys.exit(f'polish: no saved portfolio found ({p}); pass --polish-from selected.csv or run the search first')
+    with open(p, 'rb') as f:
+        raw = _dec_bytes(f.read(), a.password)
+    with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as tf:
+        m = next((x for x in tf.getmembers() if os.path.basename(x.name) == 'selected.csv'), None)
+        if m is None:
+            sys.exit('polish: selected.csv is not inside the saved results archive')
+        return pd.read_csv(io.BytesIO(tf.extractfile(m).read()))
+
+
+def polish_mode(a, keys, CF, ns, idx):
+    seed = load_seed(a)
+    pos = {k: i for i, k in enumerate(keys)}
+    init, w0, lost = [], {}, []
+    for r in seed.itertuples(index=False):
+        k = (str(r.file), str(r.coin), str(r.direction), str(r.session))
+        if k in pos and pos[k] not in init:
+            init.append(pos[k]); w0[pos[k]] = float(getattr(r, 'weight', 1.0))
+        else:
+            lost.append(k)
+    print(f'polish: saved portfolio has {len(seed)} members, {len(init)} found among the candidates')
+    if lost:
+        print(f'  ! {len(lost)} members no longer exist as candidates (data / params changed) and are dropped: ' + '; '.join('/'.join(k) for k in lost[:10]))
+    if not init:
+        sys.exit('polish: none of the saved members exist among the candidates')
+    X = CF['none'].astype(np.float64)
+    before = sum(X[i] * w0[i] for i in init)
+    s0 = float(score_rows(before[None, :], a.objective)[0])
+    sel, w = search(CF['none'], keys, a, init=init, init_w=w0)
+    if a.tune_weights:
+        w = tune_weights(CF['none'], sel, a, w0=w)
+    after = sum(X[i] * w[i] for i in sel)
+    s1 = float(score_rows(after[None, :], a.objective)[0])
+    print(f'\n== polish ({a.objective}): score {s0:.3f} -> {s1:.3f}   ({len(init)} -> {len(sel)} members) ==')
+    ch = []
+    for i in init:
+        if i not in sel:
+            ch.append(dict(change='removed', file=keys[i][0], coin=keys[i][1], direction=keys[i][2], session=keys[i][3], weight=w0[i]))
+        elif abs(w[i] - w0[i]) > 1e-9:
+            ch.append(dict(change='weight', file=keys[i][0], coin=keys[i][1], direction=keys[i][2], session=keys[i][3], weight=w[i]))
+    for i in sel:
+        if i not in init:
+            ch.append(dict(change='added', file=keys[i][0], coin=keys[i][1], direction=keys[i][2], session=keys[i][3], weight=w[i]))
+    os.makedirs(a.out, exist_ok=True)
+    cd = pd.DataFrame(ch, columns=['change', 'file', 'coin', 'direction', 'session', 'weight'])
+    cd.to_csv(os.path.join(a.out, 'polish_changes.csv'), index=False)
+    print(cd.to_string(index=False) if len(cd) else 'no change: the saved portfolio is already a local optimum for this objective')
+    report(keys, CF, ns, a, idx, sel=sel, w=w)
 
 
 # ---------------------------------------------------------------- incremental pipeline: plan
@@ -438,6 +508,8 @@ def search_mode(a, idx):
         print('ERROR: no candidates at all', file=sys.stderr)
         sys.exit(4)
     CF = {f: np.vstack(v) for f, v in mats.items()}
+    if a.polish:
+        return polish_mode(a, keys, CF, np.array(ns), idx)
     report(keys, CF, np.array(ns), a, idx)
 
 
@@ -463,6 +535,10 @@ def main():
                     help='green objective: best month should not exceed this share of the total profit')
     ap.add_argument('--tune-weights', action='store_true')
     ap.add_argument('--rebuild', action='store_true')
+    ap.add_argument('--polish', action='store_true',
+                    help='search/all: do not search from scratch; start from the portfolio already found (selected.csv) and keep improving it '
+                         'with --objective (add / remove / replace, never worse than the start); with --tune-weights the weights are tuned from the saved ones')
+    ap.add_argument('--polish-from', help='polish: selected.csv to start from (default: analysis_results/pool_search_results.tar.gz.enc in --repo-dir; mode all needs this)')
     ap.add_argument('--repo-dir', help='plan/search: git checkout of the data repo (aggregated/ + pool_candidates/)')
     ap.add_argument('--queue-dir', default='pool_queue', help='plan: where chunk_<i>.json and plan.json are written')
     ap.add_argument('--chunk-size', type=int, default=10, help='plan: files per chunk')
@@ -477,6 +553,10 @@ def main():
     need = {'all': ['password', 'data', 'regime'], 'plan': ['repo_dir', 'regime'],
             'build': ['password', 'data', 'regime', 'manifest'], 'search': ['password', 'repo_dir', 'regime']}[a.mode]
     miss = [n for n in need if not getattr(a, n)]
+    if a.polish and a.mode == 'all' and not a.polish_from:
+        miss.append('polish_from')
+    if a.polish and a.mode in ('plan', 'build'):
+        ap.error('--polish works with --mode search or all')
     if miss:
         ap.error(f'--mode {a.mode} needs ' + ', '.join('--' + n.replace('_', '-') for n in miss))
     idx = pd.period_range(a.start, a.end, freq='M')
@@ -497,6 +577,8 @@ def main():
         keys, CF, ns = build_candidates(a, idx)
         pickle.dump((keys, CF, ns), open(cache, 'wb'))
     print(f'{len(keys)} candidates, {CF["none"].shape[1]} months')
+    if a.polish:
+        return polish_mode(a, keys, CF, ns, idx)
     report(keys, CF, ns, a, idx)
 
 
