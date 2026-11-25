@@ -25,9 +25,10 @@ on:
         required: false
         type: choice
         options:
+          - green
           - sortino
           - sharpe
-        default: 'sortino'
+        default: 'green'
       pool_max_members:
         description: '[pool_search] حداکثر تعداد اعضای پرتفوی'
         required: false
@@ -2247,7 +2248,7 @@ jobs:
             exit 1
           fi
           fail() { echo "❌ پارامتر نامعتبر: $1"; exit 1; }
-          [[ "$POOL_OBJECTIVE" =~ ^(sortino|sharpe)$ ]]        || fail "pool_objective=$POOL_OBJECTIVE"
+          [[ "$POOL_OBJECTIVE" =~ ^(green|sortino|sharpe)$ ]]        || fail "pool_objective=$POOL_OBJECTIVE"
           [[ "$POOL_MAX_MEMBERS" =~ ^[0-9]+$ ]]                || fail "pool_max_members=$POOL_MAX_MEMBERS"
           [[ "$POOL_MAX_PER_FILE" =~ ^[0-9]+$ ]]               || fail "pool_max_per_file=$POOL_MAX_PER_FILE"
           [[ "$POOL_MIN_TRADES" =~ ^[0-9]+$ ]]                 || fail "pool_min_trades=$POOL_MIN_TRADES"
