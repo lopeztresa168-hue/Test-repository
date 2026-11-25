@@ -59,6 +59,14 @@ on:
         description: '[pool_search] ماه پایان به‌صورت YYYY-MM (خالی = پیش‌فرض ماژول)'
         required: false
         default: ''
+      pool_time_budget:
+        description: '[pool_search] دقیقه‌ی اضافه برای جستجوی تصادفی سید بهتر بعد از اولین بهینه (0 = خاموش؛ حداکثر ~300)'
+        required: false
+        default: '0'
+      pool_seed:
+        description: '[pool_search] seed جستجوی تصادفی (برای نتیجه‌ی متفاوت، عدد دیگری بده)'
+        required: false
+        default: '0'
 
 concurrency:
   group: analysis-runner
@@ -2565,11 +2573,14 @@ jobs:
           POOL_TUNE_WEIGHTS: ${{ inputs.pool_tune_weights }}
           POOL_POLISH: ${{ inputs.pool_polish }}
           POOL_END: ${{ inputs.pool_end }}
+          POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
+          POOL_SEED: ${{ inputs.pool_seed }}
         run: |
           echo "🔁 هنوز ${{ needs.pool-collect.outputs.blocking }} فایل پردازش‌نشده مانده — اجرای بعدی pool_search..."
           ARGS=(-f analysis_module=pool_search -f pool_objective="$POOL_OBJECTIVE" -f pool_max_members="$POOL_MAX_MEMBERS"
                 -f pool_max_per_file="$POOL_MAX_PER_FILE" -f pool_min_trades="$POOL_MIN_TRADES" -f pool_fee="$POOL_FEE"
-                -f pool_tune_weights="$POOL_TUNE_WEIGHTS" -f pool_polish="$POOL_POLISH")
+                -f pool_tune_weights="$POOL_TUNE_WEIGHTS" -f pool_polish="$POOL_POLISH"
+                -f pool_time_budget="$POOL_TIME_BUDGET" -f pool_seed="$POOL_SEED")
           if [ -n "$POOL_END" ]; then ARGS+=(-f pool_end="$POOL_END"); fi
           for attempt in 1 2 3; do
             if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
@@ -2598,6 +2609,8 @@ jobs:
       POOL_TUNE_WEIGHTS: ${{ inputs.pool_tune_weights }}
       POOL_POLISH: ${{ inputs.pool_polish }}
       POOL_END: ${{ inputs.pool_end }}
+      POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
+      POOL_SEED: ${{ inputs.pool_seed }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -2643,6 +2656,7 @@ jobs:
           if [ "$POOL_TUNE_WEIGHTS" = "true" ]; then ARGS+=(--tune-weights); fi
           if [ "$POOL_POLISH" = "true" ]; then ARGS+=(--polish); echo "✨ حالت polish: شروع از سبد ذخیره‌شده‌ی مخزن سوم"; fi
           if [ -n "$POOL_END" ]; then ARGS+=(--end "$POOL_END"); fi
+          if [ "${POOL_TIME_BUDGET:-0}" != "0" ]; then ARGS+=(--time-budget "$POOL_TIME_BUDGET" --seed "${POOL_SEED:-0}"); echo "🎲 جستجوی تصادفی: $POOL_TIME_BUDGET دقیقه (seed=${POOL_SEED:-0})"; fi
           set -o pipefail
           python -u modules/pool_search.py "${ARGS[@]}" 2>&1 | tee /tmp/pool_results/run.log
 
