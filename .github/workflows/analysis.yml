@@ -51,7 +51,7 @@ on:
         type: boolean
         default: false
       pool_polish:
-        description: '[pool_search] بهتر کردن سبد پیداشده (شروع از selected.csv ذخیره‌شده در مخزن سوم با هدف pool_objective؛ جستجوی از صفر انجام نمی‌شود، پرچم اتمام ساخته نمی‌شود)'
+        description: '[pool_search] بهتر کردن سبد پیداشده (شروع از آخرین نتیجه‌ی polish در مخزن سوم، و اگر نبود از سبد اصلی، با هدف pool_objective؛ جستجوی از صفر انجام نمی‌شود، پرچم اتمام ساخته نمی‌شود)'
         required: false
         type: boolean
         default: false
@@ -60,13 +60,21 @@ on:
         required: false
         default: ''
       pool_time_budget:
-        description: '[pool_search] دقیقه‌ی اضافه برای جستجوی تصادفی سید بهتر بعد از اولین بهینه (0 = خاموش؛ حداکثر ~300)'
+        description: '[pool_search] دقیقه‌ی اضافه برای جستجوی تصادفی سید بهتر بعد از اولین بهینه (0 = خاموش؛ حداکثر ~330)'
         required: false
         default: '0'
       pool_seed:
         description: '[pool_search] seed جستجوی تصادفی (برای نتیجه‌ی متفاوت، عدد دیگری بده)'
         required: false
         default: '0'
+      pool_repeat_hours:
+        description: '[pool_search] فقط با polish: تکرار خودکار تا این تعداد ساعت (مثلاً 24). بعد از پایان هر دور، همین ورک‌فلو با همان پارامترها و pool_time_budget دوباره اجرا می‌شود و از نتیجه‌ی polish دور قبل ادامه می‌دهد. 0 = خاموش'
+        required: false
+        default: '0'
+      pool_repeat_until:
+        description: '[pool_search] داخلی (زنجیره‌ی تکرار) — دستی پر نشود'
+        required: false
+        default: ''
 
 concurrency:
   group: analysis-runner
@@ -2241,6 +2249,7 @@ jobs:
       empty: ${{ steps.plan.outputs.empty }}
       pending_total: ${{ steps.plan.outputs.pending_total }}
       fingerprint: ${{ steps.plan.outputs.fingerprint }}
+      started_at: ${{ steps.plan.outputs.started_at }}
     env:
       POOL_OBJECTIVE: ${{ inputs.pool_objective }}
       POOL_MAX_MEMBERS: ${{ inputs.pool_max_members }}
@@ -2248,6 +2257,8 @@ jobs:
       POOL_MIN_TRADES: ${{ inputs.pool_min_trades }}
       POOL_FEE: ${{ inputs.pool_fee }}
       POOL_END: ${{ inputs.pool_end }}
+      POOL_REPEAT_HOURS: ${{ inputs.pool_repeat_hours }}
+      POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
     steps:
       - name: 1. Checkout مخزن اصلی
         uses: actions/checkout@v5
@@ -2267,6 +2278,8 @@ jobs:
           [[ "$POOL_MIN_TRADES" =~ ^[0-9]+$ ]]                 || fail "pool_min_trades=$POOL_MIN_TRADES"
           [[ "$POOL_FEE" =~ ^[0-9]*\.?[0-9]+$ ]]               || fail "pool_fee=$POOL_FEE"
           [[ -z "$POOL_END" || "$POOL_END" =~ ^[0-9]{4}-[0-9]{2}$ ]] || fail "pool_end=$POOL_END (فرمت YYYY-MM)"
+          [[ -z "$POOL_REPEAT_HOURS" || "$POOL_REPEAT_HOURS" =~ ^[0-9]+$ ]] || fail "pool_repeat_hours=$POOL_REPEAT_HOURS"
+          [[ -z "$POOL_TIME_BUDGET" || "$POOL_TIME_BUDGET" =~ ^[0-9]+$ ]]   || fail "pool_time_budget=$POOL_TIME_BUDGET (فقط عدد صحیح)"
           echo "✅ ماژول و پارامترها معتبر هستند."
 
       - name: 3. بررسی interrupt.flag
@@ -2344,6 +2357,7 @@ jobs:
           # اثرانگشت پوشه‌ی aggregated (همان فرمولی که loop_analysis.yml از روی API می‌گیرد)
           FP=$(git -C /tmp/third_repo ls-tree --format='%(path) %(objectname)' HEAD:aggregated | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
           echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: 8. آپلود صف (چانک‌ها)
         uses: actions/upload-artifact@v4
@@ -2575,12 +2589,15 @@ jobs:
           POOL_END: ${{ inputs.pool_end }}
           POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
           POOL_SEED: ${{ inputs.pool_seed }}
+          POOL_REPEAT_HOURS: ${{ inputs.pool_repeat_hours }}
+          POOL_REPEAT_UNTIL: ${{ inputs.pool_repeat_until }}
         run: |
           echo "🔁 هنوز ${{ needs.pool-collect.outputs.blocking }} فایل پردازش‌نشده مانده — اجرای بعدی pool_search..."
           ARGS=(-f analysis_module=pool_search -f pool_objective="$POOL_OBJECTIVE" -f pool_max_members="$POOL_MAX_MEMBERS"
                 -f pool_max_per_file="$POOL_MAX_PER_FILE" -f pool_min_trades="$POOL_MIN_TRADES" -f pool_fee="$POOL_FEE"
                 -f pool_tune_weights="$POOL_TUNE_WEIGHTS" -f pool_polish="$POOL_POLISH"
-                -f pool_time_budget="$POOL_TIME_BUDGET" -f pool_seed="$POOL_SEED")
+                -f pool_time_budget="$POOL_TIME_BUDGET" -f pool_seed="$POOL_SEED"
+                -f pool_repeat_hours="$POOL_REPEAT_HOURS" -f pool_repeat_until="$POOL_REPEAT_UNTIL")
           if [ -n "$POOL_END" ]; then ARGS+=(-f pool_end="$POOL_END"); fi
           for attempt in 1 2 3; do
             if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
@@ -2595,7 +2612,7 @@ jobs:
   pool-final:
     needs: [pool-plan, pool-collect]
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 355   # سقف ران‌ر ۳۶۰؛ برای pool_time_budget=330 + لود کش‌ها + گزارش
     if: >-
       ${{ always() && inputs.analysis_module == 'pool_search' && needs.pool-plan.result == 'success' &&
       (needs.pool-plan.outputs.empty == 'true' ||
@@ -2611,6 +2628,8 @@ jobs:
       POOL_END: ${{ inputs.pool_end }}
       POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
       POOL_SEED: ${{ inputs.pool_seed }}
+      POOL_REPEAT_HOURS: ${{ inputs.pool_repeat_hours }}
+      POOL_REPEAT_UNTIL: ${{ inputs.pool_repeat_until }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -2654,7 +2673,7 @@ jobs:
                 --max-members "$POOL_MAX_MEMBERS" --max-per-file "$POOL_MAX_PER_FILE"
                 --objective "$POOL_OBJECTIVE")
           if [ "$POOL_TUNE_WEIGHTS" = "true" ]; then ARGS+=(--tune-weights); fi
-          if [ "$POOL_POLISH" = "true" ]; then ARGS+=(--polish); echo "✨ حالت polish: شروع از سبد ذخیره‌شده‌ی مخزن سوم"; fi
+          if [ "$POOL_POLISH" = "true" ]; then ARGS+=(--polish); echo "✨ حالت polish: ادامه از آخرین نتیجه‌ی polish (یا سبد اصلی اگر هنوز polish نشده)"; fi
           if [ -n "$POOL_END" ]; then ARGS+=(--end "$POOL_END"); fi
           if [ "${POOL_TIME_BUDGET:-0}" != "0" ]; then ARGS+=(--time-budget "$POOL_TIME_BUDGET" --seed "${POOL_SEED:-0}"); echo "🎲 جستجوی تصادفی: $POOL_TIME_BUDGET دقیقه (seed=${POOL_SEED:-0})"; fi
           set -o pipefail
@@ -2762,6 +2781,51 @@ jobs:
           else
             echo "ℹ️ skip_analysis.flag وجود ندارد — نیازی به فراخوانی مجدد loop نیست."
           fi
+
+      - name: تکرار خودکار polish (زنجیره‌ی pool_repeat_hours)
+        if: ${{ env.POOL_POLISH == 'true' && env.POOL_REPEAT_HOURS != '' && env.POOL_REPEAT_HOURS != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CROSS_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          STARTED_AT: ${{ needs.pool-plan.outputs.started_at }}
+        run: |
+          # این step فقط بعد از موفقیت کامل دور جاری (نتیجه push شده) اجرا می‌شود.
+          if GH_TOKEN="$CROSS_TOKEN" gh api "repos/$THIRD_REPO/contents/interrupt.flag" >/dev/null 2>&1; then
+            echo "🛑 interrupt.flag هست — زنجیره‌ی polish متوقف شد."
+            exit 0
+          fi
+          UNTIL="$POOL_REPEAT_UNTIL"
+          [ -n "$UNTIL" ] || UNTIL=$(( STARTED_AT + POOL_REPEAT_HOURS * 3600 ))
+          LEFT=$(( (UNTIL - $(date +%s)) / 60 ))
+          BUDGET="${POOL_TIME_BUDGET%.*}"; BUDGET="${BUDGET:-0}"
+          NEXT=$(( LEFT - 15 ))                        # سربار لود کش‌ها / گزارش / push
+          [ "$NEXT" -gt "$BUDGET" ] && NEXT="$BUDGET"  # دور آخر به اندازه‌ی وقت باقی‌مانده کوتاه می‌شود
+          if [ "$BUDGET" -le 0 ]; then
+            echo "ℹ️ pool_time_budget=0 — تکرار بی‌فایده است (هر دور همان نتیجه‌ی قطعی را می‌دهد). زنجیره شروع نمی‌شود."
+            exit 0
+          fi
+          if [ "$NEXT" -lt 10 ]; then
+            echo "🏁 زنجیره‌ی polish تمام شد (باقی‌مانده: ${LEFT} دقیقه)."
+            exit 0
+          fi
+          NEXT_SEED=$(( ${POOL_SEED:-0} + 1 ))
+          ARGS=(-f analysis_module=pool_search -f pool_polish=true
+                -f pool_objective="$POOL_OBJECTIVE" -f pool_max_members="$POOL_MAX_MEMBERS"
+                -f pool_max_per_file="$POOL_MAX_PER_FILE" -f pool_min_trades="$POOL_MIN_TRADES" -f pool_fee="$POOL_FEE"
+                -f pool_tune_weights="$POOL_TUNE_WEIGHTS"
+                -f pool_time_budget="$NEXT" -f pool_seed="$NEXT_SEED"
+                -f pool_repeat_hours="$POOL_REPEAT_HOURS" -f pool_repeat_until="$UNTIL")
+          if [ -n "$POOL_END" ]; then ARGS+=(-f pool_end="$POOL_END"); fi
+          for attempt in 1 2 3; do
+            if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
+              echo "🔁 دور بعدی polish ثبت شد: ${NEXT} دقیقه، seed=${NEXT_SEED}، باقی‌مانده‌ی کل زنجیره: ${LEFT} دقیقه."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ ثبت دور بعدی polish ناموفق بود."
+          exit 1
 
       - name: آپلود نتایج به‌عنوان artifact
         if: always()
