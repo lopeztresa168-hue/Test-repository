@@ -46,7 +46,7 @@ POOL_DIR: any folder tree; every *.enc found recursively is one strategy file (n
 Options: --max-members 25 --min-gain 0.01 --min-trades 5 --max-per-file 3 --objective green|sortino|sharpe --max-month-share 0.25
          --tune-weights --jobs 8 --start 2018-01 --end 2026-05 --rebuild
 """
-import argparse, glob, hashlib, io, json, os, pickle, re, subprocess, sys, tarfile
+import argparse, glob, hashlib, io, json, os, pickle, re, subprocess, sys, tarfile, time
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 import numpy as np
@@ -195,10 +195,10 @@ def score_rows(P, objective):
     return (pos - neg) + 2 * T - pen + tie
 
 
-def search(C, keys, a, init=None, init_w=None):
+def search(C, keys, a, init=None, init_w=None, X=None, kick=0, rng=None, rand_top=30):
     """init: indices of an existing portfolio to continue from (polish); init_w: {index: weight} of those members.
     Members keep their weight, newly added / replacing candidates get weight 1.0. The result is never worse than init."""
-    X = C.astype(np.float64)
+    X = C.astype(np.float64) if X is None else X
     n = len(keys)
     fk = np.array([hash(k[:3]) for k in keys])          # (file, coin, direction)
     fl = np.array([hash(k[0]) for k in keys])           # file
@@ -225,11 +225,20 @@ def search(C, keys, a, init=None, init_w=None):
             sc[ch] = score_rows(base[None, :] + X[ch], a.objective)
         return sc
 
+    step = 0
     while len(sel) < a.max_members:                       # forward selection
         sc = scores(cur, allowed())
-        j = int(np.argmax(sc))
-        if sc[j] < best + a.min_gain:
-            break
+        if kick and step < kick and rng is not None:      # randomized start (multi-start): pick among the top candidates
+            top = np.argsort(sc)[-rand_top:]
+            top = top[sc[top] > -9]
+            if len(top) == 0:
+                break
+            j = int(rng.choice(top))
+        else:
+            j = int(np.argmax(sc))
+            if sc[j] < best + a.min_gain:
+                break
+        step += 1
         sel.append(j); wt[j] = 1.0; cur = cur + X[j]; best = sc[j]
     improved = True                                       # refinement: remove / replace
     while improved:
@@ -245,6 +254,41 @@ def search(C, keys, a, init=None, init_w=None):
             if j != i and sc[j] > best + 1e-6:             # replacing is better
                 wt.pop(i, None); wt[j] = 1.0; sel[pos] = j; cur = base + X[j]; best = sc[j]; improved = True; break
     return sel, wt
+
+
+def search_multi(C, keys, a, init=None, init_w=None):
+    """search() once (deterministic local optimum), then - while --time-budget minutes remain - iterated local search:
+    drop a few random members, force 1-3 random picks from the top candidates, re-run forward selection + refinement,
+    keep the result only if it beats the best so far. Never worse than the plain search()."""
+    X = C.astype(np.float64)
+    sel, wt = search(C, keys, a, init, init_w, X=X)
+    if a.time_budget <= 0:
+        return sel, wt
+    rng = np.random.default_rng(a.seed)
+
+    def val(s, w):
+        return float(score_rows(sum(X[i] * w[i] for i in s)[None, :], a.objective)[0])
+
+    best_sel, best_w, best_s = list(sel), dict(wt), val(sel, wt)
+    t_end = time.time() + a.time_budget * 60
+    print(f'multi-start: first local optimum {best_s:.4f} ({len(best_sel)} members), searching {a.time_budget} min for better ...', flush=True)
+    it = fails = 0
+    while time.time() < t_end:
+        it += 1
+        kmax = max(1, min(len(best_sel) - 1, 3 + fails // 5))        # perturbation grows when stuck
+        k = int(rng.integers(1, kmax + 1)) if len(best_sel) > 1 else 0
+        order = [int(i) for i in rng.permutation(best_sel)]
+        keep = order[k:]
+        s2, w2 = search(C, keys, a, init=keep or None, init_w={i: best_w[i] for i in keep}, X=X,
+                        kick=int(rng.integers(1, 4)), rng=rng, rand_top=int(rng.choice([10, 30, 100])))
+        v = val(s2, w2)
+        if v > best_s + 1e-9:
+            best_sel, best_w, best_s, fails = s2, w2, v, 0
+            print(f'  [{it}] improved -> {v:.4f} ({len(s2)} members, {int(t_end - time.time())}s left)', flush=True)
+        else:
+            fails += 1
+    print(f'multi-start done: {it} restarts, best {best_s:.4f}', flush=True)
+    return best_sel, best_w
 
 
 def tune_weights(C, sel, a, grid=(0.5, 1.0, 1.5), w0=None):
@@ -279,7 +323,7 @@ def report(keys, CF, ns, a, idx, sel=None, w=None):
     """STEP 1 (selection, no filter) + STEP 2 (filters on the final portfolio) + write csv files.
     sel / w given -> the portfolio is already decided (polish mode), only the report is produced."""
     if sel is None:
-        sel, _ = search(CF['none'], keys, a)
+        sel, _ = search_multi(CF['none'], keys, a)
         w = tune_weights(CF['none'], sel, a) if a.tune_weights else {i: 1.0 for i in sel}
     rows = []
     for i in sel:
@@ -354,7 +398,7 @@ def polish_mode(a, keys, CF, ns, idx):
     X = CF['none'].astype(np.float64)
     before = sum(X[i] * w0[i] for i in init)
     s0 = float(score_rows(before[None, :], a.objective)[0])
-    sel, w = search(CF['none'], keys, a, init=init, init_w=w0)
+    sel, w = search_multi(CF['none'], keys, a, init=init, init_w=w0)
     if a.tune_weights:
         w = tune_weights(CF['none'], sel, a, w0=w)
     after = sum(X[i] * w[i] for i in sel)
@@ -533,6 +577,9 @@ def main():
                     help='green = profitable months - losing months, with a profit-spread penalty (see --max-month-share)')
     ap.add_argument('--max-month-share', type=float, default=0.25,
                     help='green objective: best month should not exceed this share of the total profit')
+    ap.add_argument('--time-budget', type=float, default=0.0,
+                    help='minutes of extra randomized restarts (iterated local search) after the first local optimum; 0 = off')
+    ap.add_argument('--seed', type=int, default=0, help='random seed of the restarts')
     ap.add_argument('--tune-weights', action='store_true')
     ap.add_argument('--rebuild', action='store_true')
     ap.add_argument('--polish', action='store_true',
