@@ -38,7 +38,7 @@ MODES (--mode)
           Up to --max-missing-pct % of the files may be missing (failed files); more than that exits with code 3.
 
 POOL_DIR: any folder tree; every *.enc found recursively is one strategy file (name = parent folder, else file name).
-Options: --max-members 25 --min-gain 0.01 --min-trades 5 --max-per-file 3 --objective sortino|sharpe
+Options: --max-members 25 --min-gain 0.01 --min-trades 5 --max-per-file 3 --objective green|sortino|sharpe --max-month-share 0.25
          --tune-weights --jobs 8 --start 2018-01 --end 2026-05 --rebuild
 """
 import argparse, glob, hashlib, io, json, os, pickle, re, subprocess, sys
@@ -163,6 +163,9 @@ def build_candidates(a, month_index):
 
 
 # ---------------------------------------------------------------- objective & search
+CAP = 0.25                              # green objective: best month should be <= CAP of the total profit (soft penalty)
+
+
 def score_rows(P, objective):
     """P: (n, T) portfolio monthly series -> (n,) scores"""
     mean = P.mean(1)
@@ -170,7 +173,21 @@ def score_rows(P, objective):
         sd = P.std(1)
         return np.where(sd > 0, mean / np.where(sd > 0, sd, 1), -9)
     dd = np.sqrt((np.minimum(P, 0) ** 2).mean(1))
-    return np.where(dd > 0, mean / np.where(dd > 0, dd, 1), np.where(mean > 0, 50, -9))
+    sortino = np.where(dd > 0, mean / np.where(dd > 0, dd, 1), np.where(mean > 0, 50, -9))
+    if objective == 'sortino':
+        return sortino
+    # 'green': (profitable months - losing months), months with no trades (0) are neutral.
+    #   - soft penalty when the best month carries more than CAP of the total profit (spread of profit)
+    #   - total <= 0 gets the maximum penalty
+    #   - Sortino only breaks ties (tanh-squashed, < 0.5)
+    T = P.shape[1]
+    pos = (P > 0).sum(1)
+    neg = (P < 0).sum(1)
+    tot = P.sum(1)
+    share = np.where(tot > 0, P.max(1) / np.where(tot > 0, tot, 1), 1.0)
+    pen = np.where(tot > 0, np.maximum(0.0, share - CAP), 1.0) * T
+    tie = 0.4 * np.tanh(np.clip(sortino, -9, 50) / 10.0)
+    return (pos - neg) + 2 * T - pen + tie
 
 
 def search(C, keys, a):
@@ -271,13 +288,15 @@ def report(keys, CF, ns, a, idx):
         P = sum(CF[f][i].astype(np.float64) * w[i] for i in sel)
         series[f] = P
         d = describe(P); d['filter'] = f
+        d['score'] = round(float(score_rows(P[None, :], a.objective)[0]), 2)
+        d['best_month_share'] = round(float(P.max() / P.sum()), 2) if P.sum() > 0 else None
         res.append(d)
     R = pd.DataFrame(res).set_index('filter')
     print(R.to_string())
-    best_f = R.sortino.idxmax()
+    best_f = R.score.idxmax()
     R.to_csv(os.path.join(a.out, 'filters_compare.csv'))
     pd.DataFrame({f: series[f] for f in FILTERS}, index=idx.astype(str)).to_csv(os.path.join(a.out, 'portfolio_monthly_by_filter.csv'))
-    print(f"\nBEST FILTER: {best_f}   (highest Sortino; win% {R.loc[best_f, 'win_pct']}, total {R.loc[best_f, 'total']}, "
+    print(f"\nBEST FILTER: {best_f}   (highest score; win% {R.loc[best_f, 'win_pct']}, total {R.loc[best_f, 'total']}, "
           f"worst month {R.loc[best_f, 'worst']})")
     print({'none': 'no filter', 'both': 'drop if BTC 30d > +30% or coin 30d > +25%', 'btc': 'drop if BTC 30d > +30%',
            'coin': 'drop if coin 30d > +25%'}[best_f])
@@ -438,7 +457,10 @@ def main():
     ap.add_argument('--max-members', type=int, default=25)
     ap.add_argument('--max-per-file', type=int, default=3)
     ap.add_argument('--min-gain', type=float, default=0.01, help='stop adding when objective gain is below this')
-    ap.add_argument('--objective', choices=['sortino', 'sharpe'], default='sortino')
+    ap.add_argument('--objective', choices=['green', 'sortino', 'sharpe'], default='green',
+                    help='green = profitable months - losing months, with a profit-spread penalty (see --max-month-share)')
+    ap.add_argument('--max-month-share', type=float, default=0.25,
+                    help='green objective: best month should not exceed this share of the total profit')
     ap.add_argument('--tune-weights', action='store_true')
     ap.add_argument('--rebuild', action='store_true')
     ap.add_argument('--repo-dir', help='plan/search: git checkout of the data repo (aggregated/ + pool_candidates/)')
@@ -449,6 +471,8 @@ def main():
     ap.add_argument('--cache-dir', default='pool_cache', help='build: where the per-file caches are written')
     ap.add_argument('--max-missing-pct', type=float, default=5.0, help='search: tolerated share of files without cache')
     a = ap.parse_args()
+    global CAP
+    CAP = a.max_month_share
 
     need = {'all': ['password', 'data', 'regime'], 'plan': ['repo_dir', 'regime'],
             'build': ['password', 'data', 'regime', 'manifest'], 'search': ['password', 'repo_dir', 'regime']}[a.mode]
