@@ -39,7 +39,8 @@ MODES (--mode)
 
   polish  (flag, with --mode search or all) improve the portfolio that was already found instead of searching from scratch:
             python pool_search.py --mode search --polish --objective sortino --tune-weights --password PASS --repo-dir REPO --regime market_regime.json --out pool_polish
-          starts from selected.csv (saved results archive in REPO, or --polish-from FILE), then add / remove / replace passes with --objective;
+          starts from selected.csv of the LAST polish result (analysis_results/pool_search_polished.tar.gz.enc in REPO), or - if there is none yet -
+          of the main search result, or --polish-from FILE; then add / remove / replace passes with --objective (+ --time-budget restarts);
           the result is never worse than the start under that objective. Writes polish_changes.csv next to the usual files.
 
 POOL_DIR: any folder tree; every *.enc found recursively is one strategy file (name = parent folder, else file name).
@@ -362,13 +363,22 @@ def report(keys, CF, ns, a, idx, sel=None, w=None):
 
 # ---------------------------------------------------------------- polish: improve an already found portfolio
 SEED_IN_REPO = os.path.join('analysis_results', 'pool_search_results.tar.gz.enc')
+POLISHED_IN_REPO = os.path.join('analysis_results', 'pool_search_polished.tar.gz.enc')   # written by every polish run
 
 
 def load_seed(a):
-    """selected.csv of the portfolio already found: --polish-from (a csv file) or the encrypted results tar in the repo."""
+    """selected.csv of the portfolio to continue from: --polish-from (a csv file), else the result of the previous polish run
+    (analysis_results/pool_search_polished.tar.gz.enc), else the main search result (analysis_results/pool_search_results.tar.gz.enc).
+    So every polish run continues where the last polish run stopped."""
     if a.polish_from:
         return pd.read_csv(a.polish_from)
     p = os.path.join(a.repo_dir, SEED_IN_REPO)
+    q = os.path.join(a.repo_dir, POLISHED_IN_REPO)
+    if os.path.isfile(q):
+        p = q
+        print('polish: continuing from the previous polish result (pool_search_polished.tar.gz.enc)', flush=True)
+    elif os.path.isfile(p):
+        print('polish: no previous polish result yet - starting from the main search result (pool_search_results.tar.gz.enc)', flush=True)
     if not os.path.isfile(p):
         sys.exit(f'polish: no saved portfolio found ({p}); pass --polish-from selected.csv or run the search first')
     with open(p, 'rb') as f:
@@ -585,7 +595,7 @@ def main():
     ap.add_argument('--polish', action='store_true',
                     help='search/all: do not search from scratch; start from the portfolio already found (selected.csv) and keep improving it '
                          'with --objective (add / remove / replace, never worse than the start); with --tune-weights the weights are tuned from the saved ones')
-    ap.add_argument('--polish-from', help='polish: selected.csv to start from (default: analysis_results/pool_search_results.tar.gz.enc in --repo-dir; mode all needs this)')
+    ap.add_argument('--polish-from', help='polish: selected.csv to start from (default: analysis_results/pool_search_polished.tar.gz.enc if present, else pool_search_results.tar.gz.enc, in --repo-dir; mode all needs this)')
     ap.add_argument('--repo-dir', help='plan/search: git checkout of the data repo (aggregated/ + pool_candidates/)')
     ap.add_argument('--queue-dir', default='pool_queue', help='plan: where chunk_<i>.json and plan.json are written')
     ap.add_argument('--chunk-size', type=int, default=10, help='plan: files per chunk')
