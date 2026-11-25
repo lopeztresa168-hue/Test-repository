@@ -1544,8 +1544,14 @@ jobs:
 
   # ============================================================
   # Job 4: بررسی اینکه کدام فیلتر باید اجرا شود (skip cascade gate)
-  # منطق: fixed > golden > portfolios
+  # منطق: fixed > golden > portfolios > pool_search
   # هر فیلتر فقط وقتی اجرا میشه که همه فیلترهای قبلی خالی باشن
+  # pool_search صف جداگانه‌ای در این loop ندارد (صف داخلی‌اش در خود analysis.yml از روی «فایل‌های بدون کش به‌روز» ساخته
+  # می‌شود و در چندین اجرا کامل می‌شود). در دو حالت اجرا می‌شود، به شرط «کامل نبودن»:
+  #   ۱) هر سه صف fixed/golden/portfolios خالی‌اند
+  #   ۲) skip_analysis.flag در مخزن سوم هست (سه مرحله‌ی اول skip می‌شوند و به‌جایشان pool_search اجرا می‌شود)
+  # «کامل» = pool_search_done.flag هست و اثرانگشتش با اثرانگشت فعلی aggregated یکی است. با تغییر داده دوباره اجرا
+  # می‌شود (افزایشی: فقط فایل‌های جدید/تغییرکرده).
   # ============================================================
   check-queues:
     needs: prepare-dispatch
@@ -1554,6 +1560,7 @@ jobs:
       run_fixed: ${{ steps.gate.outputs.run_fixed }}
       run_golden: ${{ steps.gate.outputs.run_golden }}
       run_portfolios: ${{ steps.gate.outputs.run_portfolios }}
+      run_pool_search: ${{ steps.gate.outputs.run_pool_search }}
       skip_requested: ${{ steps.gate.outputs.skip_requested }}
     steps:
       - uses: actions/checkout@v5
@@ -1575,17 +1582,53 @@ jobs:
               echo "run_fixed=false" >> $GITHUB_OUTPUT
               echo "run_golden=false" >> $GITHUB_OUTPUT
               echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              echo "run_pool_search=false" >> $GITHUB_OUTPUT
               exit 0
             fi
 
-            # بررسی skip_analysis.flag: اگر وجود داشت، سه فیلتر skip می‌شوند و loop ادامه می‌یابد
+            # وضعیت pool_search (مرحله‌ی چهارم؛ صف ندارد):
+            # «کامل» یعنی pool_search_done.flag هست و اثرانگشت داخل آن با اثرانگشت فعلی پوشه‌ی aggregated یکی است.
+            # اگر داده‌ی aggregated تغییر کرده باشد (فایل جدید/به‌روزشده) POOL_DONE=false می‌شود و pool_search دوباره اجرا
+            # می‌شود؛ ولی چون کش per-file دارد فقط فایل‌های تغییرکرده را از نو می‌سازد (افزایشی).
+            # اثرانگشت = sha256 مرتب‌شده‌ی «نام sha» ورودی‌های aggregated (همان فرمول analysis.yml).
+            POOL_FLAG_FILE="pool_search_done.flag"
+            POOL_DONE=false
+            POOL_FLAG_RESP=$(gh api "repos/$THIRD_REPO/contents/$POOL_FLAG_FILE" 2>/dev/null || true)
+            if [ -n "$POOL_FLAG_RESP" ] && echo "$POOL_FLAG_RESP" | jq -e '.sha' >/dev/null 2>&1; then
+              POOL_DONE=true
+              FLAG_FP=$(echo "$POOL_FLAG_RESP" | jq -r '.content // ""' | base64 -d 2>/dev/null | jq -r '.fingerprint // empty' 2>/dev/null || true)
+              AGG_LIST=$(gh api "repos/$THIRD_REPO/contents/aggregated" -q '.[] | "\(.name) \(.sha)"' 2>/dev/null || true)
+              CUR_FP=""
+              if [ -n "$AGG_LIST" ]; then
+                CUR_FP=$(printf '%s\n' "$AGG_LIST" | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
+              fi
+              # اگر اثرانگشت‌ها قابل محاسبه‌اند و فرق دارند → داده تغییر کرده. (محاسبه‌ی ناموفق = فرض بر بدون تغییر)
+              if [ -n "$FLAG_FP" ] && [ -n "$CUR_FP" ] && [ "$FLAG_FP" != "$CUR_FP" ]; then
+                POOL_DONE=false
+                echo "🔄 داده‌ی aggregated از آخرین اجرای pool_search تغییر کرده — اجرای افزایشی لازم است."
+              fi
+            fi
+            echo "[DEBUG] pool_search_done=$POOL_DONE"
+
+            # بررسی skip_analysis.flag: اگر وجود داشت، سه مرحله‌ی اول (fixed / golden / portfolios) skip می‌شوند.
+            #   - pool_search هنوز کامل نشده → مرحله‌ی چهارم اجرا می‌شود. در این حالت loop خودش را مجدد صدا نمی‌زند؛
+            #     job موفق pool_search (در analysis.yml) اگر skip_analysis.flag هنوز باشد، loop را دوباره dispatch می‌کند.
+            #   - pool_search قبلاً کامل شده → دیگر اجرا نمی‌شود و loop مثل قبل با تأخیر ادامه می‌یابد.
             SKIP_FLAG_FILE="skip_analysis.flag"
             if gh api "repos/$THIRD_REPO/contents/$SKIP_FLAG_FILE" >/dev/null 2>&1; then
-              echo "⏭️ $SKIP_FLAG_FILE یافت شد — fixed / golden / portfolios هر سه skip می‌شوند و loop ادامه می‌یابد."
+              echo "⏭️ $SKIP_FLAG_FILE یافت شد — fixed / golden / portfolios skip می‌شوند."
               echo "run_fixed=false" >> $GITHUB_OUTPUT
               echo "run_golden=false" >> $GITHUB_OUTPUT
               echo "run_portfolios=false" >> $GITHUB_OUTPUT
-              echo "skip_requested=true" >> $GITHUB_OUTPUT
+              if [ "$POOL_DONE" != "true" ]; then
+                echo "▶ pool_search هنوز کامل نشده — مرحله‌ی چهارم اجرا می‌شود."
+                echo "run_pool_search=true" >> $GITHUB_OUTPUT
+                echo "skip_requested=false" >> $GITHUB_OUTPUT
+              else
+                echo "✅ pool_search قبلاً کامل شده — نیازی به اجرا نیست؛ loop ادامه می‌یابد."
+                echo "run_pool_search=false" >> $GITHUB_OUTPUT
+                echo "skip_requested=true" >> $GITHUB_OUTPUT
+              fi
               exit 0
             fi
 
@@ -1612,21 +1655,31 @@ jobs:
               echo "run_fixed=true"  >> $GITHUB_OUTPUT
               echo "run_golden=false" >> $GITHUB_OUTPUT
               echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              echo "run_pool_search=false" >> $GITHUB_OUTPUT
             elif [ "$LEN_GOLDEN" -gt 0 ]; then
               echo "▶ golden کار دارد ($LEN_GOLDEN) — fixed خالی، بقیه skip."
               echo "run_fixed=false" >> $GITHUB_OUTPUT
               echo "run_golden=true"  >> $GITHUB_OUTPUT
               echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              echo "run_pool_search=false" >> $GITHUB_OUTPUT
             elif [ "$LEN_PORT" -gt 0 ]; then
               echo "▶ portfolios کار دارد ($LEN_PORT) — بقیه خالی."
               echo "run_fixed=false" >> $GITHUB_OUTPUT
               echo "run_golden=false" >> $GITHUB_OUTPUT
               echo "run_portfolios=true"  >> $GITHUB_OUTPUT
-            else
-              echo "ℹ️ همه صف‌ها خالی هستند — loop ادامه می‌یابد."
+              echo "run_pool_search=false" >> $GITHUB_OUTPUT
+            elif [ "$POOL_DONE" != "true" ]; then
+              echo "▶ هر سه صف خالی‌اند و pool_search هنوز برای این وضعیت اجرا نشده — pool_search اجرا می‌شود."
               echo "run_fixed=false" >> $GITHUB_OUTPUT
               echo "run_golden=false" >> $GITHUB_OUTPUT
               echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              echo "run_pool_search=true" >> $GITHUB_OUTPUT
+            else
+              echo "ℹ️ همه صف‌ها خالی هستند و pool_search قبلاً انجام شده — loop ادامه می‌یابد."
+              echo "run_fixed=false" >> $GITHUB_OUTPUT
+              echo "run_golden=false" >> $GITHUB_OUTPUT
+              echo "run_portfolios=false" >> $GITHUB_OUTPUT
+              echo "run_pool_search=false" >> $GITHUB_OUTPUT
             fi
           }
 
@@ -1929,6 +1982,43 @@ jobs:
             done
             if [ "$SUCCESS" = "false" ]; then
               echo "❌ هر سه تلاش برای dispatch-portfolios ناموفق بود."
+              exit 1
+            fi
+          }
+
+  # ============================================================
+  # Job 8: اجرای pool_search (فیلتر ۴) — فقط وقتی fixed / golden / portfolios همگی خالی‌اند
+  # pool_search صف ندارد؛ analysis.yml را با analysis_module=pool_search صدا می‌زند.
+  # پس از اجرای موفق، خودِ آن job فایل pool_search_done.flag را در مخزن سوم می‌سازد.
+  # ============================================================
+  dispatch-pool-search:
+    needs: [prepare-dispatch, check-queues]
+    if: needs.check-queues.outputs.run_pool_search == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          ref: main
+      - name: فراخوانی analysis.yml با analysis_module=pool_search (با retry)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "🔄 فراخوانی analysis.yml (analysis_module=pool_search)..."
+            SUCCESS=false
+            for attempt in 1 2 3; do
+              if gh workflow run analysis.yml --ref main -f analysis_module=pool_search 2>&1; then
+                echo "✅ فراخوانی pool_search موفق بود (تلاش $attempt)."
+                SUCCESS=true
+                break
+              else
+                echo "⚠️ تلاش $attempt ناموفق بود. 5 ثانیه صبر می‌کنم..."
+                sleep 5
+              fi
+            done
+            if [ "$SUCCESS" = "false" ]; then
+              echo "❌ هر سه تلاش برای dispatch-pool-search ناموفق بود."
               exit 1
             fi
           }
