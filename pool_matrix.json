@@ -1,0 +1,267 @@
+{
+  "defaults": {
+    "objective": "green",
+    "fee": 0,
+    "tune_weights": true,
+    "polish": true,
+    "end": "",
+    "time_budget": 0,
+    "seed": 0,
+    "repeat": true,
+    "repeat_hours": 1
+  },
+  "configs": [
+    {
+      "tag": "m50_f5_t5",
+      "max_members": 50,
+      "max_per_file": 5,
+      "min_trades": 5
+    },
+    {
+      "tag": "m50_f5_t50",
+      "max_members": 50,
+      "max_per_file": 5,
+      "min_trades": 50
+    },
+    {
+      "tag": "m50_f5_t100",
+      "max_members": 50,
+      "max_per_file": 5,
+      "min_trades": 100
+    },
+    {
+      "tag": "m50_f5_t200",
+      "max_members": 50,
+      "max_per_file": 5,
+      "min_trades": 200
+    },
+    {
+      "tag": "m50_f5_t300",
+      "max_members": 50,
+      "max_per_file": 5,
+      "min_trades": 300
+    },
+    {
+      "tag": "m50_f5_t400",
+      "max_members": 50,
+      "max_per_file": 5,
+      "min_trades": 400
+    },
+    {
+      "tag": "m50_f5_t600",
+      "max_members": 50,
+      "max_per_file": 5,
+      "min_trades": 600
+    },
+    {
+      "tag": "m100_f5_t5",
+      "max_members": 100,
+      "max_per_file": 5,
+      "min_trades": 5
+    },
+    {
+      "tag": "m100_f5_t50",
+      "max_members": 100,
+      "max_per_file": 5,
+      "min_trades": 50
+    },
+    {
+      "tag": "m100_f5_t100",
+      "max_members": 100,
+      "max_per_file": 5,
+      "min_trades": 100
+    },
+    {
+      "tag": "m100_f5_t200",
+      "max_members": 100,
+      "max_per_file": 5,
+      "min_trades": 200
+    },
+    {
+      "tag": "m100_f5_t300",
+      "max_members": 100,
+      "max_per_file": 5,
+      "min_trades": 300
+    },
+    {
+      "tag": "m100_f5_t400",
+      "max_members": 100,
+      "max_per_file": 5,
+      "min_trades": 400
+    },
+    {
+      "tag": "m100_f5_t600",
+      "max_members": 100,
+      "max_per_file": 5,
+      "min_trades": 600
+    },
+    {
+      "tag": "m200_f5_t5",
+      "max_members": 200,
+      "max_per_file": 5,
+      "min_trades": 5
+    },
+    {
+      "tag": "m200_f5_t50",
+      "max_members": 200,
+      "max_per_file": 5,
+      "min_trades": 50
+    },
+    {
+      "tag": "m200_f5_t100",
+      "max_members": 200,
+      "max_per_file": 5,
+      "min_trades": 100
+    },
+    {
+      "tag": "m200_f5_t200",
+      "max_members": 200,
+      "max_per_file": 5,
+      "min_trades": 200
+    },
+    {
+      "tag": "m200_f5_t300",
+      "max_members": 200,
+      "max_per_file": 5,
+      "min_trades": 300
+    },
+    {
+      "tag": "m200_f5_t400",
+      "max_members": 200,
+      "max_per_file": 5,
+      "min_trades": 400
+    },
+    {
+      "tag": "m200_f5_t600",
+      "max_members": 200,
+      "max_per_file": 5,
+      "min_trades": 600
+    },
+    {
+      "tag": "m400_f5_t5",
+      "max_members": 400,
+      "max_per_file": 5,
+      "min_trades": 5
+    },
+    {
+      "tag": "m400_f5_t50",
+      "max_members": 400,
+      "max_per_file": 5,
+      "min_trades": 50
+    },
+    {
+      "tag": "m400_f5_t100",
+      "max_members": 400,
+      "max_per_file": 5,
+      "min_trades": 100
+    },
+    {
+      "tag": "m400_f5_t200",
+      "max_members": 400,
+      "max_per_file": 5,
+      "min_trades": 200
+    },
+    {
+      "tag": "m400_f5_t300",
+      "max_members": 400,
+      "max_per_file": 5,
+      "min_trades": 300
+    },
+    {
+      "tag": "m400_f5_t400",
+      "max_members": 400,
+      "max_per_file": 5,
+      "min_trades": 400
+    },
+    {
+      "tag": "m400_f5_t600",
+      "max_members": 400,
+      "max_per_file": 5,
+      "min_trades": 600
+    },
+    {
+      "tag": "m500_f5_t5",
+      "max_members": 500,
+      "max_per_file": 5,
+      "min_trades": 5
+    },
+    {
+      "tag": "m500_f5_t50",
+      "max_members": 500,
+      "max_per_file": 5,
+      "min_trades": 50
+    },
+    {
+      "tag": "m500_f5_t100",
+      "max_members": 500,
+      "max_per_file": 5,
+      "min_trades": 100
+    },
+    {
+      "tag": "m500_f5_t200",
+      "max_members": 500,
+      "max_per_file": 5,
+      "min_trades": 200
+    },
+    {
+      "tag": "m500_f5_t300",
+      "max_members": 500,
+      "max_per_file": 5,
+      "min_trades": 300
+    },
+    {
+      "tag": "m500_f5_t400",
+      "max_members": 500,
+      "max_per_file": 5,
+      "min_trades": 400
+    },
+    {
+      "tag": "m500_f5_t600",
+      "max_members": 500,
+      "max_per_file": 5,
+      "min_trades": 600
+    },
+    {
+      "tag": "m700_f5_t5",
+      "max_members": 700,
+      "max_per_file": 5,
+      "min_trades": 5
+    },
+    {
+      "tag": "m700_f5_t50",
+      "max_members": 700,
+      "max_per_file": 5,
+      "min_trades": 50
+    },
+    {
+      "tag": "m700_f5_t100",
+      "max_members": 700,
+      "max_per_file": 5,
+      "min_trades": 100
+    },
+    {
+      "tag": "m700_f5_t200",
+      "max_members": 700,
+      "max_per_file": 5,
+      "min_trades": 200
+    },
+    {
+      "tag": "m700_f5_t300",
+      "max_members": 700,
+      "max_per_file": 5,
+      "min_trades": 300
+    },
+    {
+      "tag": "m700_f5_t400",
+      "max_members": 700,
+      "max_per_file": 5,
+      "min_trades": 400
+    },
+    {
+      "tag": "m700_f5_t600",
+      "max_members": 700,
+      "max_per_file": 5,
+      "min_trades": 600
+    }
+  ]
+}
