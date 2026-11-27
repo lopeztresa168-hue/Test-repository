@@ -25,7 +25,7 @@ MODES (--mode)
             python pool_search.py --password PASS --data POOL_DIR --regime market_regime.json --fee 0 --out pool_results
   plan    INCREMENTAL / QUEUED pipeline, step 1: look at a git checkout of the data repo (git ls-tree only, blobs are not
           needed), compare every source file (aggregated/<STRAT>/<STRAT>_trades.enc, by git blob sha) with the per-file
-          caches in <repo>/pool_candidates/, and write the work queue:  chunk_<i>.json + plan.json  into --queue-dir.
+          caches extracted on disk in <repo>/pool_candidates/ (from the encrypted archive pool_cache/, see modules/pool_cache.sh), and write the work queue:  chunk_<i>.json + plan.json  into --queue-dir.
           A cache is up to date when its NAME matches  <strategy>__<source-sha12>__<params-key>.npz.enc ; so a changed /
           new source file, or a change of fee / min-trades / start / end / regime file, makes it pending again.
             python pool_search.py --mode plan --repo-dir REPO --regime market_regime.json --queue-dir Q --chunk-size 10
@@ -463,7 +463,9 @@ def make_plan(a):
             name = f'{name}~{re.sub(r"[.]enc$", "", os.path.basename(path))}'
         seen.add(name)
         sources.append(dict(name=name, path=path, sha=sha, cache=f'{_safe(name)}__{sha[:12]}__{pk}.npz.enc'))
-    present = {os.path.basename(p): p for _, p in _git_ls(a.repo_dir, CACHE_DIR_IN_REPO)}
+    # کش‌ها از روی دیسک خوانده می‌شوند (آرشیو pool_cache/ قبلاً با modules/pool_cache.sh در <repo>/pool_candidates باز شده)
+    cdir = os.path.join(a.repo_dir, CACHE_DIR_IN_REPO)
+    present = {f: f'{CACHE_DIR_IN_REPO}/{f}' for f in (os.listdir(cdir) if os.path.isdir(cdir) else [])}
     expected = {s['cache'] for s in sources}
     pending = [s for s in sources if s['cache'] not in present]
     stale = sorted(p for b, p in present.items() if b not in expected and b.endswith('.npz.enc'))
