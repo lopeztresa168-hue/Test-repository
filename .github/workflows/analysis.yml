@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       analysis_module:
-        description: 'نام ماژول (fixed_batch | golden | portfolios | correlation | pool_search)'
+        description: 'نام ماژول (fixed_batch | golden | portfolios | correlation | pool_search | pool_matrix)'
         required: true
         default: ''
       chunk_start:
@@ -64,7 +64,7 @@ on:
         required: false
         default: '0'
       pool_seed:
-        description: '[pool_search] seed جستجوی تصادفی (برای نتیجه‌ی متفاوت، عدد دیگری بده)'
+        description: '[pool_search] seed جستجوی تصادفی (برای نتیجه‌ی متفاوت، عدد دیگری بده). در pool_matrix: آفست دور تکرار که به seed هر تنظیمات اضافه می‌شود (داخلی، دستی پر نکن)'
         required: false
         default: '0'
       pool_repeat:
@@ -89,15 +89,20 @@ on:
         description: '[pool_search] نام یک تنظیمات ماتریکس (توسط pool_matrix.yml پر می‌شود). با tag: هر تنظیمات در صف مستقل اجرا می‌شود، نتیجه‌اش در analysis_results/pool_matrix/<tag>.tar.gz.enc ذخیره می‌شود، polish از نتیجه‌ی همان tag ادامه می‌دهد، و پرچم اتمام/loop دست نمی‌خورد. خالی = رفتار قبلی'
         required: false
         default: ''
+      pool_matrix_tags:
+        description: '[pool_matrix] داخلی (توسط خود workflow در دورهای تکرار/ادامه پر می‌شود): لیست tagها به‌صورت tag یا tag=epoch جداشده با کاما. خالی = همه‌ی تنظیمات pool_matrix.json. دستی پر نکن'
+        required: false
+        default: ''
 
 # اجرای tagدار (ماتریکس pool_matrix.yml) گروه همزمانی مخصوص خودش را دارد تا ۲۰ تنظیمات هم‌زمان اجرا شوند
 # (در یک گروه مشترک فقط یک اجرا + یک صف‌شده می‌ماند و بقیه لغو می‌شدند). بقیه‌ی اجراها مثل قبل در analysis-runner هستند.
+# اجرای pool_matrix (همه‌ی تنظیمات pool_matrix.json داخل یک اجرا) گروه همزمانی مخصوص خودش (analysis-pool-matrix) را دارد.
 # اجرای فقط-کش (pool_cache_only) نام و گروه همزمانی مخصوص خودش را دارد: همه‌ی ساخت‌های کش پشت‌سرهم (تک‌نویسنده‌ی آرشیو) اجرا می‌شوند
 # و modules/pool_ensure_cache.sh آن را از روی همین نام پیدا می‌کند — اگر این نام را عوض کنی آن اسکریپت را هم عوض کن.
-run-name: ${{ (inputs.analysis_module == 'pool_search' && inputs.pool_cache_only) && format('pool_search cache [fee={0} min={1} end={2}]', inputs.pool_fee, inputs.pool_min_trades, inputs.pool_end || 'default') || ((inputs.analysis_module == 'pool_search' && inputs.pool_tag != '') && format('pool_search [{0}]', inputs.pool_tag) || 'Complete Analysis Pipeline') }}
+run-name: ${{ inputs.analysis_module == 'pool_matrix' && 'pool_matrix' || ((inputs.analysis_module == 'pool_search' && inputs.pool_cache_only) && format('pool_search cache [fee={0} min={1} end={2}]', inputs.pool_fee, inputs.pool_min_trades, inputs.pool_end || 'default') || ((inputs.analysis_module == 'pool_search' && inputs.pool_tag != '') && format('pool_search [{0}]', inputs.pool_tag) || 'Complete Analysis Pipeline')) }}
 
 concurrency:
-  group: ${{ (inputs.analysis_module == 'pool_search' && inputs.pool_cache_only) && 'analysis-pool-cache' || ((inputs.analysis_module == 'pool_search' && inputs.pool_tag != '') && format('analysis-pool-{0}', inputs.pool_tag) || 'analysis-runner') }}
+  group: ${{ inputs.analysis_module == 'pool_matrix' && 'analysis-pool-matrix' || ((inputs.analysis_module == 'pool_search' && inputs.pool_cache_only) && 'analysis-pool-cache' || ((inputs.analysis_module == 'pool_search' && inputs.pool_tag != '') && format('analysis-pool-{0}', inputs.pool_tag) || 'analysis-runner')) }}
   cancel-in-progress: false
 
 jobs:
@@ -106,7 +111,7 @@ jobs:
   # ================================================================
   generate-reports:
     runs-on: ubuntu-latest
-    if: ${{ inputs.analysis_module != 'pool_search' }}
+    if: ${{ inputs.analysis_module != 'pool_search' && inputs.analysis_module != 'pool_matrix' }}
     steps:
       - name: 1. Checkout مخزن اصلی
         uses: actions/checkout@v5
@@ -215,7 +220,7 @@ jobs:
   # ================================================================
   generate-matrix:
     runs-on: ubuntu-latest
-    if: ${{ inputs.analysis_module != 'pool_search' }}
+    if: ${{ inputs.analysis_module != 'pool_search' && inputs.analysis_module != 'pool_matrix' }}
     outputs:
       matrix_items: ${{ steps.fetch_batch.outputs.matrix_items }}
       empty: ${{ steps.fetch_batch.outputs.empty }}
@@ -2981,3 +2986,874 @@ jobs:
             /tmp/pool_results/run.log
           retention-days: 14
           if-no-files-found: warn
+
+  # ================================================================
+  # pool_matrix — اجرای هم‌زمان چند تنظیمات pool_search داخل «همین یک اجرا» (بدون ورک‌فلوی جداگانه)
+  #
+  # تنظیمات از فایل pool_matrix.json خوانده می‌شود (defaults + configs). روند دقیقاً همان روند عادی pool_search است:
+  #   pm-config   : خواندن/اعتبارسنجی pool_matrix.json، ساخت لیست تنظیمات و ترکیب‌های یکتای کش (fee / min_trades / end)
+  #   pm-plan     : مثل pool-plan، ولی برای همه‌ی ترکیب‌های کش پشت‌سرهم؛ صف چانک‌ها (سقف ۲۵۰ چانک در هر اجرا)
+  #   pm-batch    : مثل pool-batch؛ ماتریس موازی (حداکثر ۲۰ همزمان) روی چانک‌های همه‌ی ترکیب‌ها
+  #   pm-collect  : مثل pool-collect؛ تنها نویسنده‌ی آرشیو کش (commit/push یک‌جا)
+  #   pm-continue : مثل pool-continue؛ اگر فایل پردازش‌نشده مانده، همین ماژول دوباره اجرا می‌شود
+  #   pm-final    : مثل pool-final؛ وقتی همه‌ی کش‌ها کامل شد، به‌ازای هر تنظیمات یک job ماتریکس (حداکثر ۲۰ همزمان) —
+  #                 جستجو/polish با tag همان تنظیمات، نتیجه به‌صورت artifact
+  #   pm-publish  : تنها نویسنده‌ی نتایج — همه‌ی نتایج را یک‌جا در analysis_results/pool_matrix/<tag>.tar.gz.enc push می‌کند
+  #                 و اگر pool_repeat فعال بود دور بعدی (فقط tagهای موفق) را ثبت می‌کند
+  # پرچم اتمام (pool_search_done.flag) و loop_analysis.yml هیچ‌وقت دست نمی‌خورند.
+  # ================================================================
+  pm-config:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.analysis_module == 'pool_matrix' }}
+    outputs:
+      configs: ${{ steps.cfg.outputs.configs }}
+      combos: ${{ steps.cfg.outputs.combos }}
+      count: ${{ steps.cfg.outputs.count }}
+    steps:
+      - name: 1. Checkout مخزن اصلی
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 2. بررسی وجود ماژول
+        run: |
+          if [ ! -f modules/pool_search.py ]; then
+            echo "❌ modules/pool_search.py در مخزن اصلی یافت نشد."
+            exit 1
+          fi
+
+      - name: 3. بررسی interrupt.flag
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/interrupt.flag")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "🛑 interrupt.flag یافت شد — اجرای pool_matrix متوقف می‌شود."
+            exit 1
+          fi
+          echo "✅ interrupt.flag یافت نشد — ادامه."
+
+      - name: 4. خواندن و اعتبارسنجی pool_matrix.json
+        id: cfg
+        env:
+          POOL_MATRIX_TAGS: ${{ inputs.pool_matrix_tags }}
+          POOL_SEED_OFFSET: ${{ inputs.pool_seed }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, re, sys
+          from decimal import Decimal
+
+          def fail(msg):
+              print(f"❌ {msg}")
+              sys.exit(1)
+
+          CANDIDATES = ["pool_matrix.json", "modules/pool_matrix.json", ".github/pool_matrix.json",
+                        ".github/workflows/pool_matrix.json", "config/pool_matrix.json"]
+          path = next((p for p in CANDIDATES if os.path.isfile(p)), None)
+          if path is None:
+              found = [p for p in glob.glob("**/pool_matrix.json", recursive=True) if not p.startswith(".git/")]
+              path = found[0] if found else None
+          if path is None:
+              fail("فایل pool_matrix.json در مخزن اصلی یافت نشد (ریشه‌ی مخزن، modules/ یا .github/).")
+          print(f"📄 فایل تنظیمات: {path}")
+
+          try:
+              with open(path, encoding="utf-8") as fh:
+                  raw = json.load(fh)
+          except Exception as e:
+              fail(f"pool_matrix.json قابل خواندن نیست: {e}")
+          if not isinstance(raw, dict) or not isinstance(raw.get("configs"), list) or not raw["configs"]:
+              fail("pool_matrix.json باید شامل لیست غیرخالی «configs» باشد.")
+
+          BASE = {"objective": "green", "max_members": 25, "max_per_file": 3, "min_trades": 5, "fee": 0,
+                  "tune_weights": False, "polish": False, "end": "", "time_budget": 0, "seed": 0,
+                  "repeat": False, "repeat_hours": 0}
+          defaults = raw.get("defaults") or {}
+          if not isinstance(defaults, dict):
+              fail("«defaults» باید یک آبجکت باشد.")
+
+          def as_bool(v):
+              return v is True or (isinstance(v, str) and v.strip().lower() == "true")
+
+          def as_str(v):
+              if v is None:
+                  return ""
+              if isinstance(v, bool):
+                  return "true" if v else "false"
+              if isinstance(v, (int, float)):
+                  d = Decimal(str(v))
+                  return str(int(d)) if d == d.to_integral_value() else format(d, "f")
+              return str(v).strip()
+
+          offset_raw = (os.environ.get("POOL_SEED_OFFSET") or "0").strip() or "0"
+          if not re.fullmatch(r"[0-9]+", offset_raw):
+              fail(f"pool_seed={offset_raw} (فقط عدد صحیح)")
+          offset = int(offset_raw)
+
+          configs, seen = [], set()
+          warn_no_polish, warn_no_budget = [], []
+          for idx, c in enumerate(raw["configs"]):
+              if not isinstance(c, dict) or "tag" not in c:
+                  fail(f"configs[{idx}]: فیلد tag الزامی است.")
+              m = {**BASE, **defaults, **c}
+              tag = as_str(m["tag"])
+              if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", tag):
+                  fail(f"tag={tag!r} (فقط حروف/عدد/_/- تا ۴۰ حرف)")
+              if tag in seen:
+                  fail(f"tag تکراری: {tag}")
+              seen.add(tag)
+              r = {
+                  "tag": tag,
+                  "objective": as_str(m["objective"]),
+                  "max_members": as_str(m["max_members"]),
+                  "max_per_file": as_str(m["max_per_file"]),
+                  "min_trades": as_str(m["min_trades"]),
+                  "fee": as_str(m["fee"]),
+                  "end": as_str(m["end"]),
+                  "tune_weights": as_bool(m["tune_weights"]),
+                  "polish": as_bool(m["polish"]),
+                  "repeat": as_bool(m["repeat"]),
+                  "time_budget": as_str(m["time_budget"]),
+                  "seed": as_str(m["seed"]),
+                  "repeat_hours": as_str(m["repeat_hours"]),
+              }
+              if r["objective"] not in ("green", "sortino", "sharpe"):
+                  fail(f"[{tag}] objective={r['objective']}")
+              for k in ("max_members", "max_per_file", "min_trades", "time_budget", "seed"):
+                  if not re.fullmatch(r"[0-9]+", r[k]):
+                      fail(f"[{tag}] {k}={r[k]} (فقط عدد صحیح)")
+              for k in ("fee", "repeat_hours"):
+                  if not re.fullmatch(r"[0-9]*\.?[0-9]+", r[k]):
+                      fail(f"[{tag}] {k}={r[k]} (عدد نامعتبر)")
+              if r["end"] and not re.fullmatch(r"[0-9]{4}-[0-9]{2}", r["end"]):
+                  fail(f"[{tag}] end={r['end']} (فرمت YYYY-MM)")
+              if int(r["time_budget"]) > 330:
+                  print(f"⚠️ [{tag}] time_budget={r['time_budget']} از سقف ~۳۳۰ بیشتر است.")
+              if r["repeat"] and not r["polish"]:
+                  warn_no_polish.append(tag)
+              if r["repeat"] and r["polish"] and int(r["time_budget"]) == 0:
+                  warn_no_budget.append(tag)
+              r["seed"] = str(int(r["seed"]) + offset)
+              r["repeat_until"] = 0
+              configs.append(r)
+
+          if warn_no_polish:
+              print(f"⚠️ repeat فقط با polish کار می‌کند؛ تکرار انجام نمی‌شود برای {len(warn_no_polish)} تنظیمات: {', '.join(warn_no_polish)}")
+          if warn_no_budget:
+              print(f"⚠️ time_budget=0 — تکرار بی‌فایده است (هر دور همان نتیجه‌ی قطعی)؛ تکرار انجام نمی‌شود برای {len(warn_no_budget)} تنظیمات (برای تکرار، time_budget را بیشتر از 0 بگذار).")
+
+          # فیلتر tagها (دورهای تکرار): "tag" یا "tag=epoch" جداشده با کاما
+          tags_in = (os.environ.get("POOL_MATRIX_TAGS") or "").strip()
+          if tags_in:
+              wanted = {}
+              for part in tags_in.split(","):
+                  part = part.strip()
+                  if not part:
+                      continue
+                  name, _, until = part.partition("=")
+                  if until and not re.fullmatch(r"[0-9]+", until):
+                      fail(f"pool_matrix_tags: مقدار نامعتبر «{part}»")
+                  wanted[name] = int(until) if until else 0
+              configs = [dict(c, repeat_until=wanted[c["tag"]]) for c in configs if c["tag"] in wanted]
+              missing = [t for t in wanted if t not in {c["tag"] for c in configs}]
+              if missing:
+                  print(f"⚠️ tagهای زیر دیگر در pool_matrix.json نیستند و نادیده گرفته شدند: {', '.join(missing)}")
+          if not configs:
+              fail("هیچ تنظیماتی برای اجرا باقی نماند.")
+
+          combos, order = {}, []
+          for c in configs:
+              key = (c["fee"], c["min_trades"], c["end"])
+              if key not in combos:
+                  combos[key] = {"cidx": len(order), "fee": c["fee"], "min_trades": c["min_trades"], "end": c["end"]}
+                  order.append(key)
+          combo_list = [combos[k] for k in order]
+
+          print(f"✅ {len(configs)} تنظیمات، {len(combo_list)} ترکیب یکتای کش (fee / min_trades / end):")
+          for cb in combo_list:
+              print(f"   - c{cb['cidx']}: fee={cb['fee']} min_trades={cb['min_trades']} end={cb['end'] or 'default'}")
+
+          def dump(o):
+              return json.dumps(o, separators=(",", ":"), ensure_ascii=False)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"configs={dump(configs)}\n")
+              out.write(f"combos={dump(combo_list)}\n")
+              out.write(f"count={len(configs)}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as sm:
+              sm.write(f"## pool_matrix — {len(configs)} تنظیمات / {len(combo_list)} ترکیب کش\n\n")
+              sm.write("| tag | objective | members | per_file | min_trades | fee | end | polish | budget | seed | repeat |\n")
+              sm.write("|---|---|---|---|---|---|---|---|---|---|---|\n")
+              for c in configs:
+                  sm.write(f"| {c['tag']} | {c['objective']} | {c['max_members']} | {c['max_per_file']} | {c['min_trades']} | "
+                           f"{c['fee']} | {c['end'] or '-'} | {c['polish']} | {c['time_budget']} | {c['seed']} | {c['repeat']} |\n")
+          PY
+
+  pm-plan:
+    needs: [pm-config]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.analysis_module == 'pool_matrix' }}
+    outputs:
+      matrix_items: ${{ steps.plan.outputs.matrix_items }}
+      empty: ${{ steps.plan.outputs.empty }}
+      pending_total: ${{ steps.plan.outputs.pending_total }}
+    env:
+      COMBOS: ${{ needs.pm-config.outputs.combos }}
+    steps:
+      - name: 1. Checkout مخزن اصلی
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 2. نصب پایتون و کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy cryptography
+
+      - name: 3. Clone سبک مخزن سوم (فقط درخت فایل‌ها، بدون blob)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 --filter=blob:none --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          if ! git -C /tmp/third_repo ls-tree HEAD:aggregated >/dev/null 2>&1; then
+            echo "❌ پوشه aggregated در مخزن سوم یافت نشد."
+            exit 1
+          fi
+
+      - name: 4. یافتن market_regime.json
+        run: |
+          # اولویت: مخزن اصلی، سپس مخزن سوم
+          REGIME_FILE=$(find "$GITHUB_WORKSPACE" -name 'market_regime.json' -not -path '*/.git/*' 2>/dev/null | head -n 1)
+          if [ -z "$REGIME_FILE" ]; then
+            P=$(git -C /tmp/third_repo ls-tree -r --name-only HEAD | grep -m1 -E '(^|/)market_regime\.json$' || true)
+            if [ -n "$P" ]; then
+              git -C /tmp/third_repo checkout HEAD -- "$P"
+              REGIME_FILE="/tmp/third_repo/$P"
+            fi
+          fi
+          if [ -z "$REGIME_FILE" ] || [ ! -s "$REGIME_FILE" ]; then
+            echo "❌ فایل market_regime.json نه در مخزن اصلی و نه در مخزن سوم یافت نشد."
+            exit 1
+          fi
+          mkdir -p /tmp/pool_regime
+          cp "$REGIME_FILE" /tmp/pool_regime/market_regime.json
+          echo "✅ فایل regime: $REGIME_FILE"
+
+      - name: 5. بازیابی آرشیو کش از مخزن سوم (pool_cache/ → pool_candidates/)
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: bash modules/pool_cache.sh restore /tmp/third_repo
+
+      - name: 6. ساخت صف (فقط فایل‌های بدون کش به‌روز) برای همه‌ی ترکیب‌های کش
+        id: plan
+        run: |
+          mkdir -p /tmp/pool_queue
+          N=$(python3 -c 'import json,os;print(len(json.loads(os.environ["COMBOS"])))')
+          for i in $(seq 0 $((N - 1))); do
+            FEE=$(python3 -c 'import json,os,sys;print(json.loads(os.environ["COMBOS"])[int(sys.argv[1])]["fee"])' "$i")
+            MIN=$(python3 -c 'import json,os,sys;print(json.loads(os.environ["COMBOS"])[int(sys.argv[1])]["min_trades"])' "$i")
+            END=$(python3 -c 'import json,os,sys;print(json.loads(os.environ["COMBOS"])[int(sys.argv[1])]["end"])' "$i")
+            echo "▶ ترکیب c$i: fee=$FEE min_trades=$MIN end=${END:-default}"
+            ARGS=(--mode plan --repo-dir /tmp/third_repo --regime /tmp/pool_regime/market_regime.json
+                  --fee "$FEE" --min-trades "$MIN"
+                  --queue-dir "/tmp/pool_queue/c$i" --chunk-size 10 --max-files 1000)
+            if [ -n "$END" ]; then ARGS+=(--end "$END"); fi
+            python -u modules/pool_search.py "${ARGS[@]}"
+          done
+
+          python3 - <<'PY'
+          import json, os
+          CAP = 250   # سقف ماتریس GitHub ۲۵۶ job است؛ بقیه‌ی چانک‌ها در اجرای بعدی (pm-continue) پردازش می‌شوند
+          combos = json.loads(os.environ["COMBOS"])
+          items, pending, deferred = [], 0, 0
+          for cb in combos:
+              with open(f"/tmp/pool_queue/c{cb['cidx']}/plan.json", encoding="utf-8") as fh:
+                  plan = json.load(fh)
+              p, n = int(plan.get("pending_total", 0)), int(plan.get("chunk_count", 0))
+              pending += p
+              print(f"📋 c{cb['cidx']}: {p} فایل بدون کش به‌روز، {n} چانک")
+              for k in range(n):
+                  if len(items) >= CAP:
+                      deferred += 1
+                      continue
+                  items.append({"cidx": cb["cidx"], "chunk": k, "fee": cb["fee"], "min_trades": cb["min_trades"],
+                                "end": cb["end"], "id": f"c{cb['cidx']}-{k}"})
+          if pending == 0:
+              print("✅ همه‌ی کش‌ها برای همه‌ی ترکیب‌ها به‌روز هستند — مستقیم به جستجوی نهایی می‌رویم.")
+          else:
+              print(f"📋 مجموع {pending} فایل در صف؛ در این اجرا {len(items)} چانک (به تعویق افتاده: {deferred}).")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"pending_total={pending}\n")
+              out.write(f"empty={'true' if pending == 0 else 'false'}\n")
+              out.write("matrix_items=" + json.dumps(items, separators=(",", ":")) + "\n")
+          PY
+
+      - name: 7. آپلود صف (چانک‌ها)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pool-queue-${{ github.run_id }}
+          path: /tmp/pool_queue/
+          retention-days: 1
+
+      - name: 8. آپلود فایل regime برای jobهای بعدی
+        uses: actions/upload-artifact@v4
+        with:
+          name: pool-regime-${{ github.run_id }}
+          path: /tmp/pool_regime/market_regime.json
+          retention-days: 1
+
+  pm-batch:
+    needs: [pm-plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    if: ${{ inputs.analysis_module == 'pool_matrix' && needs.pm-plan.outputs.empty == 'false' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        include: ${{ fromJson(needs.pm-plan.outputs.matrix_items || '[{"cidx":0,"chunk":0,"fee":"0","min_trades":"5","end":"","id":"c0-0"}]') }}
+    env:
+      POOL_MIN_TRADES: ${{ matrix.min_trades }}
+      POOL_FEE: ${{ matrix.fee }}
+      POOL_END: ${{ matrix.end }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: دانلود صف و فایل regime
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pool-*-${{ github.run_id }}
+          path: /tmp/pool_art
+          merge-multiple: false
+
+      - name: نصب پایتون و کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy cryptography
+
+      - name: دانلود فایل‌های خام این چانک از مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          CHUNK="/tmp/pool_art/pool-queue-${{ github.run_id }}/c${{ matrix.cidx }}/chunk_${{ matrix.chunk }}.json"
+          if [ ! -f "$CHUNK" ]; then
+            echo "❌ فایل چانک یافت نشد: $CHUNK"
+            exit 1
+          fi
+          echo "📋 چانک ${{ matrix.id }} (fee=$POOL_FEE min_trades=$POOL_MIN_TRADES end=${POOL_END:-default}): $(jq length "$CHUNK") فایل"
+          mkdir -p /tmp/pool_src
+          while IFS= read -r P; do
+            DEST="/tmp/pool_src/$P"
+            mkdir -p "$(dirname "$DEST")"
+            OK=0
+            for attempt in 1 2 3; do
+              URL=$(gh api "repos/$THIRD_REPO/contents/$P" -q '.download_url' 2>/dev/null || echo "")
+              if [ -n "$URL" ] && [ "$URL" != "null" ] \
+                 && /usr/bin/curl -sSL --fail -o "$DEST" "$URL" 2>/dev/null && [ -s "$DEST" ]; then
+                OK=1; break
+              fi
+              rm -f "$DEST"; sleep $((attempt * 5))
+            done
+            [ "$OK" -eq 1 ] || echo "⚠️ دانلود ناموفق (در لیست شکست‌ها ثبت می‌شود و در اجرای بعد دوباره امتحان می‌شود): $P"
+          done < <(jq -r '.[].path' "$CHUNK")
+          echo "✅ فایل‌های دانلودشده: $(find /tmp/pool_src -name '*.enc' | wc -l)"
+
+      - name: ساخت کش کاندیدا برای فایل‌های این چانک
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          ARGS=(--mode build --password "$RESULTS_PASSWORD"
+                --data /tmp/pool_src
+                --regime /tmp/pool_art/pool-regime-${{ github.run_id }}/market_regime.json
+                --manifest "/tmp/pool_art/pool-queue-${{ github.run_id }}/c${{ matrix.cidx }}/chunk_${{ matrix.chunk }}.json"
+                --cache-dir /tmp/pool_cache
+                --fee "$POOL_FEE" --min-trades "$POOL_MIN_TRADES")
+          if [ -n "$POOL_END" ]; then ARGS+=(--end "$POOL_END"); fi
+          python -u modules/pool_search.py "${ARGS[@]}"
+
+      - name: آپلود کش‌های ساخته‌شده (رمزنگاری‌شده) + لیست شکست‌ها
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pool-cache-${{ github.run_id }}-${{ matrix.id }}
+          path: /tmp/pool_cache/
+          retention-days: 1
+          if-no-files-found: warn
+
+  pm-collect:
+    needs: [pm-config, pm-plan, pm-batch]
+    runs-on: ubuntu-latest
+    if: ${{ always() && inputs.analysis_module == 'pool_matrix' && needs.pm-plan.outputs.empty == 'false' && needs.pm-batch.result != 'skipped' }}
+    outputs:
+      pushed: ${{ steps.apply.outputs.pushed }}
+      remaining: ${{ steps.apply.outputs.remaining }}
+      blocking: ${{ steps.apply.outputs.blocking }}
+    env:
+      COMBOS: ${{ needs.pm-config.outputs.combos }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: نصب پایتون و کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy cryptography
+
+      - name: دانلود کش‌های ساخته‌شده‌ی همه‌ی چانک‌ها (هر چانک در پوشه‌ی جدا)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pool-cache-${{ github.run_id }}-*
+          path: /tmp/pool_new
+          merge-multiple: false
+
+      - name: دانلود فایل regime
+        uses: actions/download-artifact@v4
+        with:
+          name: pool-regime-${{ github.run_id }}
+          path: /tmp/pool_regime
+
+      - name: Clone سبک مخزن سوم (فقط آرشیو pool_cache + pool_candidates قدیمی برای مهاجرت)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          cd /tmp/third_repo
+          git sparse-checkout set pool_cache pool_candidates
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: اعمال کش‌های جدید، حذف کش‌های کهنه، بسته‌بندی آرشیو، تنها push و محاسبه‌ی باقی‌مانده
+        id: apply
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          MOD="$GITHUB_WORKSPACE/modules/pool_search.py"
+          PC="$GITHUB_WORKSPACE/modules/pool_cache.sh"
+          N=$(python3 -c 'import json,os;print(len(json.loads(os.environ["COMBOS"])))')
+          export N
+
+          combo_field() {
+            python3 -c 'import json,os,sys;print(json.loads(os.environ["COMBOS"])[int(sys.argv[1])][sys.argv[2]])' "$1" "$2"
+          }
+          # plan_combo <index> <queue-dir>
+          plan_combo() {
+            local FEE MIN END
+            FEE=$(combo_field "$1" fee); MIN=$(combo_field "$1" min_trades); END=$(combo_field "$1" end)
+            local A=(--mode plan --repo-dir /tmp/third_repo --regime /tmp/pool_regime/market_regime.json
+                     --fee "$FEE" --min-trades "$MIN" --queue-dir "$2")
+            if [ -n "$END" ]; then A+=(--end "$END"); fi
+            python -u "$MOD" "${A[@]}"
+          }
+
+          cd /tmp/third_repo
+
+          # آرشیو فعلی را باز کن (pool_cache/ → pool_candidates/ روی دیسک)
+          bash "$PC" restore /tmp/third_repo
+
+          # کش‌های کهنه/یتیم: فقط فایلی حذف می‌شود که برای «هیچ‌کدام» از ترکیب‌های این ماتریکس معتبر نباشد
+          # (کش ترکیب‌های دیگر نباید به‌عنوان کهنه پاک شود)
+          for i in $(seq 0 $((N - 1))); do
+            plan_combo "$i" "/tmp/pm_plan_before/c$i"
+          done
+          python3 - <<'PY' > /tmp/pm_stale.txt
+          import json, os
+          n = int(os.environ["N"])
+          sets = []
+          for i in range(n):
+              with open(f"/tmp/pm_plan_before/c{i}/plan.json", encoding="utf-8") as fh:
+                  sets.append(set(json.load(fh).get("stale") or []))
+          common = set.intersection(*sets) if sets else set()
+          for p in sorted(common):
+              print(p)
+          PY
+          STALE_N=0
+          while IFS= read -r P; do
+            [ -n "$P" ] || continue
+            rm -f -- "$P" && STALE_N=$((STALE_N + 1)) || true
+          done < /tmp/pm_stale.txt
+          echo "🧹 کش‌های کهنه‌ی حذف‌شده: $STALE_N"
+
+          NEW=0
+          mkdir -p pool_candidates
+          for d in /tmp/pool_new/pool-cache-${RUN_ID}-c*/; do
+            [ -d "$d" ] || continue
+            for f in "$d"*.npz.enc; do
+              [ -f "$f" ] || continue
+              cp "$f" pool_candidates/
+              NEW=$((NEW + 1))
+            done
+          done
+          echo "📦 کش‌های جدید: $NEW"
+
+          # فقط وقتی چیزی عوض شده آرشیو دوباره بسته می‌شود (رمزنگاری salt تصادفی دارد؛ بدون تغییر نباید تکه‌ها دوباره push شوند)
+          MIGRATE=false
+          if git ls-tree -r --name-only HEAD -- pool_candidates | grep -q .; then MIGRATE=true; fi
+          if [ "$NEW" -gt 0 ] || [ "$STALE_N" -gt 0 ] || [ "$MIGRATE" = "true" ]; then
+            bash "$PC" pack /tmp/third_repo
+            git add -A pool_cache
+            # مهاجرت: فایل‌های جداگانه‌ی قدیمی از گیت حذف می‌شوند (روی دیسک می‌مانند تا plan بعدی ببیند)
+            git rm -r -q --cached --ignore-unmatch pool_candidates
+          fi
+          if git diff --cached --quiet; then
+            echo "ℹ️ تغییری برای commit نیست."
+          else
+            git commit -q -m "pool_matrix: +$NEW caches, -$STALE_N stale (run ${RUN_ID})"
+            PUSHED_OK=false
+            for attempt in $(seq 1 10); do
+              git pull --rebase -q || true
+              if git push -q; then
+                echo "✅ push موفق بود (تلاش $attempt)."
+                PUSHED_OK=true
+                break
+              fi
+              sleep $(( (RANDOM % 10) + 3 ))
+            done
+            if [ "$PUSHED_OK" != "true" ]; then
+              echo "❌ push پس از ۱۰ تلاش ناموفق بود."
+              exit 1
+            fi
+          fi
+
+          # باقی‌مانده پس از این اجرا برای همه‌ی ترکیب‌ها؛ شکست‌خورده‌های همین اجرا «مسدودکننده» حساب نمی‌شوند
+          for i in $(seq 0 $((N - 1))); do
+            plan_combo "$i" "/tmp/pm_plan_after/c$i"
+          done
+          read -r REMAINING BLOCKING FAILED_N < <(python3 - <<'PY'
+          import glob, json, os
+          run, n = os.environ["RUN_ID"], int(os.environ["N"])
+          remaining = blocking = failed_total = 0
+          for i in range(n):
+              with open(f"/tmp/pm_plan_after/c{i}/plan.json", encoding="utf-8") as fh:
+                  plan = json.load(fh)
+              failed = set()
+              for f in glob.glob(f"/tmp/pool_new/pool-cache-{run}-c{i}-*/_failed_chunk_*.json"):
+                  try:
+                      with open(f, encoding="utf-8") as fh:
+                          failed.update(json.load(fh))
+                  except Exception:
+                      pass
+              remaining += int(plan.get("pending_total", 0))
+              blocking += sum(1 for x in (plan.get("pending_names") or []) if x not in failed)
+              failed_total += len(failed)
+          print(remaining, blocking, failed_total)
+          PY
+          )
+          echo "📊 باقی‌مانده=$REMAINING  شکست‌خورده در این اجرا=$FAILED_N  مسدودکننده=$BLOCKING"
+
+          echo "pushed=$NEW" >> "$GITHUB_OUTPUT"
+          echo "remaining=$REMAINING" >> "$GITHUB_OUTPUT"
+          echo "blocking=$BLOCKING" >> "$GITHUB_OUTPUT"
+
+          if [ "$BLOCKING" -gt 0 ] && [ "$NEW" -eq 0 ]; then
+            echo "❌ هیچ پیشرفتی در این اجرا نبود ولی $BLOCKING فایل هنوز پردازش نشده — برای جلوگیری از حلقه‌ی بی‌پایان متوقف می‌شود."
+            echo "   (اگر کش ترکیب‌های مختلف روی هم نوشته می‌شود، یعنی نام کش به fee / min_trades / end وابسته نیست.)"
+            exit 1
+          fi
+
+  pm-continue:
+    needs: [pm-collect]
+    runs-on: ubuntu-latest
+    if: ${{ needs.pm-collect.result == 'success' && needs.pm-collect.outputs.blocking != '0' && needs.pm-collect.outputs.blocking != '' }}
+    steps:
+      - name: اجرای مجدد pool_matrix برای ادامه‌ی صف کش (با همان tagها و seed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          POOL_MATRIX_TAGS: ${{ inputs.pool_matrix_tags }}
+          POOL_SEED: ${{ inputs.pool_seed }}
+        run: |
+          echo "🔁 هنوز ${{ needs.pm-collect.outputs.blocking }} فایل پردازش‌نشده مانده — اجرای بعدی pool_matrix..."
+          ARGS=(-f analysis_module=pool_matrix -f pool_seed="${POOL_SEED:-0}")
+          if [ -n "$POOL_MATRIX_TAGS" ]; then ARGS+=(-f pool_matrix_tags="$POOL_MATRIX_TAGS"); fi
+          for attempt in 1 2 3; do
+            if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" "${ARGS[@]}" 2>&1; then
+              echo "✅ اجرای بعدی ثبت شد (تلاش $attempt)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ ثبت اجرای بعدی ناموفق بود."
+          exit 1
+
+  pm-final:
+    needs: [pm-config, pm-plan, pm-collect]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # سقف ران‌ر ۳۶۰؛ برای time_budget=330 + لود کش‌ها + گزارش
+    # فقط وقتی کش همه‌ی ترکیب‌ها کامل است (یا از ابتدا کامل بود)
+    if: >-
+      ${{ always() && inputs.analysis_module == 'pool_matrix' && needs.pm-config.result == 'success' && needs.pm-plan.result == 'success' &&
+      (needs.pm-plan.outputs.empty == 'true' ||
+      (needs.pm-collect.result == 'success' && needs.pm-collect.outputs.blocking == '0')) }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        config: ${{ fromJson(needs.pm-config.outputs.configs) }}
+    name: search [${{ matrix.config.tag }}]
+    env:
+      POOL_TAG: ${{ matrix.config.tag }}
+      POOL_OBJECTIVE: ${{ matrix.config.objective }}
+      POOL_MAX_MEMBERS: ${{ matrix.config.max_members }}
+      POOL_MAX_PER_FILE: ${{ matrix.config.max_per_file }}
+      POOL_MIN_TRADES: ${{ matrix.config.min_trades }}
+      POOL_FEE: ${{ matrix.config.fee }}
+      POOL_END: ${{ matrix.config.end }}
+      POOL_TUNE_WEIGHTS: ${{ matrix.config.tune_weights }}
+      POOL_POLISH: ${{ matrix.config.polish }}
+      POOL_TIME_BUDGET: ${{ matrix.config.time_budget }}
+      POOL_SEED: ${{ matrix.config.seed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: نصب پایتون و کتابخانه‌ها
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy cryptography
+
+      - name: دانلود فایل regime
+        uses: actions/download-artifact@v4
+        with:
+          name: pool-regime-${{ github.run_id }}
+          path: /tmp/pool_regime
+
+      - name: Clone سبک مخزن سوم (آرشیو pool_cache + درخت aggregated + نتایج قبلی)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          cd /tmp/third_repo
+          git sparse-checkout set pool_cache pool_candidates analysis_results
+
+      - name: بازیابی آرشیو کش (pool_cache/ → pool_candidates/)
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          bash modules/pool_cache.sh restore /tmp/third_repo
+          echo "📦 فایل‌های کش: $(find /tmp/third_repo/pool_candidates -name '*.npz.enc' 2>/dev/null | wc -l)"
+
+      - name: جستجوی پرتفوی از روی کش‌ها (pool_search --mode search)
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/pool_results
+          ARGS=(--mode search --password "$RESULTS_PASSWORD"
+                --repo-dir /tmp/third_repo
+                --regime /tmp/pool_regime/market_regime.json
+                --fee "$POOL_FEE" --min-trades "$POOL_MIN_TRADES"
+                --out /tmp/pool_results
+                --max-members "$POOL_MAX_MEMBERS" --max-per-file "$POOL_MAX_PER_FILE"
+                --objective "$POOL_OBJECTIVE"
+                --tag "$POOL_TAG")
+          echo "🏷️ تنظیمات ماتریکس: $POOL_TAG"
+          if [ "$POOL_TUNE_WEIGHTS" = "true" ]; then ARGS+=(--tune-weights); fi
+          if [ "$POOL_POLISH" = "true" ]; then ARGS+=(--polish); echo "✨ حالت polish: ادامه از آخرین نتیجه‌ی polish همین tag (یا سبد اصلی اگر هنوز polish نشده)"; fi
+          if [ -n "$POOL_END" ]; then ARGS+=(--end "$POOL_END"); fi
+          if [ "${POOL_TIME_BUDGET:-0}" != "0" ]; then ARGS+=(--time-budget "$POOL_TIME_BUDGET" --seed "${POOL_SEED:-0}"); echo "🎲 جستجوی تصادفی: $POOL_TIME_BUDGET دقیقه (seed=${POOL_SEED:-0})"; fi
+          set -o pipefail
+          python -u modules/pool_search.py "${ARGS[@]}" 2>&1 | tee /tmp/pool_results/run.log
+
+          for f in selected.csv filters_compare.csv portfolio_monthly_by_filter.csv; do
+            if [ ! -s "/tmp/pool_results/$f" ]; then
+              echo "❌ فایل خروجی $f ساخته نشد."
+              exit 1
+            fi
+          done
+          echo "✅ pool_search [$POOL_TAG] با موفقیت پایان یافت."
+
+      - name: خلاصه نتایج در صفحه‌ی run
+        run: |
+          {
+            echo "## pool_search [$POOL_TAG]"
+            echo '```'
+            sed -n '/caches loaded/,$p' /tmp/pool_results/run.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: بسته‌بندی و رمزنگاری نتیجه (push توسط pm-publish انجام می‌شود)
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/pool_search_results /tmp/pm_out
+          cp /tmp/pool_results/*.csv /tmp/pool_results/coverage.json /tmp/pool_results/run.log /tmp/pool_search_results/
+          tar -czf /tmp/pool_search_results.tar.gz -C /tmp pool_search_results
+
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const data=fs.readFileSync('/tmp/pool_search_results.tar.gz');
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=crypto.randomBytes(16);
+            const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+            const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
+            fs.writeFileSync('/tmp/pm_out/result.tar.gz.enc', enc);
+          "
+          cp /tmp/pool_results/*.csv /tmp/pool_results/coverage.json /tmp/pool_results/run.log /tmp/pm_out/
+          echo "📦 نتیجه‌ی [$POOL_TAG] آماده‌ی انتشار است."
+
+      - name: آپلود نتیجه‌ی این tag
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pool-mresult-${{ github.run_id }}-${{ matrix.config.tag }}
+          path: /tmp/pm_out/
+          retention-days: 14
+          if-no-files-found: warn
+
+  pm-publish:
+    needs: [pm-config, pm-final]
+    runs-on: ubuntu-latest
+    if: ${{ always() && inputs.analysis_module == 'pool_matrix' && needs.pm-final.result != 'skipped' && needs.pm-config.result == 'success' }}
+    env:
+      CONFIGS: ${{ needs.pm-config.outputs.configs }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: دانلود نتیجه‌ی همه‌ی tagها
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pool-mresult-${{ github.run_id }}-*
+          path: /tmp/pm_res
+          merge-multiple: false
+
+      - name: Clone سبک مخزن سوم (فقط analysis_results)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          cd /tmp/third_repo
+          git sparse-checkout set analysis_results
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: push یک‌جای نتایج همه‌ی tagها به مخزن سوم (تنها نویسنده)
+        id: publish
+        run: |
+          cd /tmp/third_repo
+          mkdir -p analysis_results/pool_matrix
+          OK_TAGS=""
+          COUNT=0
+          for d in /tmp/pm_res/pool-mresult-${RUN_ID}-*/; do
+            [ -d "$d" ] || continue
+            TAG="$(basename "$d")"
+            TAG="${TAG#pool-mresult-${RUN_ID}-}"
+            if [ -s "${d}result.tar.gz.enc" ]; then
+              cp "${d}result.tar.gz.enc" "analysis_results/pool_matrix/${TAG}.tar.gz.enc"
+              git add --sparse -f "analysis_results/pool_matrix/${TAG}.tar.gz.enc"
+              OK_TAGS="$OK_TAGS $TAG"
+              COUNT=$((COUNT + 1))
+            fi
+          done
+          echo "ok_tags=${OK_TAGS# }" >> "$GITHUB_OUTPUT"
+          echo "📦 نتیجه‌ی ${COUNT} tag آماده‌ی push است."
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ℹ️ هیچ نتیجه‌ای برای push نیست."
+            exit 0
+          fi
+          if git diff --cached --quiet; then
+            echo "ℹ️ تغییری برای commit نیست."
+            exit 0
+          fi
+          git commit -q -m "pool_matrix results: ${COUNT} tags (run ${RUN_ID})"
+          for attempt in $(seq 1 10); do
+            git pull --rebase -q || true
+            if git push -q; then
+              echo "✅ push نتایج به مخزن سوم موفق بود (تلاش $attempt): analysis_results/pool_matrix/ (${COUNT} فایل)"
+              exit 0
+            fi
+            sleep $(( (RANDOM % 10) + 3 ))
+          done
+          echo "❌ push نتایج پس از ۱۰ تلاش ناموفق بود."
+          exit 1
+
+      - name: تکرار polish (pool_repeat) — فقط tagهای موفق که repeat دارند
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CROSS_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          OK_TAGS: ${{ steps.publish.outputs.ok_tags }}
+          SEED_OFFSET: ${{ inputs.pool_seed }}
+        run: |
+          # این step فقط بعد از push موفق نتایج اجرا می‌شود.
+          if [ -z "$OK_TAGS" ]; then echo "ℹ️ نتیجه‌ی موفقی نیست — تکرار شروع نمی‌شود."; exit 0; fi
+          if GH_TOKEN="$CROSS_TOKEN" gh api "repos/$THIRD_REPO/contents/interrupt.flag" >/dev/null 2>&1; then
+            echo "🛑 interrupt.flag هست — تکرار polish متوقف شد."
+            exit 0
+          fi
+          STARTED=$(gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}" --jq .run_started_at 2>/dev/null || true)
+          export RUN_START=$(date -d "$STARTED" +%s 2>/dev/null || date +%s)
+          python3 - <<'PY'
+          import json, os, time
+          configs = json.loads(os.environ["CONFIGS"])
+          ok = set(os.environ["OK_TAGS"].split())
+          now, start = int(time.time()), int(os.environ["RUN_START"])
+          nxt = []
+          for c in configs:
+              if c["tag"] not in ok or not (c["polish"] and c["repeat"]):
+                  continue
+              if int(c["time_budget"]) <= 0:
+                  print(f"ℹ️ [{c['tag']}] time_budget=0 — تکرار بی‌فایده است؛ شروع نمی‌شود.")
+                  continue
+              until = int(c.get("repeat_until") or 0)
+              hours = float(c["repeat_hours"])
+              if until == 0 and hours > 0:
+                  until = int(start + hours * 3600)
+                  print(f"⏱️ [{c['tag']}] تکرار محدود به {hours:g} ساعت از شروع؛ پایان: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(until))}")
+              if until > 0 and now >= until:
+                  print(f"⏹️ [{c['tag']}] مهلت تکرار تمام شد — دور جدید ندارد.")
+                  continue
+              nxt.append(f"{c['tag']}={until}")
+          with open("/tmp/pm_next_tags.txt", "w", encoding="utf-8") as fh:
+              fh.write(",".join(nxt))
+          PY
+          TAGS=$(cat /tmp/pm_next_tags.txt)
+          if [ -z "$TAGS" ]; then echo "ℹ️ هیچ tagی برای دور بعد نمانده."; exit 0; fi
+          NEXT_SEED=$(( ${SEED_OFFSET:-0} + 1 ))
+          ARGS=(-f analysis_module=pool_matrix -f pool_matrix_tags="$TAGS" -f pool_seed="$NEXT_SEED")
+          for attempt in 1 2 3; do
+            if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" "${ARGS[@]}" 2>&1; then
+              echo "🔁 دور بعدی ثبت شد: $(echo "$TAGS" | tr ',' '\n' | wc -l) tag، seed=${NEXT_SEED}."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ ثبت دور بعدی ناموفق بود."
+          exit 1
+
+      - name: گزارش tagهای ناموفق
+        if: always()
+        env:
+          OK_TAGS: ${{ steps.publish.outputs.ok_tags }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          configs = json.loads(os.environ["CONFIGS"])
+          ok = set(os.environ.get("OK_TAGS", "").split())
+          bad = [c["tag"] for c in configs if c["tag"] not in ok]
+          print(f"✅ موفق: {len(ok)} از {len(configs)}")
+          if bad:
+              print("❌ ناموفق: " + ", ".join(bad))
+              sys.exit(1)
+          PY
