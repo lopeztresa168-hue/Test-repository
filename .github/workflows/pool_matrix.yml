@@ -1,0 +1,246 @@
+name: Pool Matrix Dispatcher
+
+# با ساخته شدن (push) فایل pool_matrix.json در ریشه‌ی مخزن اصلی، pool_search را به‌صورت ماتریکس اجرا می‌کند.
+# هر آیتم ماتریکس یک بار analysis.yml را با analysis_module=pool_search و فیلدهای pool_* همان تنظیمات
+# (+ pool_tag) صدا می‌زند.
+#
+# دسته‌بندی (batch): فایل می‌تواند هر تعداد تنظیمات داشته باشد (مثلاً ۱۰۰ تا)، ولی هر اجرا فقط ۲۰ تای اول
+# را dispatch می‌کند. بعد از dispatch موفق، همان ۲۰ تا از فایل حذف می‌شوند و بقیه در فایل می‌مانند؛
+# با «Run workflow» دستی (یا push دوباره‌ی فایل) ۲۰ تای بعدی اجرا می‌شود. وقتی چیزی نماند فایل حذف می‌شود.
+# tagهای خودکار (cfgNN) از جای تنظیمات در فایل اصلی ساخته می‌شوند و موقع حذف دسته، داخل فایل نوشته می‌شوند
+# تا در دسته‌ی بعد عوض نشوند.
+#
+# کش: اگر کش کاندیداهای ترکیب fee / min_trades / end یک تنظیمات به‌روز نباشد، آن اجرا خطا نمی‌دهد؛ analysis.yml
+# (job: pool-prebuild) خودش یک اجرای «فقط-کش» برای همان ترکیب می‌سازد، منتظر کامل شدنش می‌ماند و بعد جستجو را ادامه می‌دهد.
+# کش ترکیب‌های مختلف کنار هم در آرشیو pool_cache/ می‌مانند (فشرده، با تقسیم‌بندی خودکار توسط modules/pool_cache.sh).
+#
+# هر تنظیمات می‌تواند هر فیلدی را جدا override کند (مثلاً min_trades متفاوت)؛ فیلدی که ننویسی از defaults
+# و بعد از مقدار پیش‌فرض خود workflow می‌آید.
+#
+# قالب فایل (دو شکل پذیرفته می‌شود):
+#   1) آرایه:   [ {"tag":"a1","objective":"sortino"}, {...} ]
+#   2) شیء:     {"defaults": {"max_members":25,"fee":0}, "configs": [ {"tag":"a1","objective":"sortino"}, ... ]}
+# فیلدهای هر تنظیمات (همه اختیاری جز tag که اگر نباشد cfg01..، cfg02.. ساخته می‌شود):
+#   tag, objective(green|sortino|sharpe), max_members, max_per_file, min_trades, fee, tune_weights(bool),
+#   polish(bool), end(YYYY-MM), time_budget(دقیقه), seed, repeat(bool), repeat_hours(عدد)
+#   repeat_hours: فقط با polish. نباشد/0 و repeat=true → ۲۴/۷ (تا interrupt.flag)؛ مثلاً 50 → تکرار فقط ۵۰ ساعت
+#   (نوشتن repeat_hours>0 به‌تنهایی repeat را هم روشن می‌کند). هر تنظیمات مقدار خودش را دارد.
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pool_matrix.json'
+  workflow_dispatch:
+    inputs:
+      matrix_file:
+        description: 'مسیر فایل تنظیمات (پیش‌فرض pool_matrix.json)'
+        required: false
+        default: 'pool_matrix.json'
+
+concurrency:
+  group: pool-matrix-dispatch
+  cancel-in-progress: false
+
+env:
+  MATRIX_FILE: ${{ inputs.matrix_file || 'pool_matrix.json' }}
+  BATCH: 20   # حداکثر تعداد تنظیمات در هر اجرا
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.parse.outputs.matrix }}
+      count: ${{ steps.parse.outputs.count }}
+      total: ${{ steps.parse.outputs.total }}
+      tags: ${{ steps.parse.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: خواندن و اعتبارسنجی فایل تنظیمات
+        id: parse
+        run: |
+          fail() { echo "❌ $1"; exit 1; }
+          if [ ! -f "$MATRIX_FILE" ]; then
+            echo "ℹ️ $MATRIX_FILE وجود ندارد (احتمالاً حذف شده) — کاری برای انجام نیست."
+            echo "count=0" >> "$GITHUB_OUTPUT"; echo "total=0" >> "$GITHUB_OUTPUT"
+            echo "tags=" >> "$GITHUB_OUTPUT"; echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq empty "$MATRIX_FILE" 2>/dev/null || fail "$MATRIX_FILE یک JSON معتبر نیست."
+
+          # آرایه یا {defaults, configs} → لیست نهایی؛ مقادیر همه به رشته؛ tag خودکار
+          jq -c '
+            (if type=="array" then {defaults:{}, configs:.} else {defaults:(.defaults // {}), configs:(.configs // [])} end)
+            | .defaults as $d
+            | [ .configs | to_entries[] | ($d + .value) as $c
+                | { i: .key,
+                    tag:          (($c.tag // ("cfg" + ((.key+1)|tostring|if length<2 then "0"+. else . end))) | tostring),
+                    objective:    (($c.objective    // "green") | tostring),
+                    max_members:  (($c.max_members  // 25)     | tostring),
+                    max_per_file: (($c.max_per_file // 3)      | tostring),
+                    min_trades:   (($c.min_trades   // 5)      | tostring),
+                    fee:          (($c.fee          // 0)      | tostring),
+                    tune_weights: (($c.tune_weights // false)  | tostring),
+                    polish:       (($c.polish       // false)  | tostring),
+                    end:          (($c.end          // "")     | tostring),
+                    time_budget:  (($c.time_budget  // 0)      | tostring),
+                    seed:         (($c.seed         // 0)      | tostring),
+                    repeat_hours: (($c.repeat_hours // 0)      | tostring),
+                    repeat:       ((($c.repeat // false) or ((($c.repeat_hours // 0) | tonumber) > 0)) | tostring) } ]
+          ' "$MATRIX_FILE" > /tmp/all.json
+
+          TOTAL=$(jq length /tmp/all.json)
+          [ "$TOTAL" -ge 1 ] || fail "هیچ تنظیماتی در فایل نیست."
+
+          # tag تکراری → دو اجرا روی یک فایل نتیجه می‌نویسند
+          DUP=$(jq -r '[.[].tag] | group_by(.) | map(select(length>1) | .[0]) | join(", ")' /tmp/all.json)
+          [ -z "$DUP" ] || fail "tag تکراری: $DUP"
+
+          # همان اعتبارسنجی‌های analysis.yml
+          BAD=$(jq -r '
+            .[] | select(
+              ( .tag          | test("^[A-Za-z0-9_-]{1,40}$") | not) or
+              ( .objective    | test("^(green|sortino|sharpe)$") | not) or
+              ( .max_members  | test("^[0-9]+$") | not) or
+              ( .max_per_file | test("^[0-9]+$") | not) or
+              ( .min_trades   | test("^[0-9]+$") | not) or
+              ( .fee          | test("^[0-9]*\\.?[0-9]+$") | not) or
+              ( .tune_weights | test("^(true|false)$") | not) or
+              ( .polish       | test("^(true|false)$") | not) or
+              ( .repeat       | test("^(true|false)$") | not) or
+              ( .repeat_hours | test("^[0-9]*\\.?[0-9]+$") | not) or
+              ( .end          | test("^([0-9]{4}-[0-9]{2})?$") | not) or
+              ( .time_budget  | test("^[0-9]+$") | not) or
+              ( .seed         | test("^[0-9]+$") | not)
+            ) | "\(.tag) → \(. | tostring)"' /tmp/all.json)
+          [ -z "$BAD" ] || { echo "$BAD"; fail "پارامتر نامعتبر در تنظیمات بالا."; }
+
+          # فقط ۲۰ تای اول این اجرا (همه‌ی فایل بالا اعتبارسنجی شد)
+          jq -c --argjson b "$BATCH" '.[:$b]' /tmp/all.json > /tmp/matrix.json
+          N=$(jq length /tmp/matrix.json)
+          REST=$(( TOTAL - N ))
+
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "tags=$(jq -r '[.[].tag] | join(",")' /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -c . /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "## pool_matrix: این اجرا $N از $TOTAL تنظیمات"
+            if [ "$REST" -gt 0 ]; then
+              echo "⏭️ $REST تنظیمات در فایل می‌ماند؛ برای دسته‌ی بعد workflow را دوباره اجرا کن (Run workflow)."
+            fi
+            echo '| tag | objective | members | per_file | min_trades | fee | tune | polish | end | budget | seed | repeat | hours |'
+            echo '|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+            jq -r '.[] | "| \(.tag) | \(.objective) | \(.max_members) | \(.max_per_file) | \(.min_trades) | \(.fee) | \(.tune_weights) | \(.polish) | \(.end) | \(.time_budget) | \(.seed) | \(.repeat) | \(.repeat_hours) |"' /tmp/matrix.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dispatch:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    name: dispatch ${{ matrix.cfg.tag }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        cfg: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: analysis.yml را با analysis_module=pool_search و تنظیمات این آیتم صدا بزن
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CFG: ${{ toJson(matrix.cfg) }}
+        run: |
+          j() { echo "$CFG" | jq -r "$1"; }
+          TAG=$(j .tag)
+          sleep $(( $(j .i) * 2 ))            # فاصله‌ی کوتاه بین dispatchها (rate limit ثانویه‌ی API)
+          ARGS=(-f analysis_module=pool_search
+                -f pool_tag="$TAG"
+                -f pool_objective="$(j .objective)"
+                -f pool_max_members="$(j .max_members)"
+                -f pool_max_per_file="$(j .max_per_file)"
+                -f pool_min_trades="$(j .min_trades)"
+                -f pool_fee="$(j .fee)"
+                -f pool_tune_weights="$(j .tune_weights)"
+                -f pool_polish="$(j .polish)"
+                -f pool_time_budget="$(j .time_budget)"
+                -f pool_seed="$(j .seed)"
+                -f pool_repeat="$(j .repeat)"
+                -f pool_repeat_hours="$(j .repeat_hours)")
+          END=$(j .end); if [ -n "$END" ]; then ARGS+=(-f pool_end="$END"); fi
+          for attempt in 1 2 3; do
+            if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
+              echo "✅ [$TAG] dispatch شد (تلاش $attempt)."
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "❌ [$TAG] dispatch ناموفق بود."
+          exit 1
+
+  consume:
+    # فقط وقتی همه‌ی آیتم‌های این دسته dispatch شدند، همان‌ها از فایل برداشته می‌شوند. بقیه (اگر باشد) در فایل می‌مانند.
+    # اگر یکی شکست بخورد فایل دست‌نخورده می‌ماند و اجرای دوباره همان دسته را امتحان می‌کند.
+    needs: [prepare, dispatch]
+    if: ${{ needs.prepare.outputs.count != '0' && needs.dispatch.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: برداشتن دسته‌ی مصرف‌شده از فایل تنظیمات
+        env:
+          DONE_TAGS: ${{ needs.prepare.outputs.tags }}
+          DONE_COUNT: ${{ needs.prepare.outputs.count }}
+          TOTAL: ${{ needs.prepare.outputs.total }}
+        run: |
+          [ -f "$MATRIX_FILE" ] || { echo "ℹ️ $MATRIX_FILE دیگر وجود ندارد."; exit 0; }
+
+          # اگر فایل بین prepare و الان عوض شده، چیزی حذف نکن (دسته‌ی اشتباه برداشته نشود)
+          CUR_TAGS=$(jq -r --argjson b "$DONE_COUNT" '
+            (if type=="array" then {defaults:{}, configs:.} else {defaults:(.defaults // {}), configs:(.configs // [])} end)
+            | .defaults as $d
+            | [ .configs | to_entries[]
+                | (($d + .value).tag // ("cfg" + ((.key+1)|tostring|if length<2 then "0"+. else . end))) | tostring ]
+            | .[:$b] | join(",")' "$MATRIX_FILE")
+          if [ "$CUR_TAGS" != "$DONE_TAGS" ]; then
+            echo "⚠️ فایل بعد از شروع اجرا تغییر کرده؛ چیزی حذف نشد (اجرای‌ها dispatch شده‌اند)."
+            exit 0
+          fi
+
+          # tag خودکار را داخل باقی‌مانده بنویس (تا شماره‌ها بعد از حذف دسته جابه‌جا نشوند) و ۲۰ تای اول را بینداز
+          jq --argjson b "$DONE_COUNT" '
+            def auto: "cfg" + ((.key+1)|tostring|if length<2 then "0"+. else . end);
+            . as $orig
+            | (if type=="array" then {} else (.defaults // {}) end) as $d
+            | (if type=="array" then . else (.configs // []) end) as $cfgs
+            | [ $cfgs | to_entries[]
+                | .value + (if (($d + .value).tag // null) == null then {tag: auto} else {} end) ]
+            | .[$b:] as $rest
+            | if ($orig|type)=="array" then $rest else ($orig + {configs: $rest}) end
+          ' "$MATRIX_FILE" > /tmp/rest.json
+
+          LEFT=$(jq 'if type=="array" then length else (.configs | length) end' /tmp/rest.json)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ "$LEFT" -eq 0 ]; then
+            git rm -q "$MATRIX_FILE"
+            MSG="pool_matrix: $DONE_COUNT configs dispatched, file consumed (run ${{ github.run_id }}) [skip ci]"
+          else
+            cp /tmp/rest.json "$MATRIX_FILE"
+            git add "$MATRIX_FILE"
+            MSG="pool_matrix: $DONE_COUNT configs dispatched, $LEFT left (run ${{ github.run_id }}) [skip ci]"
+          fi
+          git commit -q -m "$MSG"
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase -q || true
+            git push -q && { echo "✅ $MSG"; exit 0; }
+            sleep 5
+          done
+          echo "⚠️ push فایل تنظیمات ناموفق بود (اجرای‌ها dispatch شده‌اند؛ فایل را دستی اصلاح کن)."

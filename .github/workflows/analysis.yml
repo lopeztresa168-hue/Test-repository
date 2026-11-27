@@ -68,13 +68,36 @@ on:
         required: false
         default: '0'
       pool_repeat:
-        description: '[pool_search] فقط با polish: تکرار دائمی و بدون محدودیت زمانی — بعد از پایان هر دور (pool_time_budget دقیقه)، همین ورک‌فلو با همان پارامترها دوباره اجرا می‌شود و از نتیجه‌ی polish دور قبل ادامه می‌دهد. توقف: فایل interrupt.flag در مخزن سوم'
+        description: '[pool_search] فقط با polish: تکرار دائمی (یا تا pool_repeat_hours ساعت) — بعد از پایان هر دور (pool_time_budget دقیقه)، همین ورک‌فلو با همان پارامترها دوباره اجرا می‌شود و از نتیجه‌ی polish دور قبل ادامه می‌دهد. توقف: فایل interrupt.flag در مخزن سوم'
         required: false
         type: boolean
         default: false
+      pool_repeat_hours:
+        description: '[pool_search] فقط با pool_repeat: حداکثر مدت تکرار بر حسب ساعت (از شروع اولین دور). 0 = بدون محدودیت (۲۴/۷ تا interrupt.flag). مثلاً 50 = بعد از ۵۰ ساعت دور جدید شروع نمی‌شود'
+        required: false
+        default: '0'
+      pool_repeat_until:
+        description: '[pool_search] داخلی (توسط خود workflow پر می‌شود): epoch ثانیه‌ی پایان تکرار. دستی پر نکن'
+        required: false
+        default: '0'
+      pool_cache_only:
+        description: '[pool_search] داخلی (توسط pool-prebuild پر می‌شود): فقط کش کاندیداها را برای ترکیب fee / min_trades / end بساز و جستجوی نهایی را اجرا نکن. دستی پر نکن'
+        required: false
+        type: boolean
+        default: false
+      pool_tag:
+        description: '[pool_search] نام یک تنظیمات ماتریکس (توسط pool_matrix.yml پر می‌شود). با tag: هر تنظیمات در صف مستقل اجرا می‌شود، نتیجه‌اش در analysis_results/pool_matrix/<tag>.tar.gz.enc ذخیره می‌شود، polish از نتیجه‌ی همان tag ادامه می‌دهد، و پرچم اتمام/loop دست نمی‌خورد. خالی = رفتار قبلی'
+        required: false
+        default: ''
+
+# اجرای tagدار (ماتریکس pool_matrix.yml) گروه همزمانی مخصوص خودش را دارد تا ۲۰ تنظیمات هم‌زمان اجرا شوند
+# (در یک گروه مشترک فقط یک اجرا + یک صف‌شده می‌ماند و بقیه لغو می‌شدند). بقیه‌ی اجراها مثل قبل در analysis-runner هستند.
+# اجرای فقط-کش (pool_cache_only) نام و گروه همزمانی مخصوص خودش را دارد: همه‌ی ساخت‌های کش پشت‌سرهم (تک‌نویسنده‌ی آرشیو) اجرا می‌شوند
+# و modules/pool_ensure_cache.sh آن را از روی همین نام پیدا می‌کند — اگر این نام را عوض کنی آن اسکریپت را هم عوض کن.
+run-name: ${{ (inputs.analysis_module == 'pool_search' && inputs.pool_cache_only) && format('pool_search cache [fee={0} min={1} end={2}]', inputs.pool_fee, inputs.pool_min_trades, inputs.pool_end || 'default') || ((inputs.analysis_module == 'pool_search' && inputs.pool_tag != '') && format('pool_search [{0}]', inputs.pool_tag) || 'Complete Analysis Pipeline') }}
 
 concurrency:
-  group: analysis-runner
+  group: ${{ (inputs.analysis_module == 'pool_search' && inputs.pool_cache_only) && 'analysis-pool-cache' || ((inputs.analysis_module == 'pool_search' && inputs.pool_tag != '') && format('analysis-pool-{0}', inputs.pool_tag) || 'analysis-runner') }}
   cancel-in-progress: false
 
 jobs:
@@ -2246,6 +2269,7 @@ jobs:
       empty: ${{ steps.plan.outputs.empty }}
       pending_total: ${{ steps.plan.outputs.pending_total }}
       fingerprint: ${{ steps.plan.outputs.fingerprint }}
+      prebuild: ${{ steps.plan.outputs.prebuild }}
     env:
       POOL_OBJECTIVE: ${{ inputs.pool_objective }}
       POOL_MAX_MEMBERS: ${{ inputs.pool_max_members }}
@@ -2254,6 +2278,7 @@ jobs:
       POOL_FEE: ${{ inputs.pool_fee }}
       POOL_END: ${{ inputs.pool_end }}
       POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
+      POOL_TAG: ${{ inputs.pool_tag }}
     steps:
       - name: 1. Checkout مخزن اصلی
         uses: actions/checkout@v5
@@ -2274,6 +2299,7 @@ jobs:
           [[ "$POOL_FEE" =~ ^[0-9]*\.?[0-9]+$ ]]               || fail "pool_fee=$POOL_FEE"
           [[ -z "$POOL_END" || "$POOL_END" =~ ^[0-9]{4}-[0-9]{2}$ ]] || fail "pool_end=$POOL_END (فرمت YYYY-MM)"
           [[ -z "$POOL_TIME_BUDGET" || "$POOL_TIME_BUDGET" =~ ^[0-9]+$ ]]   || fail "pool_time_budget=$POOL_TIME_BUDGET (فقط عدد صحیح)"
+          [[ -z "$POOL_TAG" || "$POOL_TAG" =~ ^[A-Za-z0-9_-]{1,40}$ ]]     || fail "pool_tag=$POOL_TAG (فقط حروف/عدد/_/- تا ۴۰ حرف)"
           echo "✅ ماژول و پارامترها معتبر هستند."
 
       - name: 3. بررسی interrupt.flag
@@ -2346,13 +2372,22 @@ jobs:
           PENDING=$(jq '.pending_total' /tmp/pool_queue/plan.json)
           echo "pending_total=$PENDING" >> "$GITHUB_OUTPUT"
           echo "matrix_items=$(jq -c '[range(0; .chunk_count)]' /tmp/pool_queue/plan.json)" >> "$GITHUB_OUTPUT"
+          # اجرای tagدار (ماتریکس) هیچ‌وقت خودش کش نمی‌سازد: ۲۰ ساخت هم‌زمان روی push آرشیو pool_cache/ race می‌شوند.
+          # اگر کش این ترکیب fee/min_trades/end به‌روز نبود، job بعدی (pool-prebuild) یک اجرای «فقط-کش» تک‌نویسنده می‌سازد،
+          # منتظرش می‌ماند و بعد جستجو ادامه پیدا می‌کند — خطا نمی‌دهد.
+          PREBUILD=false
           if [ "$PENDING" -eq 0 ]; then
             echo "empty=true" >> "$GITHUB_OUTPUT"
             echo "✅ همه‌ی کش‌ها به‌روز هستند — مستقیم به مرحله‌ی جستجوی نهایی می‌رویم."
+          elif [ -n "$POOL_TAG" ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            PREBUILD=true
+            echo "🔧 [tag=$POOL_TAG] $PENDING فایل کش به‌روز ندارند — قبل از جستجو با یک اجرای فقط-کش ساخته می‌شوند (pool-prebuild)."
           else
             echo "empty=false" >> "$GITHUB_OUTPUT"
             echo "📋 $PENDING فایل در صف (در این اجرا: $(jq '.run_files' /tmp/pool_queue/plan.json) فایل در $(jq '.chunk_count' /tmp/pool_queue/plan.json) چانک)."
           fi
+          echo "prebuild=$PREBUILD" >> "$GITHUB_OUTPUT"
           # اثرانگشت پوشه‌ی aggregated (همان فرمولی که loop_analysis.yml از روی API می‌گیرد)
           FP=$(git -C /tmp/third_repo ls-tree --format='%(path) %(objectname)' HEAD:aggregated | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
           echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
@@ -2370,6 +2405,71 @@ jobs:
           name: pool-regime-${{ github.run_id }}
           path: /tmp/pool_regime/market_regime.json
           retention-days: 1
+
+  pool-prebuild:
+    # فقط اجرای tagدار با کش ناقص: یک اجرای «فقط-کش» (بدون tag، گروه همزمانی analysis-pool-cache) می‌سازد و تا پایان کل زنجیره‌اش صبر می‌کند.
+    # pool-final بعد از آن آرشیو را از نو restore می‌کند، پس کش‌های تازه را می‌بیند.
+    # اگر سقف ~۶ ساعت job تمام شد، همین اجرای tagدار با همان پارامترها دوباره صف می‌شود (ready=false → pool-final این بار اجرا نمی‌شود).
+    needs: [pool-plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    if: ${{ inputs.analysis_module == 'pool_search' && !inputs.pool_cache_only && needs.pool-plan.outputs.prebuild == 'true' }}
+    outputs:
+      ready: ${{ steps.ensure.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: ساخت کش ناقص با اجرای فقط-کش و انتظار تا کامل شدن
+        id: ensure
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          POOL_OBJECTIVE: ${{ inputs.pool_objective }}
+          POOL_MAX_MEMBERS: ${{ inputs.pool_max_members }}
+          POOL_MAX_PER_FILE: ${{ inputs.pool_max_per_file }}
+          POOL_MIN_TRADES: ${{ inputs.pool_min_trades }}
+          POOL_FEE: ${{ inputs.pool_fee }}
+          POOL_TUNE_WEIGHTS: ${{ inputs.pool_tune_weights }}
+          POOL_POLISH: ${{ inputs.pool_polish }}
+          POOL_END: ${{ inputs.pool_end }}
+          POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
+          POOL_SEED: ${{ inputs.pool_seed }}
+          POOL_REPEAT: ${{ inputs.pool_repeat }}
+          POOL_REPEAT_HOURS: ${{ inputs.pool_repeat_hours }}
+          POOL_REPEAT_UNTIL: ${{ inputs.pool_repeat_until }}
+          POOL_TAG: ${{ inputs.pool_tag }}
+        run: |
+          set +e
+          bash modules/pool_ensure_cache.sh "$POOL_FEE" "$POOL_MIN_TRADES" "$POOL_END"
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$RC" -ne 75 ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit "$RC"
+          fi
+          # سقف زمان job تمام شد ولی ساخت کش ادامه دارد → همین اجرای tagدار را دوباره صف کن (با همان پارامترها)
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "🔁 کش هنوز کامل نیست — اجرای [$POOL_TAG] دوباره صف می‌شود تا بعد از کامل شدن کش ادامه دهد."
+          ARGS=(-f analysis_module=pool_search -f pool_objective="$POOL_OBJECTIVE" -f pool_max_members="$POOL_MAX_MEMBERS"
+                -f pool_max_per_file="$POOL_MAX_PER_FILE" -f pool_min_trades="$POOL_MIN_TRADES" -f pool_fee="$POOL_FEE"
+                -f pool_tune_weights="$POOL_TUNE_WEIGHTS" -f pool_polish="$POOL_POLISH"
+                -f pool_time_budget="$POOL_TIME_BUDGET" -f pool_seed="$POOL_SEED"
+                -f pool_repeat="$POOL_REPEAT" -f pool_repeat_hours="${POOL_REPEAT_HOURS:-0}"
+                -f pool_repeat_until="${POOL_REPEAT_UNTIL:-0}" -f pool_tag="$POOL_TAG")
+          if [ -n "$POOL_END" ]; then ARGS+=(-f pool_end="$POOL_END"); fi
+          for attempt in 1 2 3; do
+            if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" "${ARGS[@]}" 2>&1; then
+              echo "✅ اجرای بعدی ثبت شد (تلاش $attempt)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ ثبت اجرای بعدی ناموفق بود."
+          exit 1
 
   pool-batch:
     needs: [pool-plan]
@@ -2601,14 +2701,21 @@ jobs:
           POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
           POOL_SEED: ${{ inputs.pool_seed }}
           POOL_REPEAT: ${{ inputs.pool_repeat }}
+          POOL_REPEAT_HOURS: ${{ inputs.pool_repeat_hours }}
+          POOL_REPEAT_UNTIL: ${{ inputs.pool_repeat_until }}
+          POOL_TAG: ${{ inputs.pool_tag }}
+          POOL_CACHE_ONLY: ${{ inputs.pool_cache_only }}
         run: |
           echo "🔁 هنوز ${{ needs.pool-collect.outputs.blocking }} فایل پردازش‌نشده مانده — اجرای بعدی pool_search..."
           ARGS=(-f analysis_module=pool_search -f pool_objective="$POOL_OBJECTIVE" -f pool_max_members="$POOL_MAX_MEMBERS"
                 -f pool_max_per_file="$POOL_MAX_PER_FILE" -f pool_min_trades="$POOL_MIN_TRADES" -f pool_fee="$POOL_FEE"
                 -f pool_tune_weights="$POOL_TUNE_WEIGHTS" -f pool_polish="$POOL_POLISH"
                 -f pool_time_budget="$POOL_TIME_BUDGET" -f pool_seed="$POOL_SEED"
-                -f pool_repeat="$POOL_REPEAT")
+                -f pool_repeat="$POOL_REPEAT" -f pool_repeat_hours="${POOL_REPEAT_HOURS:-0}"
+                -f pool_repeat_until="${POOL_REPEAT_UNTIL:-0}")
           if [ -n "$POOL_END" ]; then ARGS+=(-f pool_end="$POOL_END"); fi
+          if [ -n "$POOL_TAG" ]; then ARGS+=(-f pool_tag="$POOL_TAG"); fi
+          if [ "$POOL_CACHE_ONLY" = "true" ]; then ARGS+=(-f pool_cache_only=true); fi
           for attempt in 1 2 3; do
             if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
               echo "✅ اجرای بعدی ثبت شد (تلاش $attempt)."
@@ -2620,11 +2727,13 @@ jobs:
           exit 1
 
   pool-final:
-    needs: [pool-plan, pool-collect]
+    needs: [pool-plan, pool-prebuild, pool-collect]
     runs-on: ubuntu-latest
     timeout-minutes: 355   # سقف ران‌ر ۳۶۰؛ برای pool_time_budget=330 + لود کش‌ها + گزارش
+    # اجرای فقط-کش (pool_cache_only) جستجوی نهایی و پرچم اتمام ندارد؛ اجرای tagدار فقط وقتی جلو می‌رود که pool-prebuild لازم نبوده یا کش را کامل کرده باشد.
     if: >-
-      ${{ always() && inputs.analysis_module == 'pool_search' && needs.pool-plan.result == 'success' &&
+      ${{ always() && inputs.analysis_module == 'pool_search' && !inputs.pool_cache_only && needs.pool-plan.result == 'success' &&
+      (needs.pool-prebuild.result == 'skipped' || (needs.pool-prebuild.result == 'success' && needs.pool-prebuild.outputs.ready == 'true')) &&
       (needs.pool-plan.outputs.empty == 'true' ||
       (needs.pool-collect.result == 'success' && needs.pool-collect.outputs.blocking == '0')) }}
     env:
@@ -2639,6 +2748,9 @@ jobs:
       POOL_TIME_BUDGET: ${{ inputs.pool_time_budget }}
       POOL_SEED: ${{ inputs.pool_seed }}
       POOL_REPEAT: ${{ inputs.pool_repeat }}
+      POOL_REPEAT_HOURS: ${{ inputs.pool_repeat_hours }}
+      POOL_REPEAT_UNTIL: ${{ inputs.pool_repeat_until }}
+      POOL_TAG: ${{ inputs.pool_tag }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -2688,6 +2800,7 @@ jobs:
                 --max-members "$POOL_MAX_MEMBERS" --max-per-file "$POOL_MAX_PER_FILE"
                 --objective "$POOL_OBJECTIVE")
           if [ "$POOL_TUNE_WEIGHTS" = "true" ]; then ARGS+=(--tune-weights); fi
+          if [ -n "$POOL_TAG" ]; then ARGS+=(--tag "$POOL_TAG"); echo "🏷️ تنظیمات ماتریکس: $POOL_TAG"; fi
           if [ "$POOL_POLISH" = "true" ]; then ARGS+=(--polish); echo "✨ حالت polish: ادامه از آخرین نتیجه‌ی polish (یا سبد اصلی اگر هنوز polish نشده)"; fi
           if [ -n "$POOL_END" ]; then ARGS+=(--end "$POOL_END"); fi
           if [ "${POOL_TIME_BUDGET:-0}" != "0" ]; then ARGS+=(--time-budget "$POOL_TIME_BUDGET" --seed "${POOL_SEED:-0}"); echo "🎲 جستجوی تصادفی: $POOL_TIME_BUDGET دقیقه (seed=${POOL_SEED:-0})"; fi
@@ -2738,13 +2851,20 @@ jobs:
           mkdir -p analysis_results
           RES_NAME=pool_search_results.tar.gz.enc
           if [ "$POOL_POLISH" = "true" ]; then RES_NAME=pool_search_polished.tar.gz.enc; fi   # نتیجه‌ی polish روی سبد اصلی نوشته نمی‌شود
+          if [ -n "$POOL_TAG" ]; then
+            # تنظیمات ماتریکس: فایل مستقل برای هر tag (نه سبد اصلی، نه polish اصلی) → ۲۰ اجرای هم‌زمان روی هم نمی‌نویسند
+            mkdir -p analysis_results/pool_matrix
+            RES_NAME="pool_matrix/${POOL_TAG}.tar.gz.enc"
+          fi
           cp /tmp/pool_search_results.tar.gz.enc "analysis_results/$RES_NAME"
           git add --sparse -f "analysis_results/$RES_NAME"
 
           # پرچم اتمام همراه اثرانگشت داده: loop_analysis.yml فقط وقتی aggregated عوض شده باشد دوباره اجرا می‌کند.
           # اگر داده در طول همین اجرا تغییر کرده باشد پرچم ساخته نمی‌شود تا اجرای افزایشی بعدی انجام شود.
           CUR_FP=$(git ls-tree --format='%(path) %(objectname)' HEAD:aggregated | LC_ALL=C sort | sha256sum | cut -d' ' -f1)
-          if [ "$POOL_POLISH" = "true" ]; then
+          if [ -n "$POOL_TAG" ]; then
+            echo "ℹ️ اجرای ماتریکس ($POOL_TAG): پرچم اتمام ساخته/تغییر داده نمی‌شود."
+          elif [ "$POOL_POLISH" = "true" ]; then
             echo "ℹ️ حالت polish: پرچم اتمام ساخته/تغییر داده نمی‌شود."
           elif [ "$CUR_FP" = "$PLAN_FP" ]; then
             printf '{"run_id":"%s","finished_at":"%s","fingerprint":"%s"}\n' "${{ github.run_id }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CUR_FP" > pool_search_done.flag
@@ -2758,7 +2878,7 @@ jobs:
             echo "ℹ️ تغییری برای commit نیست."
             exit 0
           fi
-          git commit -q -m "pool_search results (run ${{ github.run_id }})"
+          git commit -q -m "pool_search results${POOL_TAG:+ [$POOL_TAG]} (run ${{ github.run_id }})"
           for attempt in $(seq 1 10); do
             git pull --rebase -q || true
             if git push -q; then
@@ -2777,6 +2897,7 @@ jobs:
         run: |
           # در حالت skip، loop_analysis.yml برای اجرای pool_search خودش را مجدد صدا نمی‌زند؛
           # پس اینجا (فقط پس از موفقیت) دوباره dispatch می‌شود تا چرخه‌ی حالت skip مثل قبل ادامه یابد.
+          if [ -n "$POOL_TAG" ]; then echo "ℹ️ اجرای ماتریکس ($POOL_TAG) — loop دوباره صدا زده نمی‌شود."; exit 0; fi
           if [ "$POOL_POLISH" = "true" ]; then echo "ℹ️ اجرای polish دستی بود — loop دوباره صدا زده نمی‌شود."; exit 0; fi
           if gh api "repos/$THIRD_REPO/contents/skip_analysis.flag" >/dev/null 2>&1; then
             echo "⏭️ skip_analysis.flag هنوز هست — فراخوانی مجدد loop_analysis.yml..."
@@ -2804,7 +2925,8 @@ jobs:
           CROSS_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           THIRD_REPO: ${{ secrets.THIRD_REPO }}
         run: |
-          # این step فقط بعد از موفقیت کامل دور جاری (نتیجه push شده) اجرا می‌شود. محدودیت زمانی ندارد؛ فقط interrupt.flag متوقفش می‌کند.
+          # این step فقط بعد از موفقیت کامل دور جاری (نتیجه push شده) اجرا می‌شود.
+          # pool_repeat_hours=0 → بدون محدودیت (فقط interrupt.flag متوقفش می‌کند)؛ pool_repeat_hours=N → تا N ساعت از شروع اولین دور.
           if GH_TOKEN="$CROSS_TOKEN" gh api "repos/$THIRD_REPO/contents/interrupt.flag" >/dev/null 2>&1; then
             echo "🛑 interrupt.flag هست — تکرار polish متوقف شد."
             exit 0
@@ -2814,13 +2936,30 @@ jobs:
             echo "ℹ️ pool_time_budget=0 — تکرار بی‌فایده است (هر دور همان نتیجه‌ی قطعی را می‌دهد). تکرار شروع نمی‌شود."
             exit 0
           fi
+          HOURS="${POOL_REPEAT_HOURS:-0}"; UNTIL="${POOL_REPEAT_UNTIL:-0}"
+          [[ "$HOURS" =~ ^[0-9]*\.?[0-9]+$ ]] || { echo "❌ pool_repeat_hours=$HOURS نامعتبر است."; exit 1; }
+          [[ "$UNTIL" =~ ^[0-9]+$ ]]          || { echo "❌ pool_repeat_until=$UNTIL نامعتبر است."; exit 1; }
+          NOW=$(date +%s)
+          if [ "$UNTIL" -eq 0 ] && awk "BEGIN{exit !($HOURS>0)}"; then
+            # اولین دور: مهلت = زمان شروع همین run + HOURS (اگر خواندن زمان شروع نشد، از الان)
+            STARTED=$(GH_TOKEN="$GH_TOKEN" gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" --jq .run_started_at 2>/dev/null || true)
+            START_EPOCH=$(date -d "$STARTED" +%s 2>/dev/null || echo "$NOW")
+            UNTIL=$(awk "BEGIN{printf \"%d\", $START_EPOCH + $HOURS*3600}")
+            echo "⏱️ تکرار محدود به ${HOURS} ساعت از شروع؛ پایان: $(date -u -d @"$UNTIL" '+%Y-%m-%d %H:%M UTC')"
+          fi
+          if [ "$UNTIL" -gt 0 ] && [ "$NOW" -ge "$UNTIL" ]; then
+            echo "⏹️ مهلت ${HOURS} ساعت تمام شد — دور جدید شروع نمی‌شود."
+            exit 0
+          fi
           NEXT_SEED=$(( ${POOL_SEED:-0} + 1 ))
           ARGS=(-f analysis_module=pool_search -f pool_polish=true -f pool_repeat=true
+                -f pool_repeat_hours="$HOURS" -f pool_repeat_until="$UNTIL"
                 -f pool_objective="$POOL_OBJECTIVE" -f pool_max_members="$POOL_MAX_MEMBERS"
                 -f pool_max_per_file="$POOL_MAX_PER_FILE" -f pool_min_trades="$POOL_MIN_TRADES" -f pool_fee="$POOL_FEE"
                 -f pool_tune_weights="$POOL_TUNE_WEIGHTS"
                 -f pool_time_budget="$BUDGET" -f pool_seed="$NEXT_SEED")
           if [ -n "$POOL_END" ]; then ARGS+=(-f pool_end="$POOL_END"); fi
+          if [ -n "$POOL_TAG" ]; then ARGS+=(-f pool_tag="$POOL_TAG"); fi
           for attempt in 1 2 3; do
             if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
               echo "🔁 دور بعدی polish ثبت شد: ${BUDGET} دقیقه، seed=${NEXT_SEED}."
