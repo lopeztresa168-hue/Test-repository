@@ -1,8 +1,14 @@
 name: Pool Matrix Dispatcher
 
 # با ساخته شدن (push) فایل pool_matrix.json در ریشه‌ی مخزن اصلی، pool_search را به‌صورت ماتریکس اجرا می‌کند.
-# هر آیتم ماتریکس یک بار analysis.yml را با analysis_module=pool_search و فیلدهای pool_* همان تنظیمات
-# (+ pool_tag) صدا می‌زند.
+# معماری (همه‌چیز داخل همین run، بدون صدا زدن analysis.yml برای هر تنظیمات):
+#   prepare  : خواندن/اعتبارسنجی فایل و انتخاب ۲۰ تای اول
+#   prebuild : یک بار؛ برای هر ترکیب یکتای fee/min_trades/end اگر کش کهنه بود، اجرای «فقط-کش» تک‌نویسنده
+#              (modules/pool_ensure_cache.sh) را می‌سازد و منتظر می‌ماند. ترکیب‌هایی که کش‌شان کامل نشد در این دسته نمی‌آیند.
+#   search   : ۲۰ job همزمان؛ هر کدام pool_search --mode search را برای tag خودش اجرا و نتیجه‌ی رمزنگاری‌شده را artifact می‌کند
+#              (هیچ job ای روی مخزن چیزی push نمی‌کند).
+#   commit   : تنها نویسنده؛ همه‌ی نتیجه‌ها را با یک commit/push به analysis_results/pool_matrix/ مخزن سوم می‌برد،
+#              بعد tagهای موفق را از فایل تنظیمات برمی‌دارد و دور بعدی tagهای repeat را (با configs_json) صدا می‌زند.
 #
 # دسته‌بندی (batch): فایل می‌تواند هر تعداد تنظیمات داشته باشد (مثلاً ۱۰۰ تا)، ولی هر اجرا فقط ۲۰ تای اول
 # را dispatch می‌کند. بعد از dispatch موفق، همان ۲۰ تا از فایل حذف می‌شوند و بقیه در فایل می‌مانند؛
@@ -41,9 +47,14 @@ on:
         description: 'مسیر فایل تنظیمات (پیش‌فرض pool_matrix.json)'
         required: false
         default: 'pool_matrix.json'
+      configs_json:
+        description: 'داخلی (توسط دور قبلی repeat پر می‌شود): لیست تنظیمات به‌جای فایل؛ فایل تنظیمات دست نمی‌خورد. دستی پر نکن'
+        required: false
+        default: ''
 
 concurrency:
-  group: pool-matrix-dispatch
+  # دورهای repeat (configs_json) هر کدام گروه مستقل دارند تا اجرای pending فایل جدید، زنجیره‌ی repeat را لغو نکند
+  group: ${{ inputs.configs_json != '' && format('pool-matrix-repeat-{0}', github.run_id) || 'pool-matrix-dispatch' }}
   cancel-in-progress: false
 
 env:
@@ -65,15 +76,19 @@ jobs:
 
       - name: خواندن و اعتبارسنجی فایل تنظیمات
         id: parse
+        env:
+          CFGS: ${{ inputs.configs_json }}
         run: |
           fail() { echo "❌ $1"; exit 1; }
-          if [ ! -f "$MATRIX_FILE" ]; then
+          SRC="$MATRIX_FILE"
+          if [ -n "$CFGS" ]; then printf '%s' "$CFGS" > /tmp/repeat_src.json; SRC=/tmp/repeat_src.json; fi
+          if [ ! -f "$SRC" ]; then
             echo "ℹ️ $MATRIX_FILE وجود ندارد (احتمالاً حذف شده) — کاری برای انجام نیست."
             echo "count=0" >> "$GITHUB_OUTPUT"; echo "total=0" >> "$GITHUB_OUTPUT"
             echo "tags=" >> "$GITHUB_OUTPUT"; echo "matrix=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          jq empty "$MATRIX_FILE" 2>/dev/null || fail "$MATRIX_FILE یک JSON معتبر نیست."
+          jq empty "$SRC" 2>/dev/null || fail "$MATRIX_FILE یک JSON معتبر نیست."
 
           # آرایه یا {defaults, configs} → لیست نهایی؛ مقادیر همه به رشته؛ tag خودکار
           jq -c '
@@ -93,8 +108,9 @@ jobs:
                     time_budget:  (($c.time_budget  // 0)      | tostring),
                     seed:         (($c.seed         // 0)      | tostring),
                     repeat_hours: (($c.repeat_hours // 0)      | tostring),
+                    repeat_until: (($c.repeat_until // 0)      | tostring),
                     repeat:       ((($c.repeat // false) or ((($c.repeat_hours // 0) | tonumber) > 0)) | tostring) } ]
-          ' "$MATRIX_FILE" > /tmp/all.json
+          ' "$SRC" > /tmp/all.json
 
           TOTAL=$(jq length /tmp/all.json)
           [ "$TOTAL" -ge 1 ] || fail "هیچ تنظیماتی در فایل نیست."
@@ -116,6 +132,7 @@ jobs:
               ( .polish       | test("^(true|false)$") | not) or
               ( .repeat       | test("^(true|false)$") | not) or
               ( .repeat_hours | test("^[0-9]*\\.?[0-9]+$") | not) or
+              ( .repeat_until | test("^[0-9]+$") | not) or
               ( .end          | test("^([0-9]{4}-[0-9]{2})?$") | not) or
               ( .time_budget  | test("^[0-9]+$") | not) or
               ( .seed         | test("^[0-9]+$") | not)
@@ -141,106 +158,357 @@ jobs:
             jq -r '.[] | "| \(.tag) | \(.objective) | \(.max_members) | \(.max_per_file) | \(.min_trades) | \(.fee) | \(.tune_weights) | \(.polish) | \(.end) | \(.time_budget) | \(.seed) | \(.repeat) | \(.repeat_hours) |"' /tmp/matrix.json
           } >> "$GITHUB_STEP_SUMMARY"
 
-  dispatch:
+  prebuild:
+    # یک بار برای کل دسته: کش هر ترکیب یکتای fee/min_trades/end را کامل می‌کند (اجرای «فقط-کش» تک‌نویسنده، مثل قبل).
+    # فقط تنظیماتی که کش‌شان آماده است وارد search می‌شوند؛ بقیه در فایل می‌مانند تا اجرای بعدی.
     needs: prepare
     if: ${{ needs.prepare.outputs.count != '0' }}
     runs-on: ubuntu-latest
-    name: dispatch ${{ matrix.cfg.tag }}
+    timeout-minutes: 355
+    outputs:
+      matrix: ${{ steps.ensure.outputs.matrix }}
+      count: ${{ steps.ensure.outputs.count }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: بررسی interrupt.flag
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$THIRD_REPO/contents/interrupt.flag")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "🛑 interrupt.flag یافت شد — اجرا متوقف می‌شود."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy cryptography
+
+      - name: Clone سبک مخزن سوم
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 --filter=blob:none --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          git -C /tmp/third_repo ls-tree HEAD:aggregated >/dev/null 2>&1 || { echo "❌ پوشه aggregated در مخزن سوم نیست."; exit 1; }
+
+      - name: یافتن market_regime.json
+        run: |
+          REGIME_FILE=$(find "$GITHUB_WORKSPACE" -name 'market_regime.json' -not -path '*/.git/*' 2>/dev/null | head -n 1)
+          if [ -z "$REGIME_FILE" ]; then
+            P=$(git -C /tmp/third_repo ls-tree -r --name-only HEAD | grep -m1 -E '(^|/)market_regime\.json$' || true)
+            if [ -n "$P" ]; then
+              git -C /tmp/third_repo checkout HEAD -- "$P"
+              REGIME_FILE="/tmp/third_repo/$P"
+            fi
+          fi
+          if [ -z "$REGIME_FILE" ] || [ ! -s "$REGIME_FILE" ]; then
+            echo "❌ market_regime.json یافت نشد."; exit 1
+          fi
+          mkdir -p /tmp/pool_regime
+          cp "$REGIME_FILE" /tmp/pool_regime/market_regime.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pool-matrix-regime
+          path: /tmp/pool_regime/market_regime.json
+          retention-days: 1
+
+      - name: بازیابی آرشیو کش
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: bash modules/pool_cache.sh restore /tmp/third_repo
+
+      - name: کش هر ترکیب fee/min_trades/end را کامل کن و تنظیمات آماده را برگردان
+        id: ensure
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MATRIX: ${{ needs.prepare.outputs.matrix }}
+        run: |
+          set +e
+          READY=()
+          n=0
+          while IFS='|' read -r FEE MT END; do
+            n=$((n+1))
+            ARGS=(--mode plan --repo-dir /tmp/third_repo --regime /tmp/pool_regime/market_regime.json
+                  --fee "$FEE" --min-trades "$MT" --queue-dir "/tmp/pool_queue_$n" --chunk-size 10 --max-files 1000)
+            [ -n "$END" ] && ARGS+=(--end "$END")
+            if ! python -u modules/pool_search.py "${ARGS[@]}"; then
+              echo "⚠️ [fee=$FEE min=$MT end=${END:-default}] plan شکست خورد — این ترکیب در این دسته نمی‌آید."; continue
+            fi
+            PENDING=$(jq '.pending_total' "/tmp/pool_queue_$n/plan.json")
+            if [ "$PENDING" -eq 0 ]; then
+              echo "✅ [fee=$FEE min=$MT end=${END:-default}] کش به‌روز است."
+              READY+=("$FEE|$MT|$END"); continue
+            fi
+            echo "🔧 [fee=$FEE min=$MT end=${END:-default}] $PENDING فایل بدون کش — اجرای فقط-کش..."
+            bash modules/pool_ensure_cache.sh "$FEE" "$MT" "$END"
+            RC=$?
+            if [ "$RC" -eq 0 ]; then READY+=("$FEE|$MT|$END")
+            else echo "⚠️ [fee=$FEE min=$MT end=${END:-default}] کش کامل نشد (rc=$RC) — این ترکیب در فایل می‌ماند."; fi
+          done < <(jq -r '[.[] | [.fee, .min_trades, .end] | join("|")] | unique[]' <<<"$MATRIX")
+
+          if [ "${#READY[@]}" -eq 0 ]; then READY_JSON='[]'
+          else READY_JSON=$(printf '%s\n' "${READY[@]}" | jq -R . | jq -sc .); fi
+          OUT=$(jq -c --argjson r "$READY_JSON" '[ .[] | select(([.fee,.min_trades,.end] | join("|")) as $k | ($r | index($k)) != null) ]' <<<"$MATRIX")
+          echo "matrix=$OUT" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq length <<<"$OUT")" >> "$GITHUB_OUTPUT"
+          echo "## prebuild: $(jq length <<<"$OUT") از $(jq length <<<"$MATRIX") تنظیمات آماده‌ی جستجو" >> "$GITHUB_STEP_SUMMARY"
+
+  search:
+    # ۲۰ جستجوی همزمان؛ هیچ‌کدام روی مخزن چیزی نمی‌نویسند، فقط نتیجه را artifact می‌کنند.
+    needs: [prepare, prebuild]
+    if: ${{ needs.prebuild.outputs.count != '' && needs.prebuild.outputs.count != '0' }}
+    name: search ${{ matrix.cfg.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix:
-        cfg: ${{ fromJson(needs.prepare.outputs.matrix) }}
+        cfg: ${{ fromJson(needs.prebuild.outputs.matrix) }}
+    env:
+      POOL_TAG: ${{ matrix.cfg.tag }}
+      POOL_OBJECTIVE: ${{ matrix.cfg.objective }}
+      POOL_MAX_MEMBERS: ${{ matrix.cfg.max_members }}
+      POOL_MAX_PER_FILE: ${{ matrix.cfg.max_per_file }}
+      POOL_MIN_TRADES: ${{ matrix.cfg.min_trades }}
+      POOL_FEE: ${{ matrix.cfg.fee }}
+      POOL_TUNE_WEIGHTS: ${{ matrix.cfg.tune_weights }}
+      POOL_POLISH: ${{ matrix.cfg.polish }}
+      POOL_END: ${{ matrix.cfg.end }}
+      POOL_TIME_BUDGET: ${{ matrix.cfg.time_budget }}
+      POOL_SEED: ${{ matrix.cfg.seed }}
     steps:
-      - name: analysis.yml را با analysis_module=pool_search و تنظیمات این آیتم صدا بزن
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CFG: ${{ toJson(matrix.cfg) }}
-        run: |
-          j() { echo "$CFG" | jq -r "$1"; }
-          TAG=$(j .tag)
-          sleep $(( $(j .i) * 2 ))            # فاصله‌ی کوتاه بین dispatchها (rate limit ثانویه‌ی API)
-          ARGS=(-f analysis_module=pool_search
-                -f pool_tag="$TAG"
-                -f pool_objective="$(j .objective)"
-                -f pool_max_members="$(j .max_members)"
-                -f pool_max_per_file="$(j .max_per_file)"
-                -f pool_min_trades="$(j .min_trades)"
-                -f pool_fee="$(j .fee)"
-                -f pool_tune_weights="$(j .tune_weights)"
-                -f pool_polish="$(j .polish)"
-                -f pool_time_budget="$(j .time_budget)"
-                -f pool_seed="$(j .seed)"
-                -f pool_repeat="$(j .repeat)"
-                -f pool_repeat_hours="$(j .repeat_hours)")
-          END=$(j .end); if [ -n "$END" ]; then ARGS+=(-f pool_end="$END"); fi
-          for attempt in 1 2 3; do
-            if gh workflow run analysis.yml --repo "${{ github.repository }}" --ref main "${ARGS[@]}" 2>&1; then
-              echo "✅ [$TAG] dispatch شد (تلاش $attempt)."
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          echo "❌ [$TAG] dispatch ناموفق بود."
-          exit 1
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-  consume:
-    # فقط وقتی همه‌ی آیتم‌های این دسته dispatch شدند، همان‌ها از فایل برداشته می‌شوند. بقیه (اگر باشد) در فایل می‌مانند.
-    # اگر یکی شکست بخورد فایل دست‌نخورده می‌ماند و اجرای دوباره همان دسته را امتحان می‌کند.
-    needs: [prepare, dispatch]
-    if: ${{ needs.prepare.outputs.count != '0' && needs.dispatch.result == 'success' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy cryptography
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pool-matrix-regime
+          path: /tmp/pool_regime
+
+      - name: Clone سبک مخزن سوم (آرشیو کش + نتایج قبلی برای polish)
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          cd /tmp/third_repo
+          git sparse-checkout set pool_cache pool_candidates analysis_results
+
+      - name: بازیابی آرشیو کش
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: bash modules/pool_cache.sh restore /tmp/third_repo
+
+      - name: جستجو (pool_search --mode search)
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/pool_results
+          ARGS=(--mode search --password "$RESULTS_PASSWORD"
+                --repo-dir /tmp/third_repo
+                --regime /tmp/pool_regime/market_regime.json
+                --fee "$POOL_FEE" --min-trades "$POOL_MIN_TRADES"
+                --out /tmp/pool_results
+                --max-members "$POOL_MAX_MEMBERS" --max-per-file "$POOL_MAX_PER_FILE"
+                --objective "$POOL_OBJECTIVE" --tag "$POOL_TAG")
+          if [ "$POOL_TUNE_WEIGHTS" = "true" ]; then ARGS+=(--tune-weights); fi
+          if [ "$POOL_POLISH" = "true" ]; then ARGS+=(--polish); fi
+          if [ -n "$POOL_END" ]; then ARGS+=(--end "$POOL_END"); fi
+          if [ "${POOL_TIME_BUDGET:-0}" != "0" ]; then ARGS+=(--time-budget "$POOL_TIME_BUDGET" --seed "${POOL_SEED:-0}"); fi
+          set -o pipefail
+          python -u modules/pool_search.py "${ARGS[@]}" 2>&1 | tee /tmp/pool_results/run.log
+          for f in selected.csv filters_compare.csv portfolio_monthly_by_filter.csv; do
+            [ -s "/tmp/pool_results/$f" ] || { echo "❌ فایل خروجی $f ساخته نشد."; exit 1; }
+          done
+
+      - name: خلاصه‌ی نتایج
+        run: |
+          { echo "## pool_search [$POOL_TAG]"; echo '```'; sed -n '/caches loaded/,$p' /tmp/pool_results/run.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: بسته‌بندی و رمزنگاری نتیجه (فقط فایل؛ push توسط job commit)
+        env:
+          RESULTS_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          mkdir -p /tmp/pool_search_results /tmp/out
+          cp /tmp/pool_results/*.csv /tmp/pool_results/coverage.json /tmp/pool_results/run.log /tmp/pool_search_results/
+          tar -czf /tmp/pool_search_results.tar.gz -C /tmp pool_search_results
+          node -e "
+            const crypto=require('crypto'),fs=require('fs');
+            const pass=process.env.RESULTS_PASSWORD;
+            const data=fs.readFileSync('/tmp/pool_search_results.tar.gz');
+            const key=crypto.scryptSync(pass,'salt',32);
+            const iv=crypto.randomBytes(16);
+            const cipher=crypto.createCipheriv('aes-256-cbc',key,iv);
+            const enc=Buffer.concat([iv,cipher.update(data),cipher.final()]);
+            fs.writeFileSync('/tmp/out/${POOL_TAG}.tar.gz.enc', enc);
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pool-matrix-result-${{ matrix.cfg.tag }}
+          path: /tmp/out/${{ matrix.cfg.tag }}.tar.gz.enc
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: لاگ/CSV برای بررسی
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pool-matrix-logs-${{ matrix.cfg.tag }}
+          path: |
+            /tmp/pool_results/*.csv
+            /tmp/pool_results/coverage.json
+            /tmp/pool_results/run.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  commit:
+    # تنها نویسنده: یک commit/push برای همه‌ی نتیجه‌ها، بعد برداشتن tagهای موفق از فایل و دور بعدی repeat.
+    needs: [prepare, prebuild, search]
+    if: ${{ !cancelled() && needs.search.result != 'skipped' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: برداشتن دسته‌ی مصرف‌شده از فایل تنظیمات
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true      # اگر همه‌ی جستجوها شکست خورده باشند آرتیفکتی نیست
+        with:
+          pattern: pool-matrix-result-*
+          path: /tmp/results
+          merge-multiple: true       # هر آرتیفکت یک فایل <tag>.tar.gz.enc دارد
+
+      - name: ۱) یک commit/push نتایج به مخزن سوم
+        id: push
         env:
-          DONE_TAGS: ${{ needs.prepare.outputs.tags }}
-          DONE_COUNT: ${{ needs.prepare.outputs.count }}
-          TOTAL: ${{ needs.prepare.outputs.total }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+        run: |
+          shopt -s nullglob
+          FILES=(/tmp/results/*.tar.gz.enc)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "done=[]" >> "$GITHUB_OUTPUT"; echo "❌ هیچ نتیجه‌ای نیست."; exit 1
+          fi
+          git clone --depth=1 --filter=blob:none --sparse \
+            "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
+          cd /tmp/third_repo
+          git sparse-checkout set analysis_results
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p analysis_results/pool_matrix
+          DONE=()
+          for f in "${FILES[@]}"; do
+            tag=$(basename "$f" .tar.gz.enc)
+            cp "$f" "analysis_results/pool_matrix/${tag}.tar.gz.enc"
+            git add --sparse -f "analysis_results/pool_matrix/${tag}.tar.gz.enc"
+            DONE+=("$tag")
+          done
+          git commit -q -m "pool_matrix results: ${#DONE[@]} configs (run ${{ github.run_id }})"
+          for attempt in $(seq 1 10); do
+            git pull --rebase -q || true
+            if git push -q; then
+              echo "✅ push یک‌باره‌ی ${#DONE[@]} نتیجه موفق بود (تلاش $attempt)."
+              echo "done=$(printf '%s\n' "${DONE[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep $(( (RANDOM % 10) + 3 ))
+          done
+          echo "done=[]" >> "$GITHUB_OUTPUT"
+          echo "❌ push پس از ۱۰ تلاش ناموفق بود (فایل تنظیمات دست‌نخورده می‌ماند)."; exit 1
+
+      - name: ۲) برداشتن tagهای موفق از فایل تنظیمات (فقط اجرای عادی، نه دور repeat)
+        if: ${{ steps.push.outputs.done != '' && steps.push.outputs.done != '[]' && inputs.configs_json == '' }}
+        env:
+          BATCH_TAGS: ${{ needs.prepare.outputs.tags }}
+          BATCH_COUNT: ${{ needs.prepare.outputs.count }}
+          DONE_JSON: ${{ steps.push.outputs.done }}
         run: |
           [ -f "$MATRIX_FILE" ] || { echo "ℹ️ $MATRIX_FILE دیگر وجود ندارد."; exit 0; }
-
-          # اگر فایل بین prepare و الان عوض شده، چیزی حذف نکن (دسته‌ی اشتباه برداشته نشود)
-          CUR_TAGS=$(jq -r --argjson b "$DONE_COUNT" '
+          CUR_TAGS=$(jq -r --argjson b "$BATCH_COUNT" '
             (if type=="array" then {defaults:{}, configs:.} else {defaults:(.defaults // {}), configs:(.configs // [])} end)
             | .defaults as $d
             | [ .configs | to_entries[]
                 | (($d + .value).tag // ("cfg" + ((.key+1)|tostring|if length<2 then "0"+. else . end))) | tostring ]
             | .[:$b] | join(",")' "$MATRIX_FILE")
-          if [ "$CUR_TAGS" != "$DONE_TAGS" ]; then
-            echo "⚠️ فایل بعد از شروع اجرا تغییر کرده؛ چیزی حذف نشد (اجرای‌ها dispatch شده‌اند)."
-            exit 0
+          if [ "$CUR_TAGS" != "$BATCH_TAGS" ]; then
+            echo "⚠️ فایل بعد از شروع اجرا تغییر کرده؛ چیزی از آن حذف نشد (نتایج commit شده‌اند)."; exit 0
           fi
-
-          # tag خودکار را داخل باقی‌مانده بنویس (تا شماره‌ها بعد از حذف دسته جابه‌جا نشوند) و ۲۰ تای اول را بینداز
-          jq --argjson b "$DONE_COUNT" '
+          jq --argjson b "$BATCH_COUNT" --argjson done "$DONE_JSON" '
             def auto: "cfg" + ((.key+1)|tostring|if length<2 then "0"+. else . end);
             . as $orig
             | (if type=="array" then {} else (.defaults // {}) end) as $d
             | (if type=="array" then . else (.configs // []) end) as $cfgs
             | [ $cfgs | to_entries[]
-                | .value + (if (($d + .value).tag // null) == null then {tag: auto} else {} end) ]
-            | .[$b:] as $rest
+                | .key as $k
+                | (.value + (if (($d + .value).tag // null) == null then {tag: auto} else {} end)) as $v
+                | select( ($k < $b and ((($d + $v).tag | tostring) as $t | ($done | index($t)) != null)) | not )
+                | $v ] as $rest
             | if ($orig|type)=="array" then $rest else ($orig + {configs: $rest}) end
           ' "$MATRIX_FILE" > /tmp/rest.json
-
           LEFT=$(jq 'if type=="array" then length else (.configs | length) end' /tmp/rest.json)
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ "$LEFT" -eq 0 ]; then
-            git rm -q "$MATRIX_FILE"
-            MSG="pool_matrix: $DONE_COUNT configs dispatched, file consumed (run ${{ github.run_id }}) [skip ci]"
-          else
-            cp /tmp/rest.json "$MATRIX_FILE"
-            git add "$MATRIX_FILE"
-            MSG="pool_matrix: $DONE_COUNT configs dispatched, $LEFT left (run ${{ github.run_id }}) [skip ci]"
-          fi
-          git commit -q -m "$MSG"
+          if [ "$LEFT" -eq 0 ]; then git rm -q "$MATRIX_FILE"; else cp /tmp/rest.json "$MATRIX_FILE"; git add "$MATRIX_FILE"; fi
+          git commit -q -m "pool_matrix: $(jq length <<<"$DONE_JSON")/$BATCH_COUNT done, $LEFT left (run ${{ github.run_id }}) [skip ci]"
           for attempt in 1 2 3 4 5; do
             git pull --rebase -q || true
-            git push -q && { echo "✅ $MSG"; exit 0; }
+            git push -q && { echo "✅ فایل تنظیمات به‌روز شد ($LEFT مانده)."; exit 0; }
             sleep 5
           done
-          echo "⚠️ push فایل تنظیمات ناموفق بود (اجرای‌ها dispatch شده‌اند؛ فایل را دستی اصلاح کن)."
+          echo "⚠️ push فایل تنظیمات ناموفق بود (نتایج commit شده‌اند؛ فایل را دستی اصلاح کن)."
+
+      - name: ۳) دور بعدی polish برای tagهای repeat (یک run مشترک با configs_json)
+        if: ${{ steps.push.outputs.done != '' && steps.push.outputs.done != '[]' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CROSS_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+          THIRD_REPO: ${{ secrets.THIRD_REPO }}
+          MATRIX: ${{ needs.prebuild.outputs.matrix }}
+          DONE_JSON: ${{ steps.push.outputs.done }}
+        run: |
+          ELIG=$(jq -c --argjson d "$DONE_JSON" '[ .[] | select((.tag as $t | ($d | index($t))) != null) | select(.polish=="true" and .repeat=="true") ]' <<<"$MATRIX")
+          [ "$(jq length <<<"$ELIG")" -gt 0 ] || { echo "ℹ️ تنظیمات repeat در این دسته نیست."; exit 0; }
+          if GH_TOKEN="$CROSS_TOKEN" gh api "repos/$THIRD_REPO/contents/interrupt.flag" >/dev/null 2>&1; then
+            echo "🛑 interrupt.flag هست — تکرار polish متوقف شد."; exit 0
+          fi
+          NOW=$(date +%s)
+          STARTED=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" --jq .run_started_at 2>/dev/null || true)
+          START_EPOCH=$(date -d "$STARTED" +%s 2>/dev/null || echo "$NOW")
+          NEXT=$(jq -c --argjson now "$NOW" --argjson start "$START_EPOCH" '
+            [ .[]
+              | (.repeat_hours | tonumber) as $h
+              | (.repeat_until | tonumber) as $u0
+              | (.time_budget | tonumber) as $b
+              | (if $u0 == 0 and $h > 0 then (($start + $h * 3600) | floor) else $u0 end) as $u
+              | select($b > 0)
+              | select($u == 0 or $now < $u)
+              | . + {repeat_until: ($u | tostring), seed: ((((.seed | tonumber) + 1)) | tostring)} ]' <<<"$ELIG")
+          N=$(jq length <<<"$NEXT")
+          echo "🔁 دور بعدی: $N از $(jq length <<<"$ELIG") تنظیمات (بقیه: budget=0 یا مهلت repeat_hours تمام شده)"
+          [ "$N" -gt 0 ] || exit 0
+          for attempt in 1 2 3; do
+            if gh workflow run pool_matrix.yml --repo "${{ github.repository }}" --ref main -f configs_json="$NEXT" 2>&1; then
+              echo "✅ دور بعدی ثبت شد (تلاش $attempt)."; exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ ثبت دور بعدی ناموفق بود."; exit 1
