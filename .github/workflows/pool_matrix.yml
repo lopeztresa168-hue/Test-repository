@@ -46,7 +46,7 @@ on:
       matrix_file:
         description: 'مسیر فایل تنظیمات (پیش‌فرض pool_matrix.json)'
         required: false
-        default: 'pool_matrix.json'
+        default:یتیمدساسخسپس 'pool_matrix.json'
       configs_json:
         description: 'داخلی (توسط دور قبلی repeat پر می‌شود): لیست تنظیمات به‌جای فایل؛ فایل تنظیمات دست نمی‌خورد. دستی پر نکن'
         required: false
@@ -60,16 +60,16 @@ concurrency:
 env:
   MATRIX_FILE: ${{ inputs.matrix_file || 'pool_matrix.json' }}
   BATCH: 20   # حداکثر تعداد تنظیمات در هر اجرا
-
-jobs:
+ستسننس
+jobs:سننینسنس
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.parse.outputs.matrix }}
-      count: ${{ steps.parse.outputs.count }}
+      matrix: ${{ steps.parse.outpuسنسننسts.matrix }}
+      couتیتینسنسمسnt: ${{ steps.parse.outputs.count }}
       total: ${{ steps.parse.outputs.total }}
       tags: ${{ steps.parse.outputs.tags }}
-    steps:
+    stepsستستسددس:
       - uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
