@@ -58,6 +58,7 @@ SESSIONS = {'all': (0, 24), 'asia': (0, 9), 'london': (8, 17), 'ny': (13, 22), '
 FILTERS = ['none', 'both', 'btc', 'coin']
 CACHE_VERSION = 1                      # bump when the candidate-building logic changes -> all caches become stale
 CACHE_DIR_IN_REPO = 'pool_candidates'
+_CACHE_RE = re.compile(r'^(?P<name>.+)__(?P<sha>[0-9a-f]{12})__(?P<pk>[0-9a-f]{8})[.]npz[.]enc$')
 SOURCE_DIR_IN_REPO = 'aggregated'
 
 
@@ -364,6 +365,12 @@ def report(keys, CF, ns, a, idx, sel=None, w=None):
 # ---------------------------------------------------------------- polish: improve an already found portfolio
 SEED_IN_REPO = os.path.join('analysis_results', 'pool_search_results.tar.gz.enc')
 POLISHED_IN_REPO = os.path.join('analysis_results', 'pool_search_polished.tar.gz.enc')   # written by every polish run
+TAG_DIR_IN_REPO = os.path.join('analysis_results', 'pool_matrix')                         # one result file per matrix config (--tag)
+
+
+def tag_result_path(tag):
+    """result archive of one matrix config: analysis_results/pool_matrix/<tag>.tar.gz.enc (written by the workflow, read here by polish)"""
+    return os.path.join(TAG_DIR_IN_REPO, f'{_safe(tag)}.tar.gz.enc')
 
 
 def load_seed(a):
@@ -374,7 +381,11 @@ def load_seed(a):
         return pd.read_csv(a.polish_from)
     p = os.path.join(a.repo_dir, SEED_IN_REPO)
     q = os.path.join(a.repo_dir, POLISHED_IN_REPO)
-    if os.path.isfile(q):
+    t = os.path.join(a.repo_dir, tag_result_path(a.tag)) if a.tag else None
+    if t and os.path.isfile(t):                           # matrix config: continue from ITS OWN previous result
+        p = t
+        print(f'polish: continuing from the previous result of tag "{a.tag}" ({tag_result_path(a.tag)})', flush=True)
+    elif os.path.isfile(q):
         p = q
         print('polish: continuing from the previous polish result (pool_search_polished.tar.gz.enc)', flush=True)
     elif os.path.isfile(p):
@@ -468,7 +479,25 @@ def make_plan(a):
     present = {f: f'{CACHE_DIR_IN_REPO}/{f}' for f in (os.listdir(cdir) if os.path.isdir(cdir) else [])}
     expected = {s['cache'] for s in sources}
     pending = [s for s in sources if s['cache'] not in present]
-    stale = sorted(p for b, p in present.items() if b not in expected and b.endswith('.npz.enc'))
+    # کش‌های ترکیب‌های دیگر fee/min_trades/end (params-key متفاوت) تا وقتی sha منبعشان هنوز درست است «کهنه» نیستند؛
+    # ماتریکس چند ترکیب را هم‌زمان لازم دارد و ساخت کش یک ترکیب نباید کش ترکیب‌های دیگر را پاک کند.
+    # فقط کش‌هایی که منبعشان عوض/حذف شده، یا فایل نامعتبر، یا بیش از سقف --keep-keys ترکیب باشند حذف می‌شوند
+    # (حذف اشتباه بی‌خطر است: pool-prebuild همان ترکیب را خودکار دوباره می‌سازد).
+    sha_of = {_safe(s['name']): s['sha'][:12] for s in sources}
+    stale, other = [], {}
+    for b, p in present.items():
+        if not b.endswith('.npz.enc') or b in expected:
+            continue
+        m = _CACHE_RE.match(b)
+        if m and m['pk'] != pk and sha_of.get(m['name']) == m['sha']:
+            other.setdefault(m['pk'], []).append(p)
+        else:
+            stale.append(p)
+    keep = set(sorted(other, key=lambda k: (-len(other[k]), k))[:max(0, getattr(a, 'keep_keys', 16) - 1)])
+    for k, files in other.items():
+        if k not in keep:
+            stale += files
+    stale = sorted(stale)
     return dict(params_key=pk, sources=sources, pending=pending, stale=stale, cached=len(sources) - len(pending))
 
 
@@ -597,6 +626,8 @@ def main():
     ap.add_argument('--polish', action='store_true',
                     help='search/all: do not search from scratch; start from the portfolio already found (selected.csv) and keep improving it '
                          'with --objective (add / remove / replace, never worse than the start); with --tune-weights the weights are tuned from the saved ones')
+    ap.add_argument('--tag', default='', help='matrix config name: polish continues from analysis_results/pool_matrix/<tag>.tar.gz.enc '
+                                             '(falls back to the polished / main result when that does not exist yet)')
     ap.add_argument('--polish-from', help='polish: selected.csv to start from (default: analysis_results/pool_search_polished.tar.gz.enc if present, else pool_search_results.tar.gz.enc, in --repo-dir; mode all needs this)')
     ap.add_argument('--repo-dir', help='plan/search: git checkout of the data repo (aggregated/ + pool_candidates/)')
     ap.add_argument('--queue-dir', default='pool_queue', help='plan: where chunk_<i>.json and plan.json are written')
@@ -604,6 +635,7 @@ def main():
     ap.add_argument('--max-files', type=int, default=1000, help='plan: max files queued in one run')
     ap.add_argument('--manifest', help='build: one chunk json written by plan')
     ap.add_argument('--cache-dir', default='pool_cache', help='build: where the per-file caches are written')
+    ap.add_argument('--keep-keys', type=int, default=16, help='plan: how many fee/min-trades/end combinations (params keys) may stay cached side by side')
     ap.add_argument('--max-missing-pct', type=float, default=5.0, help='search: tolerated share of files without cache')
     a = ap.parse_args()
     global CAP
