@@ -2328,6 +2328,11 @@ jobs:
           cp "$REGIME_FILE" /tmp/pool_regime/market_regime.json
           echo "✅ فایل regime: $REGIME_FILE"
 
+      - name: 6.5. بازیابی آرشیو کش از مخزن سوم (pool_cache/ → pool_candidates/)
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: bash modules/pool_cache.sh restore /tmp/third_repo
+
       - name: 7. ساخت صف (فقط فایل‌های بدون کش به‌روز) و اثرانگشت داده
         id: plan
         run: |
@@ -2485,7 +2490,7 @@ jobs:
           name: pool-regime-${{ github.run_id }}
           path: /tmp/pool_regime
 
-      - name: Clone سبک مخزن سوم (فقط پوشه‌ی pool_candidates)
+      - name: Clone سبک مخزن سوم (فقط آرشیو pool_cache + pool_candidates قدیمی برای مهاجرت)
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           THIRD_REPO: ${{ secrets.THIRD_REPO }}
@@ -2493,25 +2498,30 @@ jobs:
           git clone --depth=1 --filter=blob:none --sparse \
             "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
           cd /tmp/third_repo
-          git sparse-checkout set pool_candidates
+          git sparse-checkout set pool_cache pool_candidates
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: اعمال کش‌های جدید، حذف کش‌های کهنه، تنها push و محاسبه‌ی باقی‌مانده
+      - name: اعمال کش‌های جدید، حذف کش‌های کهنه، بسته‌بندی آرشیو، تنها push و محاسبه‌ی باقی‌مانده
         id: apply
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
         run: |
           MOD="$GITHUB_WORKSPACE/modules/pool_search.py"
+          PC="$GITHUB_WORKSPACE/modules/pool_cache.sh"
           COMMON=(--regime /tmp/pool_regime/market_regime.json --fee "$POOL_FEE" --min-trades "$POOL_MIN_TRADES")
           if [ -n "$POOL_END" ]; then COMMON+=(--end "$POOL_END"); fi
           cd /tmp/third_repo
-          mkdir -p pool_candidates
+
+          # آرشیو فعلی را باز کن (pool_cache/ → pool_candidates/ روی دیسک)
+          bash "$PC" restore /tmp/third_repo
 
           # کش‌های کهنه/یتیم نسبت به HEAD فعلی (sha منبع تغییر کرده، پارامتر عوض شده، یا استراتژی حذف شده)
           python -u "$MOD" --mode plan --repo-dir /tmp/third_repo "${COMMON[@]}" --queue-dir /tmp/pool_plan_before
           STALE_N=0
           while IFS= read -r P; do
             [ -n "$P" ] || continue
-            git rm -q -f -- "$P" && STALE_N=$((STALE_N + 1)) || true
+            rm -f -- "$P" && STALE_N=$((STALE_N + 1)) || true
           done < <(jq -r '.stale[]' /tmp/pool_plan_before/plan.json)
           echo "🧹 کش‌های کهنه‌ی حذف‌شده: $STALE_N"
 
@@ -2524,7 +2534,15 @@ jobs:
           fi
           echo "📦 کش‌های جدید: $NEW"
 
-          git add -A pool_candidates
+          # فقط وقتی چیزی عوض شده آرشیو دوباره بسته می‌شود (رمزنگاری salt تصادفی دارد؛ بدون تغییر نباید تکه‌ها دوباره push شوند)
+          MIGRATE=false
+          if git ls-tree -r --name-only HEAD -- pool_candidates | grep -q .; then MIGRATE=true; fi
+          if [ "$NEW" -gt 0 ] || [ "$STALE_N" -gt 0 ] || [ "$MIGRATE" = "true" ]; then
+            bash "$PC" pack /tmp/third_repo
+            git add -A pool_cache
+            # مهاجرت: فایل‌های جداگانه‌ی قدیمی از گیت حذف می‌شوند (روی دیسک می‌مانند تا plan بعدی ببیند)
+            git rm -r -q --cached --ignore-unmatch pool_candidates
+          fi
           if git diff --cached --quiet; then
             echo "ℹ️ تغییری برای commit نیست."
           else
@@ -2638,7 +2656,7 @@ jobs:
           name: pool-regime-${{ github.run_id }}
           path: /tmp/pool_regime
 
-      - name: Clone سبک مخزن سوم (pool_candidates + درخت aggregated)
+      - name: Clone سبک مخزن سوم (آرشیو pool_cache + درخت aggregated)
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
           THIRD_REPO: ${{ secrets.THIRD_REPO }}
@@ -2646,10 +2664,16 @@ jobs:
           git clone --depth=1 --filter=blob:none --sparse \
             "https://x-access-token:${GH_TOKEN}@github.com/${THIRD_REPO}.git" /tmp/third_repo
           cd /tmp/third_repo
-          git sparse-checkout set pool_candidates analysis_results
+          git sparse-checkout set pool_cache pool_candidates analysis_results
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "📦 فایل‌های کش: $(find pool_candidates -name '*.npz.enc' 2>/dev/null | wc -l)"
+
+      - name: بازیابی آرشیو کش (pool_cache/ → pool_candidates/)
+        env:
+          POOL_CACHE_PASSWORD: ${{ secrets.RESULTS_PASSWORD || secrets.DATA_PASSWORD }}
+        run: |
+          bash modules/pool_cache.sh restore /tmp/third_repo
+          echo "📦 فایل‌های کش: $(find /tmp/third_repo/pool_candidates -name '*.npz.enc' 2>/dev/null | wc -l)"
 
       - name: جستجوی پرتفوی از روی کش‌ها (pool_search --mode search)
         env:
