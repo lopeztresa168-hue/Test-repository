@@ -5,10 +5,10 @@
     "tune_weights": true,
     "polish": true,
     "end": "",
-    "time_budget": 0,
+    "time_budget": 15,
     "seed": 0,
     "repeat": true,
-    "repeat_hours": 1
+    "repeat_hours": 24
   },
   "configs": [
     {
